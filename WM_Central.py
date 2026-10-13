@@ -325,7 +325,14 @@ class WMCentral:
     # GESTIÓN DE RIEGO (KAFKA: SOLICITUDES Y TELEMETRÍA)
     # --------------------------------------------------------------------------
     def request_watering(self, op: str, ws_id: str, duration: int):
-        """Procesa una solicitud de riego (desde FO o desde CENTRAL)."""
+        """Procesa una solicitud de riego (desde FO o desde CENTRAL). Soporta una WS o 'ALL'."""
+        if ws_id.strip().upper() == "ALL":
+            with self.lock:
+                targets = list(self.stations.keys())
+            for target in targets:
+                self.request_watering(op, target, duration)
+            return
+
         with self.lock:
             self.notify_operator(op, "STEP", ws_id, f"Petición de riego recibida para {ws_id}")
 

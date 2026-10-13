@@ -1,7 +1,24 @@
+# Entornos virtuales
 .venv/
+venv/
+ENV/
+
+# Python
 __pycache__/
-central.db
-*.lnk
-.venv/
-__pycache__/
-central.db
+*.py[cod]
+*$py.class
+
+# Bases de datos y archivos de prueba
+*.db
+*.db-journal
+test_*.txt
+test_*.db
+
+# Docker / Logs
+data/
+*.log
+
+# IDEs y SO
+.vscode/
+.idea/
+.DS_Store
