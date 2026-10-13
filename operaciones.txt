@@ -1,0 +1,5 @@
+# Fichero de pruebas de operaciones para WM_FO
+# Formato: WS_ID,duracion_en_segundos
+WS-01,10
+WS-02,8
+WS-01,5

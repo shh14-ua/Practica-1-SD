@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WM_Central — Cuadro de Mandos de Riego Urbano</title>
+<style>
+  :root {
+    --bg-base: #090d16;
+    --bg-card: #131b2e;
+    --bg-card-hover: #1b2640;
+    --bg-map: #0b1120;
+    --border-color: #23304c;
+    --text-primary: #f8fafc;
+    --text-muted: #94a3b8;
+    --accent: #38bdf8;
+    --color-available: #22c55e;
+    --color-watering: #38bdf8;
+    --color-leak: #ef4444;
+    --color-blocked: #f97316;
+    --color-offline: #64748b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* TOP HEADER */
+  header {
+    background: #0f172a;
+    border-bottom: 1px solid var(--border-color);
+    padding: 12px 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 15px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand-icon {
+    width: 36px;
+    height: 36px;
+    background: linear-gradient(135deg, #0284c7, #38bdf8);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 20px;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+  }
+  .brand-text h1 {
+    margin: 0;
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  .brand-text span {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+
+  /* TABS NAVIGATION */
+  .nav-tabs {
+    display: flex;
+    gap: 6px;
+    background: #090d16;
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+  }
+  .tab-btn {
+    background: transparent;
+    color: var(--text-muted);
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tab-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+  }
+  .tab-btn.active {
+    background: #0284c7;
+    color: white;
+    box-shadow: 0 2px 8px rgba(2, 132, 199, 0.4);
+  }
+
+  /* SYSTEM PILLS SUMMARY */
+  .summary-pills {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .pill {
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+  }
+  .pill-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .dot-available { background: var(--color-available); box-shadow: 0 0 6px var(--color-available); }
+  .dot-watering { background: var(--color-watering); box-shadow: 0 0 8px var(--color-watering); animation: pulse 1s infinite; }
+  .dot-leak { background: var(--color-leak); box-shadow: 0 0 6px var(--color-leak); }
+  .dot-blocked { background: var(--color-blocked); box-shadow: 0 0 6px var(--color-blocked); }
+  .dot-offline { background: var(--color-offline); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(1.3); }
+  }
+
+  /* MAIN CONTENT AREA */
+  main {
+    flex: 1;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .view-pane {
+    display: none;
+    flex: 1;
+  }
+  .view-pane.active {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* =========================================================================
+     FIGURA 2: VISTA MAPA URBANO
+     ========================================================================= */
+  .map-layout {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    gap: 20px;
+    flex: 1;
+    min-height: 600px;
+  }
+  @media (max-width: 1024px) {
+    .map-layout { grid-template-columns: 1fr; }
+  }
+
+  .map-canvas-container {
+    background: var(--bg-map);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: inset 0 0 80px rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  /* Grid pattern in background */
+  .map-grid-bg {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image:
+      linear-gradient(rgba(35, 48, 76, 0.25) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(35, 48, 76, 0.25) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+  }
+
+  /* SVG Map Overlay */
+  .map-svg {
+    width: 100%;
+    height: 100%;
+    position: absolute;
+    top: 0; left: 0;
+  }
+
+  .park-boundary {
+    fill: rgba(34, 197, 94, 0.04);
+    stroke: rgba(34, 197, 94, 0.25);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 4;
+    transition: all 0.3s;
+  }
+  .park-boundary:hover {
+    fill: rgba(34, 197, 94, 0.08);
+    stroke: rgba(34, 197, 94, 0.5);
+  }
+  .park-label {
+    fill: #64748b;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    pointer-events: none;
+  }
+
+  /* Station Map Marker */
+  .station-node {
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+  .station-node:hover {
+    transform: scale(1.15);
+  }
+  .marker-glow {
+    animation: ripple 2s infinite ease-out;
+    transform-origin: center;
+  }
+  @keyframes ripple {
+    0% { r: 10px; opacity: 0.8; stroke-width: 3px; }
+    100% { r: 35px; opacity: 0; stroke-width: 1px; }
+  }
+
+  /* MAP SIDEBAR: DETAIL & RECENT EVENTS */
+  .map-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .panel-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .panel-title {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-top: 0;
+    margin-bottom: 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .selected-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 16px;
+  }
+  .selected-id { font-size: 1.5rem; font-weight: 800; }
+  .selected-loc { color: var(--text-muted); font-size: 0.9rem; }
+
+  .status-badge {
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    display: inline-block;
+  }
+  .badge-DISPONIBLE { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid #22c55e; }
+  .badge-REGANDO {
+    background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid #38bdf8;
+    animation: blink-anim 1s infinite;
+  }
+  .badge-FUGA { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+  .badge-FUERA_DE_SERVICIO { background: rgba(249, 115, 22, 0.2); color: #fb923c; border: 1px solid #f97316; }
+  .badge-DESCONECTADA { background: rgba(100, 116, 139, 0.2); color: #94a3b8; border: 1px solid #64748b; }
+
+  @keyframes blink-anim { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .metrics-box {
+    background: #090d16;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .metric-item small { color: var(--text-muted); font-size: 0.75rem; display: block; }
+  .metric-item span { font-size: 1.25rem; font-weight: 700; }
+
+  .sub-sensors {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border-color);
+    padding-top: 14px;
+    margin-bottom: 16px;
+  }
+  .sensor-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .sensor-val { font-weight: 600; color: var(--text-primary); }
+
+  .action-buttons {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    flex: 1;
+    min-width: 90px;
+    padding: 10px;
+    border-radius: 6px;
+    border: none;
+    font-size: 0.85rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-align: center;
+  }
+  .btn-start { background: #15803d; color: white; }
+  .btn-start:hover { background: #16a34a; }
+  .btn-block { background: #c2410c; color: white; }
+  .btn-block:hover { background: #ea580c; }
+  .btn-activate { background: #0284c7; color: white; }
+  .btn-activate:hover { background: #0369a1; }
+  .btn-refresh { background: #334155; color: white; }
+  .btn-refresh:hover { background: #475569; }
+
+  /* EVENTS FEED */
+  .events-feed {
+    max-height: 220px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: 0.85rem;
+  }
+  .event-item {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .event-time { color: var(--accent); font-family: monospace; font-size: 0.75rem; min-width: 55px; }
+  .event-ws { font-weight: 700; color: #f59e0b; }
+  .event-text { color: var(--text-muted); flex: 1; }
+
+  /* =========================================================================
+     FIGURA 1: VISTA CUADRO DE MANDOS / TABLA DE ESCRITORIO
+     ========================================================================= */
+  .desktop-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .toolbar {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .table-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    text-align: left;
+  }
+  th {
+    background: #0d1527;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border-color);
+  }
+  td {
+    padding: 14px 20px;
+    border-bottom: 1px solid rgba(35, 48, 76, 0.4);
+    font-size: 0.9rem;
+  }
+  tr:hover td {
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .font-mono { font-family: monospace; font-weight: 600; }
+
+  /* CONSOLE LOG BOX */
+  .console-box {
+    background: #060911;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 14px;
+    font-family: monospace;
+    font-size: 0.85rem;
+    height: 180px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column-reverse;
+  }
+
+  /* SIMULATOR STYLES */
+  .sim-form {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-bottom: 20px;
+    align-items: flex-end;
+  }
+  .form-group label {
+    display: block;
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin-bottom: 6px;
+    font-weight: 600;
+  }
+  .form-control {
+    width: 100%;
+    background: #090d16;
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+  }
+
+  /* FOOTER STATUS BAR */
+  footer {
+    background: #0b1120;
+    border-top: 1px solid var(--border-color);
+    padding: 10px 24px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="brand">
+    <div class="brand-icon">💧</div>
+    <div class="brand-text">
+      <h1>WaterManagement</h1>
+      <span>Red Inteligente de Riego Urbano · Release 1</span>
+    </div>
+  </div>
+
+  <div class="nav-tabs">
+    <button class="tab-btn active" onclick="switchTab('tab-map')">🗺️ Mapa Urbano (Figura 2)</button>
+    <button class="tab-btn" onclick="switchTab('tab-table')">📊 Cuadro de Mandos (Figura 1)</button>
+    <button class="tab-btn" onclick="switchTab('tab-sim')">🧑‍🌾 Simulador de Operario (WM_FO)</button>
+    <button class="tab-btn" onclick="switchTab('tab-hist')">📜 Historial BD</button>
+  </div>
+
+  <div class="summary-pills" id="pills-container">
+    <div class="pill"><div class="pill-dot dot-available"></div><span id="cnt-available">0</span> Disp.</div>
+    <div class="pill"><div class="pill-dot dot-watering"></div><span id="cnt-watering">0</span> Regando</div>
+    <div class="pill"><div class="pill-dot dot-leak"></div><span id="cnt-leak">0</span> Fuga</div>
+    <div class="pill"><div class="pill-dot dot-blocked"></div><span id="cnt-blocked">0</span> Fuera Svc.</div>
+    <div class="pill"><div class="pill-dot dot-offline"></div><span id="cnt-offline">0</span> Descon.</div>
+  </div>
+</header>
+
+<!-- MAIN CONTENT -->
+<main>
+
+  <!-- =======================================================================
+       TAB 1: MAPA URBANO (FIGURA 2)
+       ======================================================================= -->
+  <div id="tab-map" class="view-pane active">
+    <div class="map-layout">
+
+      <!-- Map Canvas -->
+      <div class="map-canvas-container" id="map-container">
+        <div class="map-grid-bg"></div>
+
+        <svg class="map-svg" viewBox="0 0 900 600" id="map-svg">
+          <!-- PARKS ZONES -->
+          <!-- River Park (Noroeste) -->
+          <ellipse cx="220" cy="180" rx="170" ry="130" class="park-boundary" />
+          <text x="130" y="80" class="park-label">River Park</text>
+
+          <!-- Riverside Gardens (Noreste) -->
+          <ellipse cx="650" cy="190" rx="180" ry="140" class="park-boundary" />
+          <text x="540" y="80" class="park-label">Riverside Gardens</text>
+
+          <!-- Central Park (Suroeste) -->
+          <ellipse cx="270" cy="430" rx="190" ry="130" class="park-boundary" />
+          <text x="170" y="340" class="park-label">Central Park</text>
+
+          <!-- North Roundabout (Sureste) -->
+          <ellipse cx="680" cy="430" rx="160" ry="120" class="park-boundary" />
+          <text x="570" y="340" class="park-label">North Roundabout</text>
+
+          <!-- Dynamic Station Nodes rendered via JS -->
+          <g id="svg-stations-group"></g>
+        </svg>
+      </div>
+
+      <!-- Map Sidebar (Selected Station Details + Live Events) -->
+      <div class="map-sidebar">
+        <!-- Station Details -->
+        <div class="panel-card" id="detail-card">
+          <div class="panel-title">
+            <span>Detalle de Estación</span>
+            <span id="detail-badge" class="status-badge badge-DESCONECTADA">DESCONECTADA</span>
+          </div>
+
+          <div class="selected-header">
+            <div>
+              <div class="selected-id" id="detail-id">WS-01</div>
+              <div class="selected-loc" id="detail-loc">River Park Norte</div>
+            </div>
+          </div>
+
+          <div class="metrics-box">
+            <div class="metric-item">
+              <small>CAUDAL ACTUAL</small>
+              <span id="detail-flow">0.0</span> <small style="display:inline;">L/min</small>
+            </div>
+            <div class="metric-item">
+              <small>VOL. ACUMULADO</small>
+              <span id="detail-vol">0.0</span> <small style="display:inline;">L</small>
+            </div>
+            <div class="metric-item" style="grid-column: span 2;">
+              <small>OPERARIO ASIGNADO</small>
+              <span id="detail-op" style="font-size: 1rem;">—</span>
+            </div>
+          </div>
+
+          <div class="sub-sensors">
+            <div class="sensor-row">
+              <span>Caudalímetro:</span>
+              <span class="sensor-val" id="sensor-flow">Operativo (OK)</span>
+            </div>
+            <div class="sensor-row">
+              <span>Detector de fugas:</span>
+              <span class="sensor-val" id="sensor-leak">Sin incidencias (OK)</span>
+            </div>
+            <div class="sensor-row">
+              <span>Electroválvula:</span>
+              <span class="sensor-val" id="sensor-valve">Cerrada</span>
+            </div>
+          </div>
+
+          <div style="margin-bottom: 12px; display: flex; gap: 8px; align-items: center;">
+            <label style="font-size: 0.8rem; color: var(--text-muted);">Duración:</label>
+            <input type="number" id="detail-duration" value="10" min="2" max="120"
+                   style="width: 70px; background: #090d16; border: 1px solid var(--border-color); color: white; padding: 4px 8px; border-radius: 4px;">
+            <span style="font-size: 0.8rem; color: var(--text-muted);">seg</span>
+          </div>
+
+          <div class="action-buttons">
+            <button class="btn btn-start" onclick="actionStart()">Riego</button>
+            <button class="btn btn-block" onclick="actionBlock()">Bloquear</button>
+            <button class="btn btn-activate" onclick="actionActivate()">Activar</button>
+          </div>
+        </div>
+
+        <!-- Live Events Log -->
+        <div class="panel-card" style="flex: 1;">
+          <div class="panel-title">
+            <span>Eventos Recientes</span>
+            <span style="font-size: 0.75rem; color: var(--accent);">● En vivo</span>
+          </div>
+          <div class="events-feed" id="events-feed"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- =======================================================================
+       TAB 2: CUADRO DE MANDOS / TABLA DE ESCRITORIO (FIGURA 1)
+       ======================================================================= -->
+  <div id="tab-table" class="view-pane">
+    <div class="desktop-layout">
+      <!-- Toolbar -->
+      <div class="toolbar">
+        <button class="btn btn-start" onclick="actionStart()">▶ Iniciar Riego</button>
+        <button class="btn btn-block" onclick="actionBlock()">⏹ Bloquear WS</button>
+        <button class="btn btn-activate" onclick="actionActivate()">✔ Activar WS</button>
+        <button class="btn btn-refresh" onclick="updateStatus()">🔄 Refrescar</button>
+        <span style="margin-left: auto; color: var(--text-muted); font-size: 0.85rem;" id="table-selected-label">
+          Estación seleccionada: <strong>WS-01</strong>
+        </span>
+      </div>
+
+      <!-- Data Table -->
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Ubicación</th>
+              <th>Estado</th>
+              <th>Caudal (L/min)</th>
+              <th>Vol. Acumulado (L)</th>
+              <th>Operario Asignado</th>
+              <th>Acciones</th>
+            </tr>
+          </thead>
+          <tbody id="stations-table-body"></tbody>
+        </table>
+      </div>
+
+      <!-- Application Messages Console -->
+      <div class="panel-card">
+        <div class="panel-title">
+          <span>Mensajes de la Aplicación (Consola del Sistema Central)</span>
+          <span style="font-size: 0.75rem; color: var(--accent);">STDIO STREAM</span>
+        </div>
+        <div class="console-box" id="console-box"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- =======================================================================
+       TAB 3: SIMULADOR DE OPERARIO DE CAMPO (WM_FO)
+       ======================================================================= -->
+  <div id="tab-sim" class="view-pane">
+    <div class="panel-card" style="max-width: 800px; margin: 0 auto; width: 100%;">
+      <div class="panel-title">
+        <span>Simulador de Operario de Campo (Field Operator)</span>
+        <span style="color: var(--accent);">Prueba rápida sin abrir terminal</span>
+      </div>
+
+      <div class="sim-form">
+        <div class="form-group">
+          <label>Operario (ID dado de alta en BD):</label>
+          <select id="sim-op" class="form-control">
+            <option value="FO-01">FO-01 (Operario 1 - Juan Pérez)</option>
+            <option value="FO-02">FO-02 (Operario 2 - María Gómez)</option>
+            <option value="FO-03">FO-03 (Operario 3 - Carlos Ruiz)</option>
+            <option value="FO-04">FO-04 (Operario 4 - Laura Sanz)</option>
+            <option value="FO-05">FO-05 (Operario 5 - Pedro Marín)</option>
+            <option value="FO-99">FO-99 (Operario NO registrado - Prueba denegación)</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label>Estación de Riego Destino:</label>
+          <select id="sim-ws" class="form-control"></select>
+        </div>
+
+        <div class="form-group">
+          <label>Duración (segundos):</label>
+          <input type="number" id="sim-dur" class="form-control" value="10" min="2" max="120">
+        </div>
+
+        <button class="btn btn-start" style="height: 42px;" onclick="simRequestWatering()">
+          💧 Solicitar Riego
+        </button>
+      </div>
+
+      <div style="background: #090d16; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px;">
+        <h4 style="margin-top:0; color: var(--text-muted);">Progreso del Servicio del Operario:</h4>
+        <div id="sim-progress-box" style="font-family: monospace; font-size: 0.9rem; min-height: 120px; line-height: 1.6;">
+          (Selecciona los parámetros y pulsa 'Solicitar Riego')
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- =======================================================================
+       TAB 4: HISTORIAL DE RIEGOS EN BASE DE DATOS SQLITE
+       ======================================================================= -->
+  <div id="tab-hist" class="view-pane">
+    <div class="panel-card">
+      <div class="panel-title">
+        <span>Historial de Riegos en Base de Datos SQLite (Tabla 'watering_history')</span>
+        <button class="btn btn-refresh" style="padding: 4px 12px;" onclick="loadHistory()">🔄 Actualizar</button>
+      </div>
+
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th># ID</th>
+              <th>Estación</th>
+              <th>Operario</th>
+              <th>Inicio</th>
+              <th>Fin</th>
+              <th>Consumo Total (L)</th>
+              <th>Duración (s)</th>
+              <th>Motivo de Conclusión</th>
+            </tr>
+          </thead>
+          <tbody id="history-table-body">
+            <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Cargando historial...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<!-- FOOTER STATUS BAR -->
+<footer>
+  <div id="footer-kafka">● WM_Central v1.0 — Conectado a Kafka Broker & Servidor Sockets :5000</div>
+  <div id="footer-time">Sincronización activa</div>
+</footer>
+
+<script>
+// Estado global en cliente
+let currentSelectedWs = "WS-01";
+let allStations = [];
+let allLogs = [];
+
+// Coordenadas fijas para el mapa urbano ficticio (Figura 2)
+const STATION_COORDINATES = {
+  "WS-01": { x: 200, y: 150 },
+  "WS-02": { x: 260, y: 220 },
+  "WS-03": { x: 620, y: 160 },
+  "WS-04": { x: 240, y: 410 },
+  "WS-05": { x: 310, y: 470 },
+  "WS-06": { x: 700, y: 220 },
+  "WS-07": { x: 290, y: 380 },
+  "WS-08": { x: 190, y: 460 },
+  "WS-09": { x: 660, y: 250 },
+  "WS-10": { x: 640, y: 410 },
+  "WS-11": { x: 720, y: 170 },
+  "WS-12": { x: 660, y: 460 },
+  "WS-13": { x: 230, y: 470 },
+  "WS-14": { x: 720, y: 430 },
+  "WS-15": { x: 670, y: 430 },
+  "WS-16": { x: 740, y: 460 }
+};
+
+// Cambio de pestañas
+function switchTab(tabId) {
+  document.querySelectorAll('.view-pane').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+
+  const target = document.getElementById(tabId);
+  if (target) target.classList.add('active');
+
+  const btn = Array.from(document.querySelectorAll('.tab-btn')).find(b => b.getAttribute('onclick').includes(tabId));
+  if (btn) btn.classList.add('active');
+
+  if (tabId === 'tab-hist') loadHistory();
+}
+
+// Selección de estación activa
+function selectStation(wsId) {
+  currentSelectedWs = wsId;
+  document.getElementById('table-selected-label').innerHTML = `Estación seleccionada: <strong>${wsId}</strong>`;
+  renderDetails();
+  renderMap();
+}
+
+// Renderizado de detalles de la estación seleccionada
+function renderDetails() {
+  const st = allStations.find(s => s.id === currentSelectedWs) || {
+    id: currentSelectedWs, location: "Sin datos", status: "DESCONECTADA", flow: 0, vol: 0, operator: null
+  };
+
+  document.getElementById('detail-id').innerText = st.id;
+  document.getElementById('detail-loc').innerText = st.location;
+  document.getElementById('detail-flow').innerText = st.flow.toFixed(1);
+  document.getElementById('detail-vol').innerText = st.vol.toFixed(1);
+  document.getElementById('detail-op').innerText = st.operator || '—';
+
+  const badge = document.getElementById('detail-badge');
+  badge.className = 'status-badge badge-' + st.status.replace(/ /g, '_');
+  badge.innerText = st.status;
+
+  // Sensores según estado
+  const isWatering = st.status === "REGANDO";
+  const isLeak = st.status === "FUGA";
+  const isOffline = st.status === "DESCONECTADA";
+
+  document.getElementById('sensor-flow').innerText = isWatering ? "Midiendo flujo" : (isOffline ? "Sin señal" : "Operativo (OK)");
+  document.getElementById('sensor-leak').innerText = isLeak ? "¡FUGA DETECTADA!" : "Sin incidencias (OK)";
+  document.getElementById('sensor-leak').style.color = isLeak ? "#ef4444" : "var(--text-primary)";
+  document.getElementById('sensor-valve').innerText = isWatering ? "ABIERTA" : "Cerrada";
+  document.getElementById('sensor-valve').style.color = isWatering ? "#38bdf8" : "var(--text-primary)";
+}
+
+// Renderizado del Mapa SVG (Figura 2)
+function renderMap() {
+  const g = document.getElementById('svg-stations-group');
+  if (!g) return;
+
+  let html = '';
+  allStations.forEach((st, idx) => {
+    // Si no tiene coordenadas prefijadas, colocarlo en el centro
+    const coords = STATION_COORDINATES[st.id] || { x: 450 + (idx * 30) % 300, y: 300 + (idx * 25) % 200 };
+    const isSelected = st.id === currentSelectedWs;
+    const isWatering = st.status === "REGANDO";
+    const isLeak = st.status === "FUGA";
+    const isBlocked = st.status === "FUERA DE SERVICIO";
+    const isAvailable = st.status === "DISPONIBLE";
+
+    let color = "#64748b"; // Desconectada
+    if (isAvailable) color = "#22c55e";
+    else if (isWatering) color = "#38bdf8";
+    else if (isLeak) color = "#ef4444";
+    else if (isBlocked) color = "#f97316";
+
+    // Si está regando, dibujamos ondas concéntricas parpadeantes (ripple)
+    let ripples = '';
+    if (isWatering) {
+      ripples = `
+        <circle cx="${coords.x}" cy="${coords.y}" r="12" fill="none" stroke="${color}" class="marker-glow" />
+        <circle cx="${coords.x}" cy="${coords.y}" r="22" fill="none" stroke="${color}" opacity="0.4" stroke-width="1.5" />
+      `;
+    }
+
+    // Halo de selección
+    const selectHalo = isSelected ? `
+      <circle cx="${coords.x}" cy="${coords.y}" r="16" fill="none" stroke="#f8fafc" stroke-width="2" stroke-dasharray="3 3" />
+    ` : '';
+
+    html += `
+      <g class="station-node" onclick="selectStation('${st.id}')">
+        ${ripples}
+        ${selectHalo}
+        <circle cx="${coords.x}" cy="${coords.y}" r="8" fill="${color}" stroke="#0b1120" stroke-width="2" />
+        <text x="${coords.x + 12}" y="${coords.y + 4}" fill="${color}" font-size="11" font-weight="700" font-family="monospace">
+          ${st.id} ${isWatering ? '💧' : ''}
+        </text>
+      </g>
+    `;
+  });
+
+  g.innerHTML = html;
+}
+
+// Renderizado de la Tabla (Figura 1)
+function renderTable() {
+  const tbody = document.getElementById('stations-table-body');
+  if (!tbody) return;
+
+  tbody.innerHTML = allStations.map(st => {
+    const badgeCls = 'badge-' + st.status.replace(/ /g, '_');
+    const flowText = st.status === "REGANDO" ? `${st.flow.toFixed(1)} L/m` : "—";
+    const isSelected = st.id === currentSelectedWs;
+
+    return `
+      <tr style="${isSelected ? 'background: rgba(56, 189, 248, 0.08);' : ''}" onclick="selectStation('${st.id}')">
+        <td class="font-mono"><strong>${st.id}</strong></td>
+        <td>${st.location}</td>
+        <td><span class="status-badge ${badgeCls}">${st.status}</span></td>
+        <td class="font-mono">${flowText}</td>
+        <td class="font-mono">${st.vol.toFixed(1)} L</td>
+        <td>${st.operator || '—'}</td>
+        <td>
+          <button class="btn btn-start" style="padding: 4px 8px; font-size: 0.75rem;" onclick="event.stopPropagation(); actionStart('${st.id}')">Riego</button>
+          <button class="btn btn-block" style="padding: 4px 8px; font-size: 0.75rem;" onclick="event.stopPropagation(); actionBlock('${st.id}')">Bloquear</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+// Renderizado de logs
+function renderLogs() {
+  // Feed de eventos de la vista mapa
+  const feed = document.getElementById('events-feed');
+  if (feed) {
+    feed.innerHTML = allLogs.slice().reverse().map(l => `
+      <div class="event-item">
+        <span class="event-time">[${l.time}]</span>
+        <span class="event-ws">${l.ws}</span>
+        <span class="event-text">${l.message}</span>
+      </div>
+    `).join('');
+  }
+
+  // Consola de la vista de tabla
+  const consoleBox = document.getElementById('console-box');
+  if (consoleBox) {
+    consoleBox.innerHTML = allLogs.map(l => `
+      <div><span style="color:#38bdf8;">[${l.time}]</span> <span style="color:#f59e0b; font-weight:bold;">[${l.ws}]</span> ${l.message}</div>
+    `).join('');
+  }
+}
+
+// Actualización de contadores
+function updateCounters() {
+  let cAvail = 0, cWater = 0, cLeak = 0, cBlock = 0, cOff = 0;
+  allStations.forEach(s => {
+    if (s.status === "DISPONIBLE") cAvail++;
+    else if (s.status === "REGANDO") cWater++;
+    else if (s.status === "FUGA") cLeak++;
+    else if (s.status === "FUERA DE SERVICIO") cBlock++;
+    else if (s.status === "DESCONECTADA") cOff++;
+  });
+  document.getElementById('cnt-available').innerText = cAvail;
+  document.getElementById('cnt-watering').innerText = cWater;
+  document.getElementById('cnt-leak').innerText = cLeak;
+  document.getElementById('cnt-blocked').innerText = cBlock;
+  document.getElementById('cnt-offline').innerText = cOff;
+}
+
+// Actualización periódica por fetch
+async function updateStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    allStations = data.stations || [];
+    allLogs = data.logs || [];
+
+    document.getElementById('footer-time').innerText = 'Última actualización: ' + data.timestamp;
+
+    // Actualizar selector de estaciones en simulador si cambió
+    const simSelect = document.getElementById('sim-ws');
+    if (simSelect && simSelect.children.length !== allStations.length) {
+      simSelect.innerHTML = allStations.map(s => `<option value="${s.id}">${s.id} (${s.location})</option>`).join('');
+    }
+
+    updateCounters();
+    renderMap();
+    renderDetails();
+    renderTable();
+    renderLogs();
+  } catch (err) {
+    console.error("Error al sincronizar estado:", err);
+  }
+}
+
+// Cargar historial de riegos desde SQLite
+async function loadHistory() {
+  const tbody = document.getElementById('history-table-body');
+  try {
+    const res = await fetch('/api/history');
+    const data = await res.json();
+    if (!data.length) {
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No hay riegos archivados aún.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(r => `
+      <tr>
+        <td class="font-mono">${r.id}</td>
+        <td><strong>${r.ws_id}</strong></td>
+        <td>${r.operator_id}</td>
+        <td style="font-size:0.8rem;">${r.start_time.split('T')[1] || r.start_time}</td>
+        <td style="font-size:0.8rem;">${r.end_time.split('T')[1] || r.end_time}</td>
+        <td class="font-mono">${r.total_vol.toFixed(2)} L</td>
+        <td class="font-mono">${r.duration_sec} s</td>
+        <td><span class="status-badge ${r.reason === 'TIME' ? 'badge-DISPONIBLE' : 'badge-FUGA'}">${r.reason}</span></td>
+      </tr>
+    `).join('');
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #ef4444;">Error cargando historial de base de datos.</td></tr>';
+  }
+}
+
+// Acciones sobre estaciones
+async function sendAction(action, ws, dur = 10, op = "CENTRAL") {
+  await fetch('/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ws, duration: dur, op })
+  });
+  updateStatus();
+}
+
+function actionStart(wsId = null) {
+  const ws = wsId || currentSelectedWs;
+  const dur = parseInt(document.getElementById('detail-duration').value || '10');
+  sendAction('start', ws, dur, 'CENTRAL');
+}
+
+function actionBlock(wsId = null) {
+  sendAction('block', wsId || currentSelectedWs);
+}
+
+function actionActivate(wsId = null) {
+  sendAction('activate', wsId || currentSelectedWs);
+}
+
+// Simulador interactivo de FO en navegador
+async function simRequestWatering() {
+  const op = document.getElementById('sim-op').value;
+  const ws = document.getElementById('sim-ws').value;
+  const dur = parseInt(document.getElementById('sim-dur').value || '10');
+  const box = document.getElementById('sim-progress-box');
+
+  box.innerHTML = `<span style="color:#38bdf8;">[1/4] Operario ${op} enviando solicitud de riego para ${ws} (${dur}s)...</span><br>`;
+
+  await fetch('/api/action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'start', ws, duration: dur, op })
+  });
+
+  setTimeout(() => {
+    box.innerHTML += `<span style="color:#4ade80;">[2/4] CENTRAL: Comprobando disponibilidad y autorizando electroválvula...</span><br>`;
+  }, 600);
+
+  setTimeout(() => {
+    box.innerHTML += `<span style="color:#38bdf8;">[3/4] Riego en curso en ${ws}. Recibiendo telemetría continua...</span><br>`;
+  }, 1500);
+
+  setTimeout(() => {
+    box.innerHTML += `<span style="color:#f59e0b; font-weight:bold;">[4/4] Servicio concluido: Resumen generado y guardado en SQLite.</span><br>`;
+    loadHistory();
+  }, (dur + 2) * 1000);
+
+  updateStatus();
+}
+
+// Polling cada 1 segundo
+setInterval(updateStatus, 1000);
+updateStatus();
+</script>
+</body>
+</html>
