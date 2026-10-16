@@ -139,6 +139,8 @@ class WMCentral:
                     "vol": 0.0,
                     "operator": None,
                     "start_time": None,
+                    "pending_start": False,
+                    "pending_since": None,
                     "last_active": time.time(),
                 }
 
@@ -253,6 +255,8 @@ class WMCentral:
                             self.stations[st_id] = {
                                 "id": st_id, "location": location, "status": STATUS_AVAILABLE,
                                 "flow": 0.0, "vol": 0.0, "operator": None, "start_time": None,
+                                "pending_start": False,
+                                "pending_since": None,
                                 "last_active": time.time(),
                             }
                             self._update_station_db(st_id, location=location, status=STATUS_AVAILABLE)
@@ -311,7 +315,10 @@ class WMCentral:
                     if self.station_sockets.get(station_id) == conn:
                         del self.station_sockets[station_id]
                         st = self.stations.get(station_id)
+                        
                         if st:
+                            st["pending_start"] = False
+                            st["pending_since"] = None
                             if st["status"] == STATUS_WATERING:
                                 self.notify_operator(st["operator"], "SUMMARY", station_id,
                                                      "Estación DESCONECTADA súbitamente: riego interrumpido")
@@ -351,6 +358,13 @@ class WMCentral:
                 return
 
             # 3. Comprobar disponibilidad
+            if st["pending_start"]:
+                self.notify_operator(
+                    op, "DENY", ws_id,
+                    "DENEGADO: La estación tiene una solicitud de riego pendiente de confirmación"
+                )
+                return
+            
             if st["status"] != STATUS_AVAILABLE:
                 motivo = f"estación no disponible ({st['status']})"
                 if st["status"] == STATUS_WATERING:
@@ -365,15 +379,45 @@ class WMCentral:
                 return
 
             # 4. Autorizar e iniciar
-            self.notify_operator(op, "STEP", ws_id, "Estación disponible. Enviando orden de apertura de electroválvula...")
+            
+            self.notify_operator(
+                op, "STEP", ws_id,
+                "Estación disponible. Enviando orden de apertura de electroválvula..."
+            )
+
+            st["pending_start"] = True
+            st["pending_since"] = time.time()
             st["operator"] = op
-            st["flow"] = 0.0
-            st["vol"] = 0.0
-            st["start_time"] = datetime.now().isoformat()
-            self.set_station_status(ws_id, STATUS_WATERING)
 
             self.send_ws_command(ws_id, "START", op=op, duration=duration)
-            self.notify_operator(op, "AUTH", ws_id, f"AUTORIZADO: Riego de {duration} s iniciado en {ws_id}")
+            threading.Thread(
+                target=self.check_watering_timeout,
+                args=(ws_id, st["pending_since"]),
+                daemon=True
+            ).start()
+
+    def check_watering_timeout(self, ws_id: str, request_time: float):
+        """Cancela una solicitud si el Engine no confirma en 10 segundos."""
+        time.sleep(10)
+
+        with self.lock:
+            st = self.stations.get(ws_id)
+
+            if not st or not st["pending_start"]:
+                return
+
+            if st["pending_since"] != request_time:
+                return
+
+            st["pending_start"] = False
+            st["pending_since"] = None
+            op = st["operator"]
+            st["operator"] = None
+
+            self.notify_operator(
+                op, "DENY", ws_id,
+                "DENEGADO: El Engine no confirmó el inicio del riego en 10 segundos"
+            )
 
     def handle_ws_event(self, ev: dict):
         """Procesa eventos y telemetría emitidos por el motor de la estación (WM_WS_E)."""
@@ -385,13 +429,27 @@ class WMCentral:
         with self.lock:
             st = self.stations[ws_id]
             if ev_type == "STARTED":
+                if (
+                    st["status"] in (STATUS_OFFLINE, STATUS_LEAK, STATUS_OUT_OF_SERVICE)
+                    and not st["pending_start"]
+                ):
+                    self.send_ws_command(ws_id, "STOP", reason="NOT_AVAILABLE")
+                    return
+                st["pending_start"] = False
+                st["pending_since"] = None
                 st["operator"] = ev.get("op", "MANUAL")
                 st["flow"] = 0.0
                 st["vol"] = 0.0
                 st["start_time"] = datetime.now().isoformat()
+
                 self.set_station_status(ws_id, STATUS_WATERING)
                 self.log(f"Riego iniciado en estación (operario: {st['operator']})", ws_id=ws_id)
 
+                if st["operator"] != "MANUAL":
+                    self.notify_operator(
+                        st["operator"], "AUTH", ws_id,
+                        f"AUTORIZADO: Riego iniciado en {ws_id}. Confirmación recibida del Engine"
+                    )
             elif ev_type == "TELEMETRY":
                 st["flow"] = float(ev.get("flow", 0.0))
                 st["vol"] = float(ev.get("vol", 0.0))
@@ -401,6 +459,8 @@ class WMCentral:
                                      flow=st["flow"], vol=st["vol"])
 
             elif ev_type == "FINISHED":
+                st["pending_start"] = False
+                st["pending_since"] = None
                 total_vol = float(ev.get("vol", st["vol"]))
                 dur = int(ev.get("dur", 0))
                 reason = ev.get("reason", "OK")
