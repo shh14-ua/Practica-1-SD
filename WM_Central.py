@@ -253,20 +253,31 @@ class WMCentral:
                         self.station_sockets[st_id] = conn
                         if st_id not in self.stations:
                             self.stations[st_id] = {
-                                "id": st_id, "location": location, "status": STATUS_AVAILABLE,
+                                "id": st_id, "location": location, "status": STATUS_LEAK,
                                 "flow": 0.0, "vol": 0.0, "operator": None, "start_time": None,
                                 "pending_start": False,
                                 "pending_since": None,
                                 "last_active": time.time(),
                             }
-                            self._update_station_db(st_id, location=location, status=STATUS_AVAILABLE)
+                            self._update_station_db(st_id, location=location, status=STATUS_LEAK)
                             self.log(f"Nueva estación dada de alta: {st_id} ({location})", ws_id=st_id)
                         else:
-                            self.stations[st_id]["location"] = location
-                            self.stations[st_id]["status"] = STATUS_AVAILABLE
-                            self.stations[st_id]["last_active"] = time.time()
-                            self._update_station_db(st_id, location=location, status=STATUS_AVAILABLE)
-                            self.log(f"Estación conectada y AUTENTICADA: disponible para servicio", ws_id=st_id)
+                            st = self.stations[st_id]
+                            st["location"] = location
+                            st["last_active"] = time.time()
+
+                            if st["status"] != STATUS_OUT_OF_SERVICE:
+                                self.set_station_status(st_id, STATUS_LEAK)
+
+                            self._update_station_db(
+                                st_id,
+                                location=location,
+                                status=st["status"]
+                            )
+                            self.log(
+                                f"Estación conectada y AUTENTICADA: estado {st['status']}",
+                                ws_id=st_id
+                            )
                     return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente"
 
                 if not station_id:
@@ -549,6 +560,8 @@ class WMCentral:
                 if st["status"] == STATUS_WATERING:
                     self.notify_operator(st["operator"], "STEP", ws_id,
                                          "Estación bloqueada por CENTRAL: Riego detenido")
+                st["pending_start"] = False
+                st["pending_since"] = None
                 self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                 self.send_ws_command(ws_id, "BLOCK")
                 self.log("Puesta en FUERA DE SERVICIO por orden de CENTRAL", ws_id=ws_id)
@@ -563,7 +576,7 @@ class WMCentral:
         for ws_id in stations:
             with self.lock:
                 st = self.stations[ws_id]
-                if st["status"] in (STATUS_OUT_OF_SERVICE, STATUS_LEAK):
+                if st["status"] == STATUS_OUT_OF_SERVICE:
                     self.set_station_status(ws_id, STATUS_AVAILABLE)
                     self.send_ws_command(ws_id, "ACTIVATE")
                     self.log("Activada y en servicio (DISPONIBLE)", ws_id=ws_id)

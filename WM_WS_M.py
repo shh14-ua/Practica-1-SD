@@ -32,7 +32,7 @@ class WSMonitor:
 
         self.central_sock: Optional[socket.socket] = None
         self.engine_sock: Optional[socket.socket] = None
-        self.leak_active = False
+        self.leak_active = True
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] [MONITOR {self.ws_id}] {msg}", flush=True)
@@ -99,8 +99,6 @@ class WSMonitor:
         self.log(f"Servidor de sockets escuchando en puerto {self.engine_port} a la espera de WM_WS_E...")
 
         tick = 0
-        engine_had_connected = False
-
         while self.running:
             # Mantener conexión con CENTRAL
             self.ensure_central_connection()
@@ -115,7 +113,6 @@ class WSMonitor:
                     resp = request_socket(c, f"ASSIGN#{self.ws_id}")
                     if "OK" in resp:
                         self.engine_sock = c
-                        engine_had_connected = True
                         self.log(f"Engine conectado desde {addr} y asignado con ID {self.ws_id}")
                     else:
                         c.close()
@@ -124,20 +121,19 @@ class WSMonitor:
             else:
                 time.sleep(1.0)
 
-            # Comprobación de salud cada segundo (HEALTH)
-            health = "OK"
+            health = "KO"
+
             if self.engine_sock:
                 try:
                     health = request_socket(self.engine_sock, "HEALTH")
                 except (OSError, ConnectionError):
                     self.log("El Engine dejó de responder a la comprobación de salud.")
-                    try: self.engine_sock.close()
-                    except Exception: pass
+                    try:
+                        self.engine_sock.close()
+                    except Exception:
+                        pass
                     self.engine_sock = None
                     health = "KO"
-            elif engine_had_connected:
-                # El Engine estuvo conectado pero se cayó -> se considera avería
-                health = "KO"
 
             current_is_leak = (health != "OK")
 
