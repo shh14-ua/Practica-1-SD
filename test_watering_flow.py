@@ -17,12 +17,19 @@ import io
 import os
 import queue
 import socket
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
+
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+for subdir in ("WM_Central", "WM_WS", "WM_FO"):
+    mod_path = os.path.join(ROOT_DIR, subdir)
+    if mod_path not in sys.path:
+        sys.path.insert(0, mod_path)
 
 import common
 import WM_Central
@@ -244,6 +251,25 @@ class WaterManagementFlowTests(unittest.TestCase):
             fo.run_interactive()
 
         self.assertEqual(calls, [("WS-01", 10), ("WS-02", 15), ("WS-01", 5)])
+
+        # Verificar que WM_Central localiza WM_Central/dashboard.html
+        central = WM_Central.WMCentral(
+            socket_port=get_free_port(),
+            kafka_bootstrap="localhost:9092",
+            web_port=0,
+            db_path=self.temp_db.name
+        )
+        self.active_instances.append(central)
+        html = central._get_dashboard_html()
+        self.assertNotIn("Error: dashboard.html no encontrado", html)
+        self.assertIn("<html", html.lower())
+
+        # Verificar que WM_FO localiza operaciones.txt tanto por nombre corto como por ruta WM_FO/operaciones.txt
+        batch_calls = []
+        fo.request_service = lambda ws, dur: (batch_calls.append((ws, dur)), fo.service_done_event.set())
+        with patch("time.sleep", lambda *a: None):
+            fo.run_file("operaciones.txt")
+        self.assertGreater(len(batch_calls), 0)
 
     def test_3_fault_tolerance_monitor_disconnect_stops_watering_and_blocks_manual(self):
         """Rúbrica: Si cae el Monitor de una WS, CENTRAL marca Desconectada, el riego en curso se detiene

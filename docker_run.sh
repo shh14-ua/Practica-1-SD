@@ -13,24 +13,29 @@ fi
 MODO=$1
 shift
 
+TTY_FLAG="-i"
+if [ -t 0 ]; then
+  TTY_FLAG="-it"
+fi
+
 case $MODO in
   central)
     echo "Iniciando WM_Central en contenedor Docker..."
-    docker run --rm -it --network=host \
+    docker run --rm $TTY_FLAG --network=host \
       -v "$(pwd)/data:/data" \
-      $IMAGE_NAME python WM_Central.py 5000 localhost:9092 --web-port 8080 --db /data/central.db "$@"
+      $IMAGE_NAME python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --db /data/central.db "$@"
     ;;
   monitor)
     echo "Iniciando WM_WS_M (Monitor) en contenedor Docker..."
-    docker run --rm -it --network=host $IMAGE_NAME python WM_WS_M.py "$@"
+    docker run --rm $TTY_FLAG --network=host $IMAGE_NAME python WM_WS/WM_WS_M.py "$@"
     ;;
   engine)
     echo "Iniciando WM_WS_E (Engine) en contenedor Docker..."
-    docker run --rm -it --network=host $IMAGE_NAME python WM_WS_E.py "$@"
+    docker run --rm $TTY_FLAG --network=host $IMAGE_NAME python WM_WS/WM_WS_E.py "$@"
     ;;
   fo)
     echo "Iniciando WM_FO (Field Operator) en contenedor Docker..."
-    docker run --rm -it --network=host $IMAGE_NAME python WM_FO.py "$@"
+    docker run --rm $TTY_FLAG --network=host $IMAGE_NAME python WM_FO/WM_FO.py "$@"
     ;;
   *)
     echo "Uso: ./docker_run.sh [central | monitor | engine | fo] [argumentos...]"
@@ -40,7 +45,7 @@ case $MODO in
     echo "  ./docker_run.sh monitor 6001 localhost:5000 WS-01 --loc 'River Park'"
     echo "  ./docker_run.sh engine localhost:9092 localhost:6001"
     echo "  ./docker_run.sh fo localhost:9092 FO-01"
-    echo "  ./docker_run.sh fo localhost:9092 FO-01 --file operaciones.txt"
+    echo "  ./docker_run.sh fo localhost:9092 FO-01 --file WM_FO/operaciones.txt"
     exit 1
     ;;
 esac

@@ -20,19 +20,19 @@ case $opcion in
     echo "Kafka en marcha en localhost:9092"
     ;;
   2)
-    .venv/bin/python WM_Central.py 5000 localhost:9092 --web-port 8080
+    .venv/bin/python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080
     ;;
   3)
-    .venv/bin/python WM_WS_M.py 6001 localhost:5000 WS-01 --loc "River Park Norte"
+    .venv/bin/python WM_WS/WM_WS_M.py 6001 localhost:5000 WS-01 --loc "River Park Norte"
     ;;
   4)
-    .venv/bin/python WM_WS_E.py localhost:9092 localhost:6001
+    .venv/bin/python WM_WS/WM_WS_E.py localhost:9092 localhost:6001
     ;;
   5)
-    .venv/bin/python WM_FO.py localhost:9092 FO-01
+    .venv/bin/python WM_FO/WM_FO.py localhost:9092 FO-01
     ;;
   6)
-    .venv/bin/python WM_FO.py localhost:9092 FO-01 --file operaciones.txt
+    .venv/bin/python WM_FO/WM_FO.py localhost:9092 FO-01 --file WM_FO/operaciones.txt
     ;;
   7)
     docker compose down

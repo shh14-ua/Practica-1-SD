@@ -20,6 +20,10 @@ import threading
 import time
 from typing import List, Dict, Any
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from common import (
     TOPIC_REQUESTS, TOPIC_REPLIES, TOPIC_STATUS,
     make_producer, send_kafka, make_consumer,
@@ -157,8 +161,15 @@ class FieldOperator:
     # --------------------------------------------------------------------------
     def run_file(self, file_path: str):
         if not os.path.isfile(file_path):
-            print(f"Error: El archivo '{file_path}' no existe.")
-            return
+            alt_in_module = os.path.join(os.path.dirname(os.path.abspath(__file__)), file_path)
+            alt_in_root = os.path.join(ROOT_DIR, file_path)
+            if os.path.isfile(alt_in_module):
+                file_path = alt_in_module
+            elif os.path.isfile(alt_in_root):
+                file_path = alt_in_root
+            else:
+                print(f"Error: El archivo '{file_path}' no existe.")
+                return
 
         with open(file_path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]

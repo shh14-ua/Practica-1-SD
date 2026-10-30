@@ -12,12 +12,17 @@ Funcionalidades:
 """
 
 import argparse
+import os
 import random
 import socket
 import sys
 import threading
 import time
 from typing import Optional
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 from common import (
     client_handshake, serve_one_socket, parse_addr,

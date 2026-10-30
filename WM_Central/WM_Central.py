@@ -22,6 +22,10 @@ import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
 from common import (
     STATUS_AVAILABLE, STATUS_WATERING, STATUS_LEAK, STATUS_OUT_OF_SERVICE, STATUS_OFFLINE,
     STATUS_STYLES, COLOR_RESET, COLOR_BOLD, COLOR_BLINK, format_status,
