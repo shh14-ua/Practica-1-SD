@@ -246,7 +246,7 @@ class WMCentral:
 
                 # Registro y autenticación inicial
                 if cmd in ("REGISTRO", "AUTH") and len(parts) >= 2:
-                    st_id = parts[1]
+                    st_id = parts[1].strip().upper()
                     location = parts[2] if len(parts) >= 3 else "Ubicación desconocida"
                     station_id = st_id
                     with self.lock:
@@ -299,17 +299,41 @@ class WMCentral:
                             self.set_station_status(station_id, STATUS_LEAK)
                             self.log("¡AVERÍA / FUGA DETECTADA!", ws_id=station_id)
                             if was_watering:
-                                self.notify_operator(st["operator"], "STEP", station_id,
+                                op_interrupted = st["operator"]
+                                vol_interrupted = st["vol"]
+                                start_interrupted = st["start_time"] or datetime.now().isoformat()
+                                st["interrupted_watering"] = {
+                                    "op": op_interrupted,
+                                    "vol": vol_interrupted,
+                                    "start_time": start_interrupted,
+                                    "ts": time.time(),
+                                }
+                                self.notify_operator(op_interrupted, "STEP", station_id,
                                                      "Fuga detectada: RIEGO INTERRUMPIDO INMEDIATAMENTE")
                                 self.send_ws_command(station_id, "STOP", reason="LEAK")
+                                threading.Thread(
+                                    target=self._finalize_interrupted_if_unreported,
+                                    args=(station_id, st["interrupted_watering"]["ts"]),
+                                    daemon=True
+                                ).start()
                     return "OK"
 
                 # Avería resuelta
                 if cmd in ("FIXED", "OK_LEAK"):
                     with self.lock:
                         if station_id in self.stations and self.stations[station_id]["status"] == STATUS_LEAK:
+                            st = self.stations[station_id]
+                            last_leak = st.pop("last_leak_summary", None)
+                            if last_leak:
+                                self.log(
+                                    f"Avería de fuga RESUELTA. Estado final del riego previo: "
+                                    f"{last_leak['vol']:.2f} L en {last_leak['dur']} s (Op: {last_leak['op']}). "
+                                    f"Estación disponible de nuevo.",
+                                    ws_id=station_id
+                                )
+                            else:
+                                self.log("Avería de fuga RESUELTA. Estación disponible de nuevo.", ws_id=station_id)
                             self.set_station_status(station_id, STATUS_AVAILABLE)
-                            self.log("Avería de fuga RESUELTA. Estación disponible de nuevo.", ws_id=station_id)
                     return "OK"
 
                 return "STATUS#KO#Comando no reconocido"
@@ -321,7 +345,7 @@ class WMCentral:
             pass
         finally:
             conn.close()
-            if station_id:
+            if station_id and self.running:
                 with self.lock:
                     if self.station_sockets.get(station_id) == conn:
                         del self.station_sockets[station_id]
@@ -331,20 +355,74 @@ class WMCentral:
                             st["pending_start"] = False
                             st["pending_since"] = None
                             if st["status"] == STATUS_WATERING:
-                                self.notify_operator(st["operator"], "SUMMARY", station_id,
-                                                     "Estación DESCONECTADA súbitamente: riego interrumpido")
+                                op_disc = st["operator"]
+                                vol_disc = st["vol"]
+                                start_disc = st["start_time"] or datetime.now().isoformat()
+                                self.send_ws_command(station_id, "STOP", reason="MONITOR_DOWN")
+                                self.notify_operator(
+                                    op_disc, "SUMMARY", station_id,
+                                    f"Estación DESCONECTADA súbitamente: riego interrumpido ({vol_disc:.2f} L consumidos)",
+                                    total_vol=vol_disc, duration=0, reason="MONITOR_DOWN"
+                                )
+                                self._record_watering_history(
+                                    ws_id=station_id,
+                                    op_id=op_disc or "MANUAL",
+                                    start_time=start_disc,
+                                    end_time=datetime.now().isoformat(),
+                                    total_vol=vol_disc,
+                                    duration_sec=0,
+                                    reason="MONITOR_DOWN"
+                                )
                             st["operator"] = None
                             st["flow"] = 0.0
                             st["vol"] = 0.0
                             self.set_station_status(station_id, STATUS_OFFLINE)
                             self.log("Conexión de socket cerrada: estación DESCONECTADA", ws_id=station_id)
 
+    def _finalize_interrupted_if_unreported(self, ws_id: str, interrupted_ts: float):
+        """Si el Engine cayó abruptamente (p. ej. muerte de proceso) y no envió FINISHED tras LEAK,
+        consolida el volumen acumulado en el historial y envía el SUMMARY al operario."""
+        time.sleep(1.5)
+        with self.lock:
+            st = self.stations.get(ws_id)
+            if not st:
+                return
+            info = st.get("interrupted_watering")
+            if not info or info.get("ts") != interrupted_ts:
+                return
+            st.pop("interrupted_watering", None)
+            op_id = info.get("op")
+            vol = float(info.get("vol", 0.0))
+            start_iso = info.get("start_time") or datetime.now().isoformat()
+            try:
+                dur = max(1, int((datetime.now() - datetime.fromisoformat(start_iso)).total_seconds()))
+            except Exception:
+                dur = 0
+
+            summary_msg = f"Riego FINALIZADO (LEAK): {vol:.2f} L consumidos en {dur} s"
+            self.notify_operator(op_id, "SUMMARY", ws_id, summary_msg,
+                                 total_vol=vol, duration=dur, reason="LEAK")
+            self._record_watering_history(
+                ws_id=ws_id,
+                op_id=op_id or "MANUAL",
+                start_time=start_iso,
+                end_time=datetime.now().isoformat(),
+                total_vol=vol,
+                duration_sec=dur,
+                reason="LEAK"
+            )
+            st["last_leak_summary"] = {"op": op_id or "MANUAL", "vol": vol, "dur": dur}
+            st["operator"] = None
+            st["flow"] = 0.0
+
     # --------------------------------------------------------------------------
     # GESTIÓN DE RIEGO (KAFKA: SOLICITUDES Y TELEMETRÍA)
     # --------------------------------------------------------------------------
     def request_watering(self, op: str, ws_id: str, duration: int):
         """Procesa una solicitud de riego (desde FO o desde CENTRAL). Soporta una WS o 'ALL'."""
-        if ws_id.strip().upper() == "ALL":
+        op = op.strip().upper()
+        ws_id = ws_id.strip().upper()
+        if ws_id == "ALL":
             with self.lock:
                 targets = list(self.stations.keys())
             for target in targets:
@@ -432,8 +510,10 @@ class WMCentral:
 
     def handle_ws_event(self, ev: dict):
         """Procesa eventos y telemetría emitidos por el motor de la estación (WM_WS_E)."""
-        ws_id = ev.get("ws")
-        ev_type = ev.get("type")
+        if not isinstance(ev, dict):
+            return
+        ws_id = str(ev.get("ws", "")).strip().upper()
+        ev_type = str(ev.get("type", "")).strip().upper()
         if not ws_id or ws_id not in self.stations:
             return
 
@@ -472,50 +552,95 @@ class WMCentral:
             elif ev_type == "FINISHED":
                 st["pending_start"] = False
                 st["pending_since"] = None
+                interrupted_info = st.pop("interrupted_watering", None)
+                op_id = ev.get("op") or st["operator"] or (interrupted_info["op"] if interrupted_info else "MANUAL")
                 total_vol = float(ev.get("vol", st["vol"]))
                 dur = int(ev.get("dur", 0))
                 reason = ev.get("reason", "OK")
+
+                # Si ya fue reportado por timeout de caída abrupta del Engine, no duplicar
+                if st.get("operator") is None and interrupted_info is None and st.get("last_leak_summary") and reason == "LEAK":
+                    return
+
                 summary_msg = f"Riego FINALIZADO ({reason}): {total_vol:.2f} L consumidos en {dur} s"
-                self.notify_operator(st["operator"], "SUMMARY", ws_id, summary_msg,
+                self.notify_operator(op_id, "SUMMARY", ws_id, summary_msg,
                                      total_vol=total_vol, duration=dur, reason=reason)
 
                 # Registrar en base de datos
                 self._record_watering_history(
                     ws_id=ws_id,
-                    op_id=st["operator"] or "MANUAL",
-                    start_time=st["start_time"] or datetime.now().isoformat(),
+                    op_id=op_id or "MANUAL",
+                    start_time=st["start_time"] or (interrupted_info["start_time"] if interrupted_info else datetime.now().isoformat()),
                     end_time=datetime.now().isoformat(),
                     total_vol=total_vol,
                     duration_sec=dur,
                     reason=reason
                 )
 
+                if reason == "LEAK":
+                    st["last_leak_summary"] = {"op": op_id or "MANUAL", "vol": total_vol, "dur": dur}
+
                 st["operator"] = None
                 st["flow"] = 0.0
                 if st["status"] == STATUS_WATERING:
-                    self.set_station_status(ws_id, STATUS_AVAILABLE)
+                    if reason == "LEAK":
+                        self.set_station_status(ws_id, STATUS_LEAK)
+                    elif reason == "MONITOR_DOWN":
+                        self.set_station_status(ws_id, STATUS_OFFLINE)
+                    else:
+                        self.set_station_status(ws_id, STATUS_AVAILABLE)
 
     # --------------------------------------------------------------------------
     # CONSUMIDORES Y PUBLICADORES KAFKA
     # --------------------------------------------------------------------------
     def run_kafka_requests_consumer(self):
-        consumer = make_consumer(self.kafka_bootstrap, [TOPIC_REQUESTS], group_prefix="central-requests")
-        for msg in consumer:
-            if not self.running:
-                break
-            data = msg.value
-            op = data.get("op")
-            ws_id = data.get("ws")
-            duration = int(data.get("duration", 10))
-            if op and ws_id:
-                self.request_watering(op, ws_id, duration)
+        while self.running:
+            try:
+                consumer = make_consumer(
+                    self.kafka_bootstrap,
+                    [TOPIC_REQUESTS],
+                    group_prefix="central-requests",
+                    group_id="central-requests",
+                    auto_offset_reset="latest"
+                )
+                for msg in consumer:
+                    if not self.running:
+                        break
+                    data = msg.value
+                    if not isinstance(data, dict):
+                        continue
+                    op = str(data.get("op", "")).strip().upper()
+                    ws_id = str(data.get("ws", "")).strip().upper()
+                    try:
+                        duration = int(data.get("duration", 10))
+                    except (ValueError, TypeError):
+                        duration = 10
+                    if op and ws_id:
+                        self.request_watering(op, ws_id, duration)
+            except Exception as exc:
+                if self.running:
+                    self.log(f"Aviso en consumidor Kafka fo_requests ({exc}). Reintentando...")
+                    time.sleep(2.0)
 
     def run_kafka_events_consumer(self):
-        consumer = make_consumer(self.kafka_bootstrap, [TOPIC_EVENTS], group_prefix="central-events")
-        for msg in consumer:
-            if not self.running:
-                break
-            self.handle_ws_event(msg.value)
+        while self.running:
+            try:
+                consumer = make_consumer(
+                    self.kafka_bootstrap,
+                    [TOPIC_EVENTS],
+                    group_prefix="central-events",
+                    group_id="central-events",
+                    auto_offset_reset="latest"
+                )
+                for msg in consumer:
+                    if not self.running:
+                        break
+                    if isinstance(msg.value, dict):
+                        self.handle_ws_event(msg.value)
+            except Exception as exc:
+                if self.running:
+                    self.log(f"Aviso en consumidor Kafka ws_events ({exc}). Reintentando...")
+                    time.sleep(2.0)
 
     def run_kafka_status_publisher(self):
         """Publica periódicamente el snapshot del estado de todas las estaciones en Kafka (TOPIC_STATUS)."""
@@ -791,13 +916,15 @@ def main():
     # Detectar puerto web automático si Railway o el entorno define PORT
     env_port = os.getenv("PORT")
     default_web = int(env_port) if env_port and env_port.isdigit() else 8080
+    default_db = os.getenv("DB_PATH", "central.db")
+    env_kafka = os.getenv("KAFKA_BOOTSTRAP")
 
     parser = argparse.ArgumentParser(
         description="WM_Central: Módulo central de control de riego WaterManagement."
     )
     parser.add_argument("args", nargs="*", help="[puerto_sockets] [kafka_host:puerto] o [puerto_sockets] [kafka_host] [kafka_puerto]")
     parser.add_argument("--web-port", type=int, default=default_web, help="Puerto para el cuadro de mandos Web (por defecto 8080 o $PORT)")
-    parser.add_argument("--db", default="central.db", help="Ruta del fichero SQLite (por defecto central.db)")
+    parser.add_argument("--db", default=default_db, help="Ruta del fichero SQLite (por defecto central.db o $DB_PATH)")
 
     parsed = parser.parse_args()
     raw_args = parsed.args
@@ -813,10 +940,12 @@ def main():
         # Argumentos restantes: Kafka host y puerto
         if len(raw_args) == 2:
             kafka_bootstrap = raw_args[1]
+            if kafka_bootstrap == "kafka:19092" and env_kafka:
+                kafka_bootstrap = env_kafka
         elif len(raw_args) >= 3:
             kafka_bootstrap = f"{raw_args[1]}:{raw_args[2]}"
         else:
-            kafka_bootstrap = "localhost:9092"
+            kafka_bootstrap = env_kafka or "localhost:9092"
     except Exception as e:
         print(f"Error procesando argumentos: {e}")
         sys.exit(1)

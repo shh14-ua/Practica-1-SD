@@ -215,28 +215,50 @@ def make_producer(bootstrap: str, max_retries: int = 15, delay: float = 2.0) -> 
             time.sleep(delay)
     raise ConnectionError(f"No se pudo conectar al broker Kafka en {bootstrap}")
 
-def send_kafka(producer: KafkaProducer, topic: str, message_dict: dict) -> None:
-    """Envía un diccionario como mensaje JSON al tópico indicado y realiza flush."""
+def send_kafka(producer: KafkaProducer, topic: str, message_dict: dict, timeout: float = 5.0) -> bool:
+    """Envía un diccionario como mensaje JSON al tópico indicado y verifica su entrega."""
     try:
-        producer.send(topic, message_dict)
-        producer.flush()
+        future = producer.send(topic, message_dict)
+        future.get(timeout=timeout)
+        return True
     except Exception as exc:
         print(f"[KAFKA ERROR] Error enviando mensaje a '{topic}': {exc}", file=sys.stderr)
+        return False
 
-def make_consumer(bootstrap: str, topics, group_prefix: str = "wm", auto_offset_reset: str = "latest") -> KafkaConsumer:
+def _safe_json_loads(raw_bytes: bytes):
+    """Deserializa JSON de forma segura devolviendo None si el mensaje está corrupto o vacío."""
+    if not raw_bytes:
+        return None
+    try:
+        return json.loads(raw_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+def make_consumer(bootstrap: str, topics, group_prefix: str = "wm",
+                  auto_offset_reset: str = "latest", group_id: Optional[str] = None,
+                  max_retries: int = 15, delay: float = 2.0) -> KafkaConsumer:
     """
-    Crea un KafkaConsumer para los tópicos indicados.
-    Usa un group_id único para garantizar que cada réplica/operario reciba los mensajes en tiempo real.
+    Crea un KafkaConsumer para los tópicos indicados con reintentos de conexión
+    y deserialización segura. Fuerza una primera asignación de particiones con poll().
     """
-    group_id = f"{group_prefix}-{uuid.uuid4().hex[:8]}"
-    return KafkaConsumer(
-        *topics,
-        bootstrap_servers=bootstrap,
-        group_id=group_id,
-        auto_offset_reset=auto_offset_reset,
-        enable_auto_commit=True,
-        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-    )
+    gid = group_id or f"{group_prefix}-{uuid.uuid4().hex[:8]}"
+    for attempt in range(1, max_retries + 1):
+        try:
+            consumer = KafkaConsumer(
+                *topics,
+                bootstrap_servers=bootstrap,
+                group_id=gid,
+                auto_offset_reset=auto_offset_reset,
+                enable_auto_commit=True,
+                value_deserializer=_safe_json_loads,
+            )
+            consumer.poll(timeout_ms=500)
+            return consumer
+        except NoBrokersAvailable:
+            if attempt % 3 == 0 or attempt == 1:
+                print(f"[KAFKA] Esperando broker para consumidor en {bootstrap}... (intento {attempt}/{max_retries})")
+            time.sleep(delay)
+    raise ConnectionError(f"No se pudo conectar el consumidor al broker Kafka en {bootstrap}")
 
 
 # ==============================================================================

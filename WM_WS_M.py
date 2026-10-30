@@ -65,7 +65,7 @@ class WSMonitor:
                 sock.close()
                 return False
         except (OSError, ConnectionError) as exc:
-            self.log(f"Aviso: CENTRAL no disponible ({exc}). Reintentando conexión...")
+            self.log(f"ERROR: Imposible conectar con WM_Central ({exc}). Reintentando conexión...")
             if self.central_sock:
                 try: self.central_sock.close()
                 except Exception: pass
@@ -80,7 +80,7 @@ class WSMonitor:
             resp = request_socket(self.central_sock, msg)
             return "OK" in resp
         except (OSError, ConnectionError):
-            self.log("Se perdió la conexión con CENTRAL al enviar mensaje.")
+            self.log("ERROR: Imposible conectar con WM_Central (se perdió la conexión al enviar mensaje).")
             try: self.central_sock.close()
             except Exception: pass
             self.central_sock = None
@@ -101,7 +101,7 @@ class WSMonitor:
         tick = 0
         while self.running:
             # Mantener conexión con CENTRAL
-            self.ensure_central_connection()
+            central_ok = self.ensure_central_connection()
 
             # Aceptar conexión del Engine si no está conectado
             if self.engine_sock is None:
@@ -125,7 +125,8 @@ class WSMonitor:
 
             if self.engine_sock:
                 try:
-                    health = request_socket(self.engine_sock, "HEALTH")
+                    health_cmd = "HEALTH#OK" if central_ok else "HEALTH#NO_CENTRAL"
+                    health = request_socket(self.engine_sock, health_cmd)
                 except (OSError, ConnectionError):
                     self.log("El Engine dejó de responder a la comprobación de salud.")
                     try:
