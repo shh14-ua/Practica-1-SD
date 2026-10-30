@@ -71,33 +71,30 @@ def send_frame(sock: socket.socket, message: str, retries: int = 3) -> bool:
 def recv_frame(sock: socket.socket) -> Optional[str]:
     """
     Recibe una trama con el formato <STX><DATA><ETX><LRC>.
-    Comprueba el LRC:
-      - Si es válido: responde <ACK> y devuelve el contenido de DATA decodificado en UTF-8.
-      - Si es inválido: responde <NACK> y devuelve None.
+    Si el LRC es válido, responde ACK.
+    Si es incorrecto, responde NACK y devuelve None.
+    Si se cierra la conexión, propaga la excepción.
     """
-    try:
+    first_byte = _read_exact(sock, 1)
+
+    while first_byte != STX:
         first_byte = _read_exact(sock, 1)
-        # Sincronización en caso de bytes espurios: avanzar hasta encontrar STX
-        while first_byte != STX:
-            first_byte = _read_exact(sock, 1)
 
-        data = b""
-        while True:
-            byte = _read_exact(sock, 1)
-            if byte == ETX:
-                break
-            data += byte
+    data = b""
+    while True:
+        byte = _read_exact(sock, 1)
+        if byte == ETX:
+            break
+        data += byte
 
-        expected_lrc = _read_exact(sock, 1)
-        actual_lrc = lrc(data)
+    expected_lrc = _read_exact(sock, 1)
+    actual_lrc = lrc(data)
 
-        if expected_lrc == actual_lrc:
-            sock.sendall(ACK)
-            return data.decode("utf-8", errors="replace")
-        else:
-            sock.sendall(NACK)
-            return None
-    except (OSError, ConnectionError):
+    if expected_lrc == actual_lrc:
+        sock.sendall(ACK)
+        return data.decode("utf-8", errors="replace")
+    else:
+        sock.sendall(NACK)
         return None
 
 def recv_msg(sock: socket.socket) -> str:
