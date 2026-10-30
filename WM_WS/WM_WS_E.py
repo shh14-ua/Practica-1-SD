@@ -167,7 +167,7 @@ class WSEngine:
             self.state = "WATERING"
             self.current_op = op
             self.accumulated_vol = 0.0
-            self.watering_start_time = time.time()
+            self.watering_start_time = time.monotonic()
             self.duration_limit = duration
             self.session_id += 1
 
@@ -177,6 +177,7 @@ class WSEngine:
             # Iniciar hilo de bombeo y telemetría
             threading.Thread(target=self._water_loop, args=(self.session_id,), daemon=True).start()
 
+
     def _water_loop(self, sid: int):
         while self.running:
             time.sleep(1.0)
@@ -184,17 +185,31 @@ class WSEngine:
                 if self.session_id != sid or self.state != "WATERING":
                     break
 
-                # Simulación de caudalímetro: ~8 a 12 L/min
+                elapsed = time.monotonic() - self.watering_start_time
+
+                # Comprobar el límite antes de generar otra medición.
+                if self.duration_limit > 0 and elapsed >= self.duration_limit:
+                    self.finish_watering("TIME")
+                    break
+
+                # Simulación de caudalímetro: ~8 a 12 L/min.
                 flow = round(random.uniform(8.5, 11.5), 2)
-                # En 1 segundo se consumen (flow / 60) litros
                 self.accumulated_vol += flow / 60.0
                 curr_vol = round(self.accumulated_vol, 2)
 
-                self.send_event("TELEMETRY", flow=flow, vol=curr_vol, op=self.current_op)
-                self.log(f"   [Telemetría] Caudal: {flow:.1f} L/min | Acumulado: {curr_vol:.2f} L")
+                self.send_event(
+                    "TELEMETRY",
+                    flow=flow,
+                    vol=curr_vol,
+                    op=self.current_op
+                )
+                self.log(
+                    f"   [Telemetría] Caudal: {flow:.1f} L/min | "
+                    f"Acumulado: {curr_vol:.2f} L"
+                )
 
-                # Comprobación de tiempo límite
-                elapsed = time.time() - self.watering_start_time
+                # El envío de telemetría también puede consumir tiempo.
+                elapsed = time.monotonic() - self.watering_start_time
                 if self.duration_limit > 0 and elapsed >= self.duration_limit:
                     self.finish_watering("TIME")
                     break
@@ -204,7 +219,7 @@ class WSEngine:
             if self.state != "WATERING":
                 return
 
-            elapsed = max(1, int(round(time.time() - self.watering_start_time)))
+            elapsed = max(0, int(round(time.monotonic() - self.watering_start_time)))
             total_vol = round(self.accumulated_vol, 2)
             op = self.current_op
 
