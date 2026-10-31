@@ -189,6 +189,15 @@ class WaterManagementFlowTests(unittest.TestCase):
         threading.Thread(target=central.run_kafka_events_consumer, daemon=True).start()
         threading.Thread(target=central.run_kafka_status_publisher, daemon=True).start()
 
+        # Esperar a que los consumidores de CENTRAL estén registrados antes de continuar
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            with self.broker.lock:
+                gids = {c.group_id for c in self.broker.consumers}
+            if "central-requests" in gids and "central-events" in gids:
+                break
+            time.sleep(0.02)
+
         monitor = WM_WS_M.WSMonitor(
             engine_port=engine_port,
             central_addr=f"127.0.0.1:{central_port}",
@@ -207,15 +216,19 @@ class WaterManagementFlowTests(unittest.TestCase):
         assigned = engine.assigned_event.wait(timeout=5.0)
         self.assertTrue(assigned, "El Monitor no asignó ID al Engine a tiempo")
         threading.Thread(target=engine.run_commands_consumer, daemon=True).start()
-        time.sleep(0.1)
 
-        # Esperar a que WS-01 pase a DISPONIBLE en CENTRAL y el Engine tenga confirmado el enlace
+        # Esperar a que WS-01 pase a DISPONIBLE en CENTRAL, el Engine tenga enlace OK y su consumidor Kafka esté listo
         deadline = time.time() + 5.0
         while time.time() < deadline:
+            with self.broker.lock:
+                engine_consumer_ready = any(
+                    c.group_id.startswith(f"engine-{ws_id}") for c in self.broker.consumers
+                )
             if (
                 central.stations.get(ws_id, {}).get("status") == common.STATUS_AVAILABLE
                 and engine.central_connected
                 and engine.monitor_connected
+                and engine_consumer_ready
             ):
                 break
             time.sleep(0.05)
@@ -316,7 +329,11 @@ class WaterManagementFlowTests(unittest.TestCase):
 
         deadline = time.time() + 3.0
         while time.time() < deadline:
-            if central.stations["WS-01"]["status"] == common.STATUS_OFFLINE and engine.state == "AVAILABLE":
+            if (
+                central.stations["WS-01"]["status"] == common.STATUS_OFFLINE
+                and engine.state == "AVAILABLE"
+                and not engine.monitor_connected
+            ):
                 break
             time.sleep(0.05)
 
@@ -347,20 +364,23 @@ class WaterManagementFlowTests(unittest.TestCase):
         # Simular avería en el Engine (equivalente a pulsar 'k' o caída de sensor)
         with engine.lock:
             engine.is_ko = True
-            engine.finish_watering("LEAK")
+        engine.finish_watering("LEAK")
 
-        # Esperar a que el Monitor detecte KO (monitor.leak_active = True) y CENTRAL marque FUGA DETECTADA
+        # Esperar a que el Monitor detecte KO, CENTRAL marque FUGA y se persista el registro en SQLite
+        rows = []
         deadline = time.time() + 4.0
-        while time.time() < deadline and (
-            central.stations["WS-01"]["status"] != common.STATUS_LEAK or not monitor.leak_active
-        ):
-            time.sleep(0.1)
+        while time.time() < deadline:
+            with central._get_db() as db:
+                rows = db.execute("SELECT * FROM watering_history WHERE ws_id = 'WS-01' AND reason = 'LEAK'").fetchall()
+            if (
+                central.stations["WS-01"]["status"] == common.STATUS_LEAK
+                and monitor.leak_active
+                and len(rows) == 1
+            ):
+                break
+            time.sleep(0.05)
         self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_LEAK)
         self.assertTrue(monitor.leak_active)
-
-        # Verificar que el volumen regado antes del fallo se guardó en SQLite
-        with central._get_db() as db:
-            rows = db.execute("SELECT * FROM watering_history WHERE ws_id = 'WS-01' AND reason = 'LEAK'").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertGreater(rows[0]["total_vol"], 0.0)
 
