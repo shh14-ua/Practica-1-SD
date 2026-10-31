@@ -38,6 +38,9 @@ class WSMonitor:
         self.central_sock: Optional[socket.socket] = None
         self.engine_sock: Optional[socket.socket] = None
         self.leak_active = True
+        self.leak_reason: str = "NO_ENGINE"
+        self.central_blocked: bool = False
+        self.engine_block_synced: Optional[bool] = None
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] [MONITOR {self.ws_id}] {msg}", flush=True)
@@ -60,6 +63,7 @@ class WSMonitor:
 
             if resp.startswith("STATUS#OK#"):
                 self.central_sock = sock
+                self.central_blocked = "#BLOCKED" in resp
                 self.log(f"Autenticado correctamente en CENTRAL ({self.central_host}:{self.central_port})")
 
                 # Central vuelve a comprobar el estado de la estación tras autenticarse.
@@ -85,6 +89,7 @@ class WSMonitor:
             return False
         try:
             resp = request_socket(self.central_sock, msg)
+            self.central_blocked = "#BLOCKED" in resp
             return "OK" in resp
         except (OSError, ConnectionError):
             self.log("ERROR: Imposible conectar con WM_Central (se perdió la conexión al enviar mensaje).")
@@ -92,6 +97,25 @@ class WSMonitor:
             except Exception: pass
             self.central_sock = None
             return False
+
+    def _build_health_cmd(self, central_ok: bool) -> str:
+        base_flag = "OK" if central_ok else "NO_CENTRAL"
+        if self.engine_block_synced != self.central_blocked:
+            if self.central_blocked:
+                return f"HEALTH#{base_flag}#BLOCKED"
+            if self.engine_block_synced is not None:
+                return f"HEALTH#{base_flag}#ACTIVE"
+        return f"HEALTH#{base_flag}"
+
+    def _sync_engine_block_if_needed(self, central_ok: bool):
+        if self.engine_sock is None or self.engine_block_synced == self.central_blocked:
+            return
+        try:
+            cmd = f"HEALTH#{'OK' if central_ok else 'NO_CENTRAL'}#{'BLOCKED' if self.central_blocked else 'ACTIVE'}"
+            request_socket(self.engine_sock, cmd)
+            self.engine_block_synced = self.central_blocked
+        except (OSError, ConnectionError):
+            pass
 
     # --------------------------------------------------------------------------
     # BUCLE PRINCIPAL DE MONITORIZACIÓN
@@ -120,6 +144,7 @@ class WSMonitor:
                     resp = request_socket(c, f"ASSIGN#{self.ws_id}")
                     if "OK" in resp:
                         self.engine_sock = c
+                        self.engine_block_synced = None
                         self.log(f"Engine conectado desde {addr} y asignado con ID {self.ws_id}")
                     else:
                         c.close()
@@ -129,11 +154,14 @@ class WSMonitor:
                 time.sleep(1.0)
 
             health = "KO"
+            leak_reason = "NO_ENGINE"
 
             if self.engine_sock:
                 try:
-                    health_cmd = "HEALTH#OK" if central_ok else "HEALTH#NO_CENTRAL"
+                    health_cmd = self._build_health_cmd(central_ok)
                     health = request_socket(self.engine_sock, health_cmd)
+                    self.engine_block_synced = self.central_blocked
+                    leak_reason = "OK" if health == "OK" else "SENSOR_KO"
                 except (OSError, ConnectionError):
                     self.log("El Engine dejó de responder a la comprobación de salud.")
                     try:
@@ -141,25 +169,33 @@ class WSMonitor:
                     except Exception:
                         pass
                     self.engine_sock = None
+                    self.engine_block_synced = None
                     health = "KO"
+                    leak_reason = "NO_ENGINE"
 
+            prev_reason = self.leak_reason
+            self.leak_reason = leak_reason
             current_is_leak = (health != "OK")
 
-            # Si cambia el estado de fuga, informar a CENTRAL inmediatamente
-            if current_is_leak != self.leak_active:
+            # Si cambia el estado de fuga o el motivo de avería, informar a CENTRAL inmediatamente
+            if current_is_leak != self.leak_active or (current_is_leak and leak_reason != prev_reason):
                 if current_is_leak:
-                    self.log("¡AVERÍA / FUGA DETECTADA! Notificando a CENTRAL...")
-                    if self.send_to_central(f"LEAK#{self.ws_id}"):
+                    self.log(f"¡AVERÍA / FUGA DETECTADA! ({leak_reason}) Notificando a CENTRAL...")
+                    if self.send_to_central(f"LEAK#{self.ws_id}#{leak_reason}"):
                         self.leak_active = True
+                        self._sync_engine_block_if_needed(central_ok)
                 else:
                     self.log("Avería resuelta (salud OK). Notificando a CENTRAL...")
                     if self.send_to_central(f"FIXED#{self.ws_id}"):
                         self.leak_active = False
+                        self._sync_engine_block_if_needed(central_ok)
 
             # Latido periódico hacia CENTRAL cada 3 ticks (3 segundos)
             tick += 1
             if tick % 3 == 0:
-                self.send_to_central(f"PING#{self.ws_id}")
+                state_code = "KO" if current_is_leak else "OK"
+                if self.send_to_central(f"PING#{self.ws_id}#{state_code}#{leak_reason}"):
+                    self._sync_engine_block_if_needed(central_ok)
 
 
 # ==============================================================================

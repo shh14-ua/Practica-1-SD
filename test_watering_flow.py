@@ -543,5 +543,172 @@ class WaterManagementFlowTests(unittest.TestCase):
             "La telemetría llegó después del evento FINISHED"
         )
 
+    def test_9_activate_all_verifies_engine_and_keeps_monitor_only_in_leak(self):
+        """Verifica que ACTIVATE (individual y ALL) comprueba cada estación por separado:
+        - Con Monitor y Engine operativos -> pasa a DISPONIBLE (verde).
+        - Con Monitor pero sin Engine -> pasa a FUGA (rojo) y registra el motivo.
+        - Con Monitor y Engine en KO -> pasa a FUGA (rojo) y registra el motivo.
+        - Sin Monitor -> permanece en DESCONECTADA."""
+        central, monitor1, engine1 = self._start_cluster("WS-01")
+        central_port = monitor1.central_port
+
+        # Conectar WS-02 únicamente con Monitor (sin Engine)
+        monitor2 = WM_WS_M.WSMonitor(
+            engine_port=get_free_port(),
+            central_addr=f"127.0.0.1:{central_port}",
+            ws_id="WS-02",
+            location="East Garden"
+        )
+        self.active_instances.append(monitor2)
+        threading.Thread(target=monitor2.run, daemon=True).start()
+
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if (
+                "WS-02" in central.station_sockets
+                and central.stations["WS-02"]["status"] == common.STATUS_LEAK
+                and monitor2.leak_active is True
+            ):
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
+        self.assertEqual(central.stations["WS-02"]["status"], common.STATUS_LEAK)
+        self.assertFalse(central.stations["WS-02"]["engine_ok"])
+        self.assertEqual(central.stations["WS-03"]["status"], common.STATUS_OFFLINE)
+
+        # 1. Bloquear todas las estaciones (b ALL)
+        central.block_station("ALL")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and engine1.state != "BLOCKED":
+            time.sleep(0.05)
+
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertEqual(central.stations["WS-02"]["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertEqual(central.stations["WS-03"]["status"], common.STATUS_OFFLINE)
+        self.assertEqual(engine1.state, "BLOCKED")
+
+        # 2. Activar todas las estaciones (a ALL)
+        central.activate_station("ALL")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and engine1.state != "AVAILABLE":
+            time.sleep(0.05)
+
+        # WS-01 tiene Monitor y Engine operativos -> DISPONIBLE
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
+        self.assertEqual(engine1.state, "AVAILABLE")
+        # WS-02 tiene Monitor pero NO Engine -> FUGA (rojo) con motivo registrado
+        self.assertEqual(central.stations["WS-02"]["status"], common.STATUS_LEAK)
+        self.assertTrue(
+            any(
+                entry["ws"] == "WS-02" and "Engine no conectado al Monitor" in entry["message"]
+                for entry in central.recent_logs
+            ),
+            "Debe registrarse que WS-02 pasa/se mantiene en FUGA porque el Engine no está conectado al Monitor"
+        )
+        # WS-03 no tiene Monitor -> DESCONECTADA
+        self.assertEqual(central.stations["WS-03"]["status"], common.STATUS_OFFLINE)
+
+        # 3. Si WS-01 entra en KO y se bloquea/activa, tampoco puede pasar a DISPONIBLE mientras siga en KO
+        with engine1.lock:
+            engine1.is_ko = True
+        deadline = time.time() + 3.0
+        while time.time() < deadline and central.stations["WS-01"]["status"] != common.STATUS_LEAK:
+            time.sleep(0.05)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_LEAK)
+
+        central.block_station("WS-01")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        central.activate_station("WS-01")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_LEAK)
+        self.assertTrue(
+            any(
+                entry["ws"] == "WS-01" and "Avería / fuga detectada en Engine" in entry["message"]
+                for entry in central.recent_logs
+            )
+        )
+
+    def test_10_block_persists_until_explicit_activate_and_syncs_late_engine(self):
+        """Verifica que:
+        - Una estación en FUERA DE SERVICIO mantiene el bloqueo aunque el Monitor envíe LEAK o FIXED.
+        - Si WM_WS_E arranca después de haberse ejecutado BLOCK en Central, la estación sigue en FUERA DE SERVICIO
+          y el nuevo Engine queda sincronizado en estado BLOCKED (rechazando riegos manuales) hasta orden ACTIVATE."""
+        central_port = get_free_port()
+        engine_port = get_free_port()
+
+        central = WM_Central.WMCentral(
+            socket_port=central_port,
+            kafka_bootstrap="localhost:9092",
+            web_port=0,
+            db_path=self.temp_db.name
+        )
+        self.active_instances.append(central)
+        threading.Thread(target=central.run_socket_server, daemon=True).start()
+        threading.Thread(target=central.run_kafka_requests_consumer, daemon=True).start()
+        threading.Thread(target=central.run_kafka_events_consumer, daemon=True).start()
+
+        # Arrancar solo Monitor para WS-01 (sin Engine)
+        monitor = WM_WS_M.WSMonitor(
+            engine_port=engine_port,
+            central_addr=f"127.0.0.1:{central_port}",
+            ws_id="WS-01",
+            location="River Park"
+        )
+        self.active_instances.append(monitor)
+        threading.Thread(target=monitor.run, daemon=True).start()
+
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if "WS-01" in central.station_sockets and monitor.leak_active is True:
+                break
+            time.sleep(0.05)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_LEAK)
+
+        # Ejecutar BLOCK en Central antes de que arranque el Engine
+        central.block_station("WS-01")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Arrancar Engine DESPUÉS del BLOCK
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr=f"127.0.0.1:{engine_port}"
+        )
+        self.active_instances.append(engine)
+        threading.Thread(target=engine.link_monitor, daemon=True).start()
+        self.assertTrue(engine.assigned_event.wait(timeout=5.0))
+        threading.Thread(target=engine.run_commands_consumer, daemon=True).start()
+
+        # Esperar a que el Monitor detecte salud OK, notifique FIXED a Central y sincronice el bloqueo con el Engine
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            if (
+                central.stations["WS-01"]["engine_ok"] is True
+                and engine.state == "BLOCKED"
+            ):
+                break
+            time.sleep(0.05)
+
+        # Central debe seguir en FUERA DE SERVICIO (FIXED no debe desbloquearla sin orden explícita)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertTrue(central.stations["WS-01"]["engine_ok"])
+        self.assertEqual(engine.state, "BLOCKED")
+
+        # Intentar riego manual en el Engine recién arrancado -> debe rechazarse por estar FUERA DE SERVICIO
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            engine.start_watering("MANUAL", 0)
+        self.assertIn("FUERA DE SERVICIO", buf.getvalue())
+        self.assertEqual(engine.state, "BLOCKED")
+
+        # Ahora enviar orden explícita de activación desde Central
+        central.activate_station("WS-01")
+        deadline = time.time() + 3.0
+        while time.time() < deadline and engine.state != "AVAILABLE":
+            time.sleep(0.05)
+
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
+        self.assertEqual(engine.state, "AVAILABLE")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

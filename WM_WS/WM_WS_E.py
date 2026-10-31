@@ -161,6 +161,17 @@ class WSEngine:
                                     if self.pending_finished_events and not self.is_ko:
                                         self.flush_pending_finished()
 
+                            if len(parts) >= 3:
+                                block_flag = parts[2].strip().upper()
+                                if block_flag == "BLOCKED" and self.state != "BLOCKED":
+                                    if self.state == "WATERING":
+                                        self.finish_watering("CENTRAL_BLOCK")
+                                    self.state = "BLOCKED"
+                                    self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
+                                elif block_flag == "ACTIVE" and self.state == "BLOCKED":
+                                    self.state = "AVAILABLE"
+                                    self.log("Estación REACTIVADA por CENTRAL: lista para prestar servicio")
+
                             if self.is_ko:
                                 # Si hay avería mientras riega, se interrumpe inmediatamente
                                 if self.state == "WATERING":
@@ -201,7 +212,10 @@ class WSEngine:
                 self.log("AVERIADA: No se puede iniciar riego: sensor en estado de avería (KO).")
                 return
             if self.state != "AVAILABLE":
-                self.log(f"No se puede iniciar riego: estado actual es {self.state}")
+                if self.state == "BLOCKED":
+                    self.log("No se puede iniciar riego: la estación está FUERA DE SERVICIO (BLOCKED por CENTRAL)")
+                else:
+                    self.log(f"No se puede iniciar riego: estado actual es {self.state}")
                 return
 
             self.state = "WATERING"

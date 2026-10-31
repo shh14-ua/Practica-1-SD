@@ -160,8 +160,19 @@ class WMCentral:
                     "transaction_id": None,
                     "pending_start": False,
                     "pending_since": None,
+                    "engine_ok": False,
+                    "engine_reason": "Engine no conectado al Monitor",
                     "last_active": time.time(),
                 }
+
+    @staticmethod
+    def _format_leak_reason(reason_code: str) -> str:
+        code = (reason_code or "").strip().upper()
+        if code == "NO_ENGINE":
+            return "Engine no conectado al Monitor"
+        if code == "SENSOR_KO":
+            return "Avería / fuga detectada en Engine"
+        return "Avería / fuga detectada o Engine no operativo"
 
     def _update_station_db(self, ws_id: str, location: Optional[str] = None, status: Optional[str] = None):
         with self.lock, self._get_db() as db:
@@ -320,6 +331,8 @@ class WMCentral:
                         st = self.stations[st_id]
                         st["location"] = location
                         st["last_active"] = time.time()
+                        st["engine_ok"] = False
+                        st["engine_reason"] = "Engine no conectado al Monitor"
 
                         if st["status"] != STATUS_OUT_OF_SERVICE:
                             self.set_station_status(st_id, STATUS_LEAK)
@@ -334,26 +347,59 @@ class WMCentral:
                             f"Estación conectada y AUTENTICADA: estado {st['status']}",
                             ws_id=st_id
                         )
+                        is_blocked = st["status"] == STATUS_OUT_OF_SERVICE
 
-                    return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente"
+                    suffix = "#BLOCKED" if is_blocked else ""
+                    return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente{suffix}"
                 if not station_id:
                     return "STATUS#KO#No autenticado"
 
                 # Comprobación de latido (Keepalive / Heartbeat)
                 if cmd == "PING":
                     with self.lock:
-                        if station_id in self.stations:
-                            self.stations[station_id]["last_active"] = time.time()
-                    return "OK"
+                        st = self.stations.get(station_id)
+                        if st:
+                            st["last_active"] = time.time()
+                            if len(parts) >= 3:
+                                health_state = parts[2].strip().upper()
+                                reason_code = parts[3].strip().upper() if len(parts) >= 4 else "LEAK"
+                                if health_state == "KO":
+                                    reason_text = self._format_leak_reason(reason_code)
+                                    st["engine_ok"] = False
+                                    st["engine_reason"] = reason_text
+                                    if st["status"] == STATUS_AVAILABLE:
+                                        self.set_station_status(station_id, STATUS_LEAK)
+                                        self.log(f"Estación pasa a FUGA: {reason_text}", ws_id=station_id)
+                                elif health_state == "OK":
+                                    st["engine_ok"] = True
+                                    st["engine_reason"] = "OK"
+                                    if st["status"] == STATUS_LEAK:
+                                        self.set_station_status(station_id, STATUS_AVAILABLE)
+                                        self.log("Engine operativo confirmado. Estación disponible de nuevo.", ws_id=station_id)
+                            is_blocked = st["status"] == STATUS_OUT_OF_SERVICE
+                        else:
+                            is_blocked = False
+                    return "OK#BLOCKED" if is_blocked else "OK"
 
                 # Detección de avería / fuga reportada por el monitor
                 if cmd == "LEAK":
+                    reason_code = parts[2].strip().upper() if len(parts) >= 3 else "LEAK"
+                    reason_text = self._format_leak_reason(reason_code)
                     with self.lock:
                         st = self.stations.get(station_id)
                         if st:
+                            st["engine_ok"] = False
+                            st["engine_reason"] = reason_text
+                            if st["status"] == STATUS_OUT_OF_SERVICE:
+                                self.log(
+                                    f"Incidencia reportada ({reason_text}); se mantiene en FUERA DE SERVICIO por bloqueo de CENTRAL",
+                                    ws_id=station_id
+                                )
+                                return "OK#BLOCKED"
+
                             was_watering = st["status"] == STATUS_WATERING
                             self.set_station_status(station_id, STATUS_LEAK)
-                            self.log("¡AVERÍA / FUGA DETECTADA!", ws_id=station_id)
+                            self.log(f"¡AVERÍA / FUGA DETECTADA! ({reason_text})", ws_id=station_id)
                             if was_watering:
                                 op_interrupted = st["operator"]
                                 vol_interrupted = st["vol"]
@@ -380,19 +426,29 @@ class WMCentral:
                 # Avería resuelta
                 if cmd in ("FIXED", "OK_LEAK"):
                     with self.lock:
-                        if station_id in self.stations and self.stations[station_id]["status"] == STATUS_LEAK:
-                            st = self.stations[station_id]
-                            last_leak = st.pop("last_leak_summary", None)
-                            if last_leak:
+                        st = self.stations.get(station_id)
+                        if st:
+                            st["engine_ok"] = True
+                            st["engine_reason"] = "OK"
+                            if st["status"] == STATUS_OUT_OF_SERVICE:
+                                self.send_ws_command(station_id, "BLOCK")
                                 self.log(
-                                    f"Avería de fuga RESUELTA. Estado final del riego previo: "
-                                    f"{last_leak['vol']:.2f} L en {last_leak['dur']} s (Op: {last_leak['op']}). "
-                                    f"Estación disponible de nuevo.",
+                                    "Engine operativo detectado; la estación se mantiene en FUERA DE SERVICIO hasta orden de activación",
                                     ws_id=station_id
                                 )
-                            else:
-                                self.log("Avería de fuga RESUELTA. Estación disponible de nuevo.", ws_id=station_id)
-                            self.set_station_status(station_id, STATUS_AVAILABLE)
+                                return "OK#BLOCKED"
+                            if st["status"] == STATUS_LEAK:
+                                last_leak = st.pop("last_leak_summary", None)
+                                if last_leak:
+                                    self.log(
+                                        f"Avería de fuga RESUELTA. Estado final del riego previo: "
+                                        f"{last_leak['vol']:.2f} L en {last_leak['dur']} s (Op: {last_leak['op']}). "
+                                        f"Estación disponible de nuevo.",
+                                        ws_id=station_id
+                                    )
+                                else:
+                                    self.log("Avería de fuga RESUELTA. Estación disponible de nuevo.", ws_id=station_id)
+                                self.set_station_status(station_id, STATUS_AVAILABLE)
                     return "OK"
 
                 return "STATUS#KO#Comando no reconocido"
@@ -413,6 +469,8 @@ class WMCentral:
                         if st:
                             st["pending_start"] = False
                             st["pending_since"] = None
+                            st["engine_ok"] = False
+                            st["engine_reason"] = "Monitor desconectado"
                             if st["status"] == STATUS_WATERING:
                                 op_disc = st["operator"]
                                 vol_disc = st["vol"]
@@ -603,7 +661,10 @@ class WMCentral:
                     st["status"] in (STATUS_OFFLINE, STATUS_LEAK, STATUS_OUT_OF_SERVICE)
                     and not st["pending_start"]
                 ):
-                    self.send_ws_command(ws_id, "STOP", reason="NOT_AVAILABLE")
+                    if st["status"] == STATUS_OUT_OF_SERVICE:
+                        self.send_ws_command(ws_id, "BLOCK")
+                    else:
+                        self.send_ws_command(ws_id, "STOP", reason="NOT_AVAILABLE")
                     return
                 st["pending_start"] = False
                 st["pending_since"] = None
@@ -697,6 +758,8 @@ class WMCentral:
                         self.set_station_status(ws_id, STATUS_LEAK)
                     elif reason == "MONITOR_DOWN":
                         self.set_station_status(ws_id, STATUS_OFFLINE)
+                    elif reason == "CENTRAL_BLOCK":
+                        self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                     else:
                         self.set_station_status(ws_id, STATUS_AVAILABLE)
 
@@ -816,7 +879,7 @@ class WMCentral:
                 self.log("Puesta en FUERA DE SERVICIO por orden de CENTRAL", ws_id=ws_id)
 
     def activate_station(self, target: str):
-        """Reactiva una o todas las WS desde Fuera de Servicio a DISPONIBLE (VERDE)."""
+        """Reactiva una o todas las WS desde Fuera de Servicio comprobando que Monitor y Engine estén operativos."""
         stations = self._target_stations(target)
         if not stations:
             self.log(f"No se encontró la estación '{target}' para activar.")
@@ -825,12 +888,34 @@ class WMCentral:
         for ws_id in stations:
             with self.lock:
                 st = self.stations[ws_id]
-                if st["status"] == STATUS_OUT_OF_SERVICE:
-                    self.set_station_status(ws_id, STATUS_AVAILABLE)
-                    self.send_ws_command(ws_id, "ACTIVATE")
-                    self.log("Activada y en servicio (DISPONIBLE)", ws_id=ws_id)
-                elif st["status"] == STATUS_OFFLINE:
+                monitor_connected = (ws_id in self.station_sockets) and (st["status"] != STATUS_OFFLINE)
+                engine_ok = bool(st.get("engine_ok", False))
+                reason = st.get("engine_reason") or "Engine no conectado al Monitor"
+
+                if not monitor_connected:
+                    if st["status"] != STATUS_OFFLINE:
+                        self.set_station_status(ws_id, STATUS_OFFLINE)
                     self.log(f"No se puede activar {ws_id}: no hay conexión física con el monitor", ws_id=ws_id)
+                    continue
+
+                if st["status"] == STATUS_OUT_OF_SERVICE:
+                    self.send_ws_command(ws_id, "ACTIVATE")
+                    if engine_ok:
+                        self.set_station_status(ws_id, STATUS_AVAILABLE)
+                        self.log("Activada y en servicio (DISPONIBLE): Monitor y Engine operativos", ws_id=ws_id)
+                    else:
+                        self.set_station_status(ws_id, STATUS_LEAK)
+                        self.log(f"No puede pasar a DISPONIBLE: pasa a FUGA ({reason})", ws_id=ws_id)
+                elif st["status"] == STATUS_LEAK:
+                    if engine_ok:
+                        self.send_ws_command(ws_id, "ACTIVATE")
+                        self.set_station_status(ws_id, STATUS_AVAILABLE)
+                        self.log("Activada y en servicio (DISPONIBLE): Monitor y Engine operativos", ws_id=ws_id)
+                    else:
+                        self.log(f"No se puede activar {ws_id} a DISPONIBLE: se mantiene en FUGA ({reason})", ws_id=ws_id)
+                elif st["status"] == STATUS_AVAILABLE and not engine_ok:
+                    self.set_station_status(ws_id, STATUS_LEAK)
+                    self.log(f"No puede mantenerse DISPONIBLE: pasa a FUGA ({reason})", ws_id=ws_id)
 
     # --------------------------------------------------------------------------
     # PANEL DE MONITORIZACIÓN EN CONSOLA (CÓDIGOS DE COLOR ANSI)
