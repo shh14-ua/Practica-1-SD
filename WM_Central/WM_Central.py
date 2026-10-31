@@ -252,38 +252,39 @@ class WMCentral:
                 if cmd in ("REGISTRO", "AUTH") and len(parts) >= 2:
                     st_id = parts[1].strip().upper()
                     location = parts[2] if len(parts) >= 3 else "Ubicación desconocida"
-                    station_id = st_id
+
                     with self.lock:
-                        self.station_sockets[st_id] = conn
+                        # Rechazar estaciones que no estén registradas en SQLite.
                         if st_id not in self.stations:
-                            self.stations[st_id] = {
-                                "id": st_id, "location": location, "status": STATUS_LEAK,
-                                "flow": 0.0, "vol": 0.0, "operator": None, "start_time": None,
-                                "pending_start": False,
-                                "pending_since": None,
-                                "last_active": time.time(),
-                            }
-                            self._update_station_db(st_id, location=location, status=STATUS_LEAK)
-                            self.log(f"Nueva estación dada de alta: {st_id} ({location})", ws_id=st_id)
-                        else:
-                            st = self.stations[st_id]
-                            st["location"] = location
-                            st["last_active"] = time.time()
-
-                            if st["status"] != STATUS_OUT_OF_SERVICE:
-                                self.set_station_status(st_id, STATUS_LEAK)
-
-                            self._update_station_db(
-                                st_id,
-                                location=location,
-                                status=st["status"]
-                            )
                             self.log(
-                                f"Estación conectada y AUTENTICADA: estado {st['status']}",
+                                f"Autenticación DENEGADA: estación {st_id} no registrada",
                                 ws_id=st_id
                             )
-                    return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente"
+                            return f"STATUS#KO#Estacion {st_id} no registrada"
 
+                        # Estación registrada: aceptar la conexión.
+                        station_id = st_id
+                        self.station_sockets[st_id] = conn
+
+                        st = self.stations[st_id]
+                        st["location"] = location
+                        st["last_active"] = time.time()
+
+                        if st["status"] != STATUS_OUT_OF_SERVICE:
+                            self.set_station_status(st_id, STATUS_LEAK)
+
+                        self._update_station_db(
+                            st_id,
+                            location=location,
+                            status=st["status"]
+                        )
+
+                        self.log(
+                            f"Estación conectada y AUTENTICADA: estado {st['status']}",
+                            ws_id=st_id
+                        )
+
+                    return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente"
                 if not station_id:
                     return "STATUS#KO#No autenticado"
 
@@ -354,7 +355,7 @@ class WMCentral:
                     if self.station_sockets.get(station_id) == conn:
                         del self.station_sockets[station_id]
                         st = self.stations.get(station_id)
-                        
+
                         if st:
                             st["pending_start"] = False
                             st["pending_since"] = None
@@ -457,7 +458,7 @@ class WMCentral:
                     "DENEGADO: La estación tiene una solicitud de riego pendiente de confirmación"
                 )
                 return
-            
+
             if st["status"] != STATUS_AVAILABLE:
                 motivo = f"estación no disponible ({st['status']})"
                 if st["status"] == STATUS_WATERING:
@@ -472,7 +473,7 @@ class WMCentral:
                 return
 
             # 4. Autorizar e iniciar
-            
+
             self.notify_operator(
                 op, "STEP", ws_id,
                 "Estación disponible. Enviando orden de apertura de electroválvula..."
