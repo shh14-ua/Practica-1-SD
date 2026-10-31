@@ -19,6 +19,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -156,6 +157,7 @@ class WMCentral:
                     "vol": 0.0,
                     "operator": None,
                     "start_time": None,
+                    "transaction_id": None,
                     "pending_start": False,
                     "pending_since": None,
                     "last_active": time.time(),
@@ -176,13 +178,49 @@ class WMCentral:
             db.commit()
 
     def _record_watering_history(self, ws_id: str, op_id: str, start_time: str, end_time: str,
-                                 total_vol: float, duration_sec: int, reason: str):
+                                 total_vol: float, duration_sec: int, reason: str,
+                                 transaction_id: Optional[str] = None) -> bool:
+        """Registra una transacción de riego de forma idempotente en SQLite.
+        Devuelve True si se insertó un nuevo registro o False si la transacción ya existía."""
+        clean_op = op_id or "MANUAL"
+        clean_start = start_time or ""
+        clean_end = end_time or datetime.now().isoformat()
+        tx_id = (str(transaction_id).strip() if transaction_id else "") or (
+            f"{ws_id}:{clean_op}:{clean_start}:{reason}:{total_vol:.2f}:{duration_sec}"
+        )
+
         with self.lock, self._get_db() as db:
-            db.execute("""
-                INSERT INTO watering_history (ws_id, operator_id, start_time, end_time, total_vol, duration_sec, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (ws_id, op_id or "MANUAL", start_time or "", end_time or "", total_vol, duration_sec, reason))
-            db.commit()
+            existing = db.execute(
+                "SELECT id, total_vol, duration_sec, reason FROM watering_history WHERE transaction_id = ?",
+                (tx_id,)
+            ).fetchone()
+            if existing is not None:
+                if total_vol > float(existing["total_vol"]) or duration_sec > int(existing["duration_sec"]):
+                    db.execute(
+                        """
+                        UPDATE watering_history
+                        SET total_vol = MAX(total_vol, ?),
+                            duration_sec = MAX(duration_sec, ?),
+                            end_time = ?
+                        WHERE transaction_id = ?
+                        """,
+                        (total_vol, duration_sec, clean_end, tx_id),
+                    )
+                    db.commit()
+                return False
+
+            try:
+                db.execute("""
+                    INSERT INTO watering_history (
+                        ws_id, operator_id, start_time, end_time,
+                        total_vol, duration_sec, reason, transaction_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (ws_id, clean_op, clean_start, clean_end, total_vol, duration_sec, reason, tx_id))
+                db.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
 
     # --------------------------------------------------------------------------
     # LOGGING Y NOTIFICACIONES
@@ -320,10 +358,13 @@ class WMCentral:
                                 op_interrupted = st["operator"]
                                 vol_interrupted = st["vol"]
                                 start_interrupted = st["start_time"] or datetime.now().isoformat()
+                                tx_interrupted = st.get("transaction_id") or f"{station_id}-{op_interrupted or 'MANUAL'}-{uuid.uuid4().hex[:12]}"
+                                st["transaction_id"] = tx_interrupted
                                 st["interrupted_watering"] = {
                                     "op": op_interrupted,
                                     "vol": vol_interrupted,
                                     "start_time": start_interrupted,
+                                    "transaction_id": tx_interrupted,
                                     "ts": time.time(),
                                 }
                                 self.notify_operator(op_interrupted, "STEP", station_id,
@@ -376,22 +417,27 @@ class WMCentral:
                                 op_disc = st["operator"]
                                 vol_disc = st["vol"]
                                 start_disc = st["start_time"] or datetime.now().isoformat()
+                                tx_disc = st.get("transaction_id") or f"{station_id}:{op_disc or 'MANUAL'}:{start_disc}:MONITOR_DOWN"
                                 self.send_ws_command(station_id, "STOP", reason="MONITOR_DOWN")
-                                self.notify_operator(
-                                    op_disc, "SUMMARY", station_id,
-                                    f"Estación DESCONECTADA súbitamente: riego interrumpido ({vol_disc:.2f} L consumidos)",
-                                    total_vol=vol_disc, duration=0, reason="MONITOR_DOWN"
-                                )
-                                self._record_watering_history(
+                                inserted = self._record_watering_history(
                                     ws_id=station_id,
                                     op_id=op_disc or "MANUAL",
                                     start_time=start_disc,
                                     end_time=datetime.now().isoformat(),
                                     total_vol=vol_disc,
                                     duration_sec=0,
-                                    reason="MONITOR_DOWN"
+                                    reason="MONITOR_DOWN",
+                                    transaction_id=tx_disc,
                                 )
+                                if inserted:
+                                    self.notify_operator(
+                                        op_disc, "SUMMARY", station_id,
+                                        f"Estación DESCONECTADA súbitamente: riego interrumpido ({vol_disc:.2f} L consumidos)",
+                                        total_vol=vol_disc, duration=0, reason="MONITOR_DOWN",
+                                        transaction_id=tx_disc
+                                    )
                             st["operator"] = None
+                            st["transaction_id"] = None
                             st["flow"] = 0.0
                             st["vol"] = 0.0
                             self.set_station_status(station_id, STATUS_OFFLINE)
@@ -408,30 +454,42 @@ class WMCentral:
             info = st.get("interrupted_watering")
             if not info or info.get("ts") != interrupted_ts:
                 return
-            st.pop("interrupted_watering", None)
             op_id = info.get("op")
             vol = float(info.get("vol", 0.0))
             start_iso = info.get("start_time") or datetime.now().isoformat()
+            tx_id = info.get("transaction_id") or st.get("transaction_id") or f"{ws_id}:{op_id or 'MANUAL'}:{start_iso}:LEAK"
             try:
                 dur = max(1, int((datetime.now() - datetime.fromisoformat(start_iso)).total_seconds()))
             except Exception:
                 dur = 0
 
-            summary_msg = f"Riego FINALIZADO (LEAK): {vol:.2f} L consumidos en {dur} s"
-            self.notify_operator(op_id, "SUMMARY", ws_id, summary_msg,
-                                 total_vol=vol, duration=dur, reason="LEAK")
-            self._record_watering_history(
+            inserted = self._record_watering_history(
                 ws_id=ws_id,
                 op_id=op_id or "MANUAL",
                 start_time=start_iso,
                 end_time=datetime.now().isoformat(),
                 total_vol=vol,
                 duration_sec=dur,
-                reason="LEAK"
+                reason="LEAK",
+                transaction_id=tx_id,
             )
-            st["last_leak_summary"] = {"op": op_id or "MANUAL", "vol": vol, "dur": dur}
+            st.pop("interrupted_watering", None)
+            st["last_leak_summary"] = {
+                "op": op_id or "MANUAL",
+                "vol": vol,
+                "dur": dur,
+                "transaction_id": tx_id,
+            }
             st["operator"] = None
+            st["transaction_id"] = None
             st["flow"] = 0.0
+            if inserted:
+                summary_msg = f"Riego FINALIZADO (LEAK): {vol:.2f} L consumidos en {dur} s"
+                self.notify_operator(
+                    op_id, "SUMMARY", ws_id, summary_msg,
+                    total_vol=vol, duration=dur, reason="LEAK",
+                    transaction_id=tx_id
+                )
 
     # --------------------------------------------------------------------------
     # GESTIÓN DE RIEGO (KAFKA: SOLICITUDES Y TELEMETRÍA)
@@ -492,11 +550,13 @@ class WMCentral:
                 "Estación disponible. Enviando orden de apertura de electroválvula..."
             )
 
+            tx_id = f"{ws_id}-{op}-{uuid.uuid4().hex[:12]}"
             st["pending_start"] = True
             st["pending_since"] = time.time()
             st["operator"] = op
+            st["transaction_id"] = tx_id
 
-            self.send_ws_command(ws_id, "START", op=op, duration=duration)
+            self.send_ws_command(ws_id, "START", op=op, duration=duration, transaction_id=tx_id)
             threading.Thread(
                 target=self.check_watering_timeout,
                 args=(ws_id, st["pending_since"]),
@@ -520,6 +580,7 @@ class WMCentral:
             st["pending_since"] = None
             op = st["operator"]
             st["operator"] = None
+            st["transaction_id"] = None
 
             self.notify_operator(
                 op, "DENY", ws_id,
@@ -547,6 +608,11 @@ class WMCentral:
                 st["pending_start"] = False
                 st["pending_since"] = None
                 st["operator"] = ev.get("op", "MANUAL")
+                st["transaction_id"] = (
+                    ev.get("transaction_id")
+                    or st.get("transaction_id")
+                    or f"{ws_id}-{st['operator']}-{uuid.uuid4().hex[:12]}"
+                )
                 st["flow"] = 0.0
                 st["vol"] = 0.0
                 st["start_time"] = datetime.now().isoformat()
@@ -557,46 +623,72 @@ class WMCentral:
                 if st["operator"] != "MANUAL":
                     self.notify_operator(
                         st["operator"], "AUTH", ws_id,
-                        f"AUTORIZADO: Riego iniciado en {ws_id}. Confirmación recibida del Engine"
+                        f"AUTORIZADO: Riego iniciado en {ws_id}. Confirmación recibida del Engine",
+                        transaction_id=st["transaction_id"]
                     )
             elif ev_type == "TELEMETRY":
                 st["flow"] = float(ev.get("flow", 0.0))
                 st["vol"] = float(ev.get("vol", 0.0))
                 st["last_active"] = time.time()
+                if ev.get("transaction_id") and not st.get("transaction_id"):
+                    st["transaction_id"] = ev.get("transaction_id")
                 # Notificar al operario asociado sin ensuciar el log general de CENTRAL
                 self.notify_operator(st["operator"], "TELEMETRY", ws_id, "", quiet=True,
                                      flow=st["flow"], vol=st["vol"])
 
             elif ev_type == "FINISHED":
-                st["pending_start"] = False
-                st["pending_since"] = None
-                interrupted_info = st.pop("interrupted_watering", None)
+                interrupted_info = st.get("interrupted_watering")
                 op_id = ev.get("op") or st["operator"] or (interrupted_info["op"] if interrupted_info else "MANUAL")
                 total_vol = float(ev.get("vol", st["vol"]))
                 dur = int(ev.get("dur", 0))
                 reason = ev.get("reason", "OK")
+                start_iso = (
+                    st["start_time"]
+                    or (interrupted_info["start_time"] if interrupted_info else None)
+                    or datetime.now().isoformat()
+                )
+                tx_id = (
+                    ev.get("transaction_id")
+                    or st.get("transaction_id")
+                    or (interrupted_info.get("transaction_id") if interrupted_info else None)
+                )
+                if not tx_id:
+                    tx_id = f"{ws_id}:{op_id or 'MANUAL'}:{start_iso}:{reason}:{total_vol:.2f}:{dur}"
 
-                # Si ya fue reportado por timeout de caída abrupta del Engine, no duplicar
-                if st.get("operator") is None and interrupted_info is None and st.get("last_leak_summary") and reason == "LEAK":
+                # Si ya fue reportado por timeout de caída abrupta del Engine sin transaction_id, no duplicar
+                if (
+                    not ev.get("transaction_id")
+                    and st.get("operator") is None
+                    and interrupted_info is None
+                    and st.get("last_leak_summary")
+                    and reason == "LEAK"
+                ):
                     return
 
-                summary_msg = f"Riego FINALIZADO ({reason}): {total_vol:.2f} L consumidos en {dur} s"
-                self.notify_operator(op_id, "SUMMARY", ws_id, summary_msg,
-                                     total_vol=total_vol, duration=dur, reason=reason)
-
-                # Registrar en base de datos
-                self._record_watering_history(
+                # 1. Guardar resultado en SQLite ANTES de confirmar procesamiento o notificar finalización
+                inserted = self._record_watering_history(
                     ws_id=ws_id,
                     op_id=op_id or "MANUAL",
-                    start_time=st["start_time"] or (interrupted_info["start_time"] if interrupted_info else datetime.now().isoformat()),
+                    start_time=start_iso,
                     end_time=datetime.now().isoformat(),
                     total_vol=total_vol,
                     duration_sec=dur,
-                    reason=reason
+                    reason=reason,
+                    transaction_id=tx_id,
                 )
 
+                # 2. Actualizar estado en memoria tras persistir con éxito
+                st["pending_start"] = False
+                st["pending_since"] = None
+                st.pop("interrupted_watering", None)
+                st["transaction_id"] = None
                 if reason == "LEAK":
-                    st["last_leak_summary"] = {"op": op_id or "MANUAL", "vol": total_vol, "dur": dur}
+                    st["last_leak_summary"] = {
+                        "op": op_id or "MANUAL",
+                        "vol": total_vol,
+                        "dur": dur,
+                        "transaction_id": tx_id,
+                    }
 
                 st["operator"] = None
                 st["flow"] = 0.0
@@ -607,6 +699,17 @@ class WMCentral:
                         self.set_station_status(ws_id, STATUS_OFFLINE)
                     else:
                         self.set_station_status(ws_id, STATUS_AVAILABLE)
+
+                # 3. Notificar al operario únicamente si la transacción no estaba ya registrada
+                if inserted:
+                    summary_msg = f"Riego FINALIZADO ({reason}): {total_vol:.2f} L consumidos en {dur} s"
+                    self.notify_operator(
+                        op_id, "SUMMARY", ws_id, summary_msg,
+                        total_vol=total_vol, duration=dur, reason=reason,
+                        transaction_id=tx_id
+                    )
+                else:
+                    self.log(f"Evento FINISHED duplicado ignorado (transaction_id={tx_id})", ws_id=ws_id)
 
     # --------------------------------------------------------------------------
     # CONSUMIDORES Y PUBLICADORES KAFKA
@@ -648,13 +751,16 @@ class WMCentral:
                     [TOPIC_EVENTS],
                     group_prefix="central-events",
                     group_id="central-events",
-                    auto_offset_reset="latest"
+                    auto_offset_reset="earliest",
+                    enable_auto_commit=False
                 )
                 for msg in consumer:
                     if not self.running:
                         break
                     if isinstance(msg.value, dict):
                         self.handle_ws_event(msg.value)
+                    if hasattr(consumer, "commit"):
+                        consumer.commit()
             except Exception as exc:
                 if self.running:
                     self.log(f"Aviso en consumidor Kafka ws_events ({exc}). Reintentando...")

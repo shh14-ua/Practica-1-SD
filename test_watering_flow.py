@@ -26,6 +26,8 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 for subdir in ("WM_Central", "WM_WS", "WM_FO"):
     mod_path = os.path.join(ROOT_DIR, subdir)
     if mod_path not in sys.path:
@@ -72,9 +74,13 @@ class FakeKafkaBroker:
 
     def make_consumer(self, bootstrap: str, topics, group_prefix: str = "wm",
                       auto_offset_reset: str = "latest", max_retries: int = 15,
-                      group_id: str = None):
+                      group_id: str = None, delay: float = 2.0,
+                      enable_auto_commit: bool = True):
         gid = group_id if group_id else f"{group_prefix}-{int(time.time() * 1000000)}-{ len(self.consumers) }"
-        consumer = FakeKafkaConsumer(self, topics, gid, auto_offset_reset)
+        consumer = FakeKafkaConsumer(
+            self, topics, gid, auto_offset_reset,
+            enable_auto_commit=enable_auto_commit
+        )
         with self.lock:
             self.consumers.append(consumer)
         return consumer
@@ -86,11 +92,14 @@ class FakeKafkaBroker:
 
 
 class FakeKafkaConsumer:
-    def __init__(self, broker: FakeKafkaBroker, topics, group_id: str, auto_offset_reset: str):
+    def __init__(self, broker: FakeKafkaBroker, topics, group_id: str,
+                 auto_offset_reset: str, enable_auto_commit: bool = True):
         self.broker = broker
         self.topics = list(topics)
         self.group_id = group_id
+        self.enable_auto_commit = enable_auto_commit
         self.active = True
+        self.read_offsets = {}
 
         with self.broker.lock:
             for t in self.topics:
@@ -100,6 +109,12 @@ class FakeKafkaConsumer:
                         self.broker.group_offsets[key] = 0
                     else:
                         self.broker.group_offsets[key] = len(self.broker.topics.get(t, []))
+                self.read_offsets[key] = self.broker.group_offsets[key]
+
+    def commit(self):
+        with self.broker.lock:
+            for key, offset in self.read_offsets.items():
+                self.broker.group_offsets[key] = offset
 
     def __iter__(self):
         while self.active:
@@ -108,10 +123,12 @@ class FakeKafkaConsumer:
                 for t in self.topics:
                     key = (self.group_id, t)
                     msgs = self.broker.topics.get(t, [])
-                    idx = self.broker.group_offsets.get(key, 0)
+                    idx = self.read_offsets.get(key, self.broker.group_offsets.get(key, 0))
                     if idx < len(msgs):
                         val = msgs[idx]
-                        self.broker.group_offsets[key] = idx + 1
+                        self.read_offsets[key] = idx + 1
+                        if self.enable_auto_commit:
+                            self.broker.group_offsets[key] = idx + 1
                         delivered = True
                         yield FakeKafkaMessage(t, val)
                         break
@@ -192,10 +209,14 @@ class WaterManagementFlowTests(unittest.TestCase):
         threading.Thread(target=engine.run_commands_consumer, daemon=True).start()
         time.sleep(0.1)
 
-        # Esperar a que WS-01 pase a DISPONIBLE en CENTRAL
+        # Esperar a que WS-01 pase a DISPONIBLE en CENTRAL y el Engine tenga confirmado el enlace
         deadline = time.time() + 5.0
         while time.time() < deadline:
-            if central.stations.get(ws_id, {}).get("status") == common.STATUS_AVAILABLE:
+            if (
+                central.stations.get(ws_id, {}).get("status") == common.STATUS_AVAILABLE
+                and engine.central_connected
+                and engine.monitor_connected
+            ):
                 break
             time.sleep(0.05)
         self.assertEqual(
