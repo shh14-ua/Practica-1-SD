@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 import uuid
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 # Importación de Kafka (librería kafka-python-ng)
 try:
@@ -22,7 +22,16 @@ try:
     from kafka.admin import KafkaAdminClient, NewTopic
     from kafka.errors import NoBrokersAvailable, TopicAlreadyExistsError
 except ImportError:
-    pass
+    KafkaConsumer = Any
+    KafkaProducer = Any
+    KafkaAdminClient = None
+    NewTopic = None
+
+    class NoBrokersAvailable(Exception):
+        pass
+
+    class TopicAlreadyExistsError(Exception):
+        pass
 
 # ==============================================================================
 # 1. PROTOCOLO DE TRAMAS POR SOCKETS (<STX><DATA><ETX><LRC>)
@@ -236,7 +245,8 @@ def _safe_json_loads(raw_bytes: bytes):
 
 def make_consumer(bootstrap: str, topics, group_prefix: str = "wm",
                   auto_offset_reset: str = "latest", group_id: Optional[str] = None,
-                  max_retries: int = 15, delay: float = 2.0) -> KafkaConsumer:
+                  max_retries: int = 15, delay: float = 2.0,
+                  enable_auto_commit: bool = True) -> KafkaConsumer:
     """
     Crea un KafkaConsumer para los tópicos indicados con reintentos de conexión
     y deserialización segura. Fuerza una primera asignación de particiones con poll().
@@ -249,7 +259,7 @@ def make_consumer(bootstrap: str, topics, group_prefix: str = "wm",
                 bootstrap_servers=bootstrap,
                 group_id=gid,
                 auto_offset_reset=auto_offset_reset,
-                enable_auto_commit=True,
+                enable_auto_commit=enable_auto_commit,
                 value_deserializer=_safe_json_loads,
             )
             consumer.poll(timeout_ms=500)

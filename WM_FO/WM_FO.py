@@ -41,6 +41,7 @@ class FieldOperator:
         self.last_service_result = None
         self.stations_status: List[Dict[str, Any]] = []
         self.last_central_status_ts: float = 0.0
+        self.seen_summary_tx_ids = set()
 
         self.producer = make_producer(self.kafka_bootstrap)
         # Usamos un group_id determinista por operario para que, si el FO se cierra en mitad
@@ -109,6 +110,11 @@ class FieldOperator:
                         print(f"   [{ws_id}] Telemetría en directo: {flow:.1f} L/min | Acumulado: {vol:.2f} L", flush=True)
 
                     elif msg_type == "SUMMARY":
+                        tx_id = val.get("transaction_id")
+                        if tx_id:
+                            if tx_id in self.seen_summary_tx_ids:
+                                continue
+                            self.seen_summary_tx_ids.add(tx_id)
                         print(f"\n\033[93;1m==================================================================")
                         print(f" RESUMEN DEL SERVICIO [{ws_id}]:\n {text}")
                         print(f"==================================================================\033[0m\n", flush=True)
