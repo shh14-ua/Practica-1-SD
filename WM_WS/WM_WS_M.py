@@ -58,12 +58,14 @@ class WSMonitor:
             reg_msg = f"REGISTRO#{self.ws_id}#{self.location}"
             resp = request_socket(sock, reg_msg)
 
-            if "OK" in resp:
+            if resp.startswith("STATUS#OK#"):
                 self.central_sock = sock
                 self.log(f"Autenticado correctamente en CENTRAL ({self.central_host}:{self.central_port})")
-                # Si reconectamos y había fuga, lo re-notificamos inmediatamente
-                if self.leak_active:
-                    self.send_to_central(f"LEAK#{self.ws_id}")
+
+                # Central vuelve a comprobar el estado de la estación tras autenticarse.
+                # Forzamos el envío del estado real en el siguiente ciclo HEALTH.
+                self.leak_active = None
+
                 return True
             else:
                 self.log(f"CENTRAL rechazó el registro: {resp}")
