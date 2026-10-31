@@ -102,7 +102,20 @@ class WMCentral:
                     reason TEXT NOT NULL
                 )
             """)
+            # Añadir identificador único sin perder el historial anterior
+            columnas = {
+                fila[1] for fila in db.execute("PRAGMA table_info(watering_history)")
+            }
 
+            if "transaction_id" not in columnas:
+                db.execute(
+                    "ALTER TABLE watering_history ADD COLUMN transaction_id TEXT"
+                )
+
+            db.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_watering_transaction
+                ON watering_history(transaction_id)
+            """)
             # Operarios iniciales de ejemplo si la tabla está vacía
             cur = db.execute("SELECT COUNT(*) FROM operators")
             if cur.fetchone()[0] == 0:
