@@ -423,6 +423,84 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertIn("Imposible conectar con WM_Central", buf.getvalue())
         self.assertEqual(engine.state, "AVAILABLE")
 
+    def test_7_timer_independent_of_slow_kafka(self):
+        """El cierre del riego no debe esperar a Kafka."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+
+        engine.ws_id = "WS-TEST"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        original_send = engine.send_event
+
+        def slow_send(ev_type, **kwargs):
+            if ev_type == "TELEMETRY":
+                time.sleep(3.0)
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = slow_send
+
+        start = time.monotonic()
+        engine.start_watering("FO-TEST", 2)
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            with engine.lock:
+                if engine.state == "AVAILABLE":
+                    break
+            time.sleep(0.02)
+
+        with engine.lock:
+            self.assertEqual(engine.state, "AVAILABLE")
+
+        elapsed = time.monotonic() - start
+        self.assertLess(
+            elapsed, 2.7,
+            "El cierre del riego se ha retrasado esperando a Kafka"
+        )
+
+    def test_8_finished_after_telemetry(self):
+        """Comprueba el orden de los eventos con telemetría lenta."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+
+        engine.ws_id = "WS-TEST"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        original_send = engine.send_event
+
+        def slow_send(ev_type, **kwargs):
+            if ev_type == "TELEMETRY":
+                time.sleep(3.0)
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = slow_send
+        engine.start_watering("FO-TEST", 2)
+
+        time.sleep(5.0)
+
+        events = self.broker.topics.get(common.TOPIC_EVENTS, [])
+        types = [
+            e["type"]
+            for e in events
+            if e.get("ws") == "WS-TEST"
+        ]
+
+        self.assertIn("TELEMETRY", types)
+        self.assertIn("FINISHED", types)
+        self.assertLess(
+            types.index("TELEMETRY"),
+            types.index("FINISHED"),
+            "La telemetría llegó después del evento FINISHED"
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

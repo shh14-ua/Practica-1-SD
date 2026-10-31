@@ -36,6 +36,9 @@ class WSEngine:
         self.kafka_bootstrap = kafka_bootstrap
         self.monitor_host, self.monitor_port = parse_addr(monitor_addr)
         self.lock = threading.RLock()
+        self.event_lock = threading.RLock()
+        self.pending_telemetry = 0
+        self.telemetry_done = threading.Condition(self.lock)
         self.running = True
 
         self.ws_id: Optional[str] = None
@@ -53,6 +56,8 @@ class WSEngine:
         self.watering_start_time = 0.0
         self.duration_limit = 0
         self.session_id = 0
+        self.watering_deadline = 0.0
+        self.timer_event = threading.Event()
         self.last_interrupted_summary: Optional[dict] = None
 
         # Conexión con Kafka
@@ -63,15 +68,18 @@ class WSEngine:
         print(f"[{time.strftime('%H:%M:%S')}] [ENGINE {id_str}] {msg}", flush=True)
 
     def send_event(self, ev_type: str, **extra) -> bool:
-        if not self.ws_id:
-            return False
-        payload = {
-            "type": ev_type,
-            "ws": self.ws_id,
-            "timestamp": time.time(),
-            **extra
-        }
-        return send_kafka(self.producer, TOPIC_EVENTS, payload)
+        with self.event_lock:
+            if not self.ws_id:
+                return False
+
+            payload = {
+                "type": ev_type,
+                "ws": self.ws_id,
+                "timestamp": time.time(),
+                **extra
+            }
+
+            return send_kafka(self.producer, TOPIC_EVENTS, payload)
 
     # --------------------------------------------------------------------------
     # CONEXIÓN Y SUPERVISIÓN CON EL MONITOR
@@ -169,69 +177,116 @@ class WSEngine:
             self.accumulated_vol = 0.0
             self.watering_start_time = time.monotonic()
             self.duration_limit = duration
+            self.watering_deadline = (
+                self.watering_start_time + duration if duration > 0 else 0.0
+            )
             self.session_id += 1
+            self.timer_event = threading.Event()
 
             self.send_event("STARTED", op=op, duration=duration)
             self.log(f">>> ELECTROVÁLVULA ABIERTA. Riego iniciado por {op} (Límite: {duration or 'manual'} s)")
 
             # Iniciar hilo de bombeo y telemetría
             threading.Thread(target=self._water_loop, args=(self.session_id,), daemon=True).start()
+            # Iniciar temporizador independiente para riegos con duración limitada
+            if duration > 0:
+                threading.Thread(
+                    target=self._watering_timer,
+                    args=(self.session_id, self.watering_deadline, self.timer_event),
+                    daemon=True
+                ).start()
 
+
+    def _watering_timer(self, sid: int, deadline: float, stop_event: threading.Event):
+        remaining = max(0.0, deadline - time.monotonic())
+
+        if stop_event.wait(timeout=remaining):
+            return
+
+        with self.lock:
+            if self.session_id == sid and self.state == "WATERING":
+                self.finish_watering("TIME")
 
     def _water_loop(self, sid: int):
         while self.running:
             time.sleep(1.0)
+
             with self.lock:
                 if self.session_id != sid or self.state != "WATERING":
                     break
 
                 elapsed = time.monotonic() - self.watering_start_time
 
-                # Comprobar el límite antes de generar otra medición.
                 if self.duration_limit > 0 and elapsed >= self.duration_limit:
-                    self.finish_watering("TIME")
                     break
 
-                # Simulación de caudalímetro: ~8 a 12 L/min.
+                # Simular el caudal y actualizar el volumen.
                 flow = round(random.uniform(8.5, 11.5), 2)
                 self.accumulated_vol += flow / 60.0
                 curr_vol = round(self.accumulated_vol, 2)
+                op = self.current_op
+                self.pending_telemetry += 1
 
+            # Enviar telemetría fuera del bloqueo.
+            try:
                 self.send_event(
                     "TELEMETRY",
                     flow=flow,
                     vol=curr_vol,
-                    op=self.current_op
+                    op=op
                 )
                 self.log(
                     f"   [Telemetría] Caudal: {flow:.1f} L/min | "
                     f"Acumulado: {curr_vol:.2f} L"
                 )
+            finally:
+                with self.telemetry_done:
+                    self.pending_telemetry -= 1
+                    self.telemetry_done.notify_all()
 
-                # El envío de telemetría también puede consumir tiempo.
-                elapsed = time.monotonic() - self.watering_start_time
-                if self.duration_limit > 0 and elapsed >= self.duration_limit:
-                    self.finish_watering("TIME")
-                    break
+
 
     def finish_watering(self, reason: str):
         with self.lock:
             if self.state != "WATERING":
                 return
 
-            elapsed = max(0, int(round(time.monotonic() - self.watering_start_time)))
+            elapsed = max(
+                0,
+                int(round(time.monotonic() - self.watering_start_time))
+            )
             total_vol = round(self.accumulated_vol, 2)
             op = self.current_op
 
+            # Cerrar el riego antes de cualquier espera de Kafka.
             self.state = "AVAILABLE"
             self.current_op = None
+            self.timer_event.set()
 
-            summary_data = {"op": op, "reason": reason, "vol": total_vol, "dur": elapsed}
-            sent = self.send_event("FINISHED", **summary_data)
-            if reason in ("LEAK", "MONITOR_DOWN") or not self.central_connected or not sent:
+            summary_data = {
+                "op": op,
+                "reason": reason,
+                "vol": total_vol,
+                "dur": elapsed
+            }
+
+            self.log(
+                f"<<< ELECTROVÁLVULA CERRADA (Motivo: {reason}). "
+                f"Total: {total_vol} L en {elapsed} s"
+            )
+
+        # Esperar a que se publiquen las mediciones pendientes.
+        # La electroválvula ya está cerrada y self.lock está liberado.
+        with self.telemetry_done:
+            while self.pending_telemetry > 0:
+                self.telemetry_done.wait()
+
+        # Publicar el evento final después de la telemetría.
+        sent = self.send_event("FINISHED", **summary_data)
+
+        if reason in ("LEAK", "MONITOR_DOWN") or not self.central_connected or not sent:
+            with self.lock:
                 self.last_interrupted_summary = summary_data
-
-            self.log(f"<<< ELECTROVÁLVULA CERRADA (Motivo: {reason}). Total: {total_vol} L en {elapsed} s")
 
     # --------------------------------------------------------------------------
     # CONSUMO DE ÓRDENES KAFKA (TOPIC_COMMANDS)
