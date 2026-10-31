@@ -11,9 +11,11 @@ Funcionalidades:
 """
 
 import argparse
+import hmac
 import http.server
 import json
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -22,6 +24,8 @@ import time
 import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
+
+STATION_ID_RE = re.compile(r"^WS-\d{2,}$")
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -917,6 +921,60 @@ class WMCentral:
                     self.set_station_status(ws_id, STATUS_LEAK)
                     self.log(f"No puede mantenerse DISPONIBLE: pasa a FUGA ({reason})", ws_id=ws_id)
 
+    @staticmethod
+    def _is_authorized_admin_request(client_ip: str, headers=None) -> bool:
+        """Verifica que la petición administrativa provenga exclusivamente de loopback (127.0.0.1 / ::1)
+        o presente un token administrativo válido (WM_ADMIN_TOKEN)."""
+        ip = (client_ip or "").strip()
+        if ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return True
+        expected_token = (os.getenv("WM_ADMIN_TOKEN") or "").strip()
+        if expected_token and headers is not None:
+            provided_token = (headers.get("X-Admin-Token") or "").strip()
+            if provided_token and hmac.compare_digest(provided_token, expected_token):
+                return True
+        return False
+
+    def register_station(self, ws_id: str, location: str = "Parque Municipal") -> bool:
+        """Da de alta dinámicamente una nueva estación autorizada en memoria y en SQLite.
+        Valida el formato WS- seguido de al menos dos dígitos (ej. WS-07, WS-100).
+        Si la estación ya existe, registra un aviso y devuelve False sin modificar su ubicación, estado ni conexiones."""
+        clean_id = (ws_id or "").strip().upper()
+        clean_loc = (location or "Parque Municipal").strip() or "Parque Municipal"
+        if not STATION_ID_RE.fullmatch(clean_id):
+            self.log(
+                f"Aviso: identificador de estación no válido ('{ws_id}'). "
+                f"Debe tener formato WS- seguido de al menos dos dígitos (ej. WS-07)."
+            )
+            return False
+
+        with self.lock:
+            if clean_id in self.stations:
+                self.log(
+                    f"Aviso: la estación {clean_id} ya existe; no se modifica su ubicación, estado ni conexiones.",
+                    ws_id=clean_id
+                )
+                return False
+
+            self.stations[clean_id] = {
+                "id": clean_id,
+                "location": clean_loc,
+                "status": STATUS_OFFLINE,
+                "flow": 0.0,
+                "vol": 0.0,
+                "operator": None,
+                "start_time": None,
+                "transaction_id": None,
+                "pending_start": False,
+                "pending_since": None,
+                "engine_ok": False,
+                "engine_reason": "Engine no conectado al Monitor",
+                "last_active": time.time(),
+            }
+            self._update_station_db(clean_id, location=clean_loc, status=STATUS_OFFLINE)
+            self.log(f"Nueva estación dada de alta en CENTRAL: {clean_id} ({clean_loc})", ws_id=clean_id)
+            return True
+
     # --------------------------------------------------------------------------
     # PANEL DE MONITORIZACIÓN EN CONSOLA (CÓDIGOS DE COLOR ANSI)
     # --------------------------------------------------------------------------
@@ -1022,6 +1080,52 @@ class WMCentral:
                         central_self.block_station(ws_id)
                     elif action == "activate" and ws_id:
                         central_self.activate_station(ws_id)
+                    elif action == "register" and ws_id:
+                        client_ip = self.client_address[0] if self.client_address else ""
+                        if not central_self._is_authorized_admin_request(client_ip, self.headers):
+                            central_self.log(
+                                f"Acceso DENEGADO a alta HTTP desde origen no autorizado ({client_ip})",
+                                ws_id=str(ws_id).strip().upper()
+                            )
+                            self.send_response(403)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(
+                                json.dumps({
+                                    "status": "forbidden",
+                                    "created": False,
+                                    "msg": "Acceso denegado: alta permitida únicamente desde la máquina de Central"
+                                }).encode("utf-8")
+                            )
+                            return
+
+                        loc = str(data.get("location") or "Parque Municipal")
+                        clean_ws = str(ws_id).strip().upper()
+                        if not STATION_ID_RE.fullmatch(clean_ws):
+                            central_self.register_station(clean_ws, loc)
+                            self.send_response(400)
+                            self.send_header("Content-Type", "application/json")
+                            self.end_headers()
+                            self.wfile.write(
+                                json.dumps({
+                                    "status": "invalid",
+                                    "created": False,
+                                    "msg": "Formato de ID no válido: use WS- seguido de al menos dos dígitos"
+                                }).encode("utf-8")
+                            )
+                            return
+
+                        created = central_self.register_station(clean_ws, loc)
+                        resp = (
+                            {"status": "ok", "created": True}
+                            if created
+                            else {"status": "exists", "created": False, "msg": f"La estación {clean_ws} ya existe"}
+                        )
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(resp).encode("utf-8"))
+                        return
 
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -1032,6 +1136,7 @@ class WMCentral:
                     self.end_headers()
 
         server = http.server.ThreadingHTTPServer(("0.0.0.0", self.web_port), DashboardHandler)
+        self._web_server = server
         self.log(f"Panel Web interactivo disponible en http://0.0.0.0:{self.web_port}/")
         server.serve_forever()
 
@@ -1053,6 +1158,7 @@ class WMCentral:
             f"  {COLOR_BOLD}s <WS> [seg]{COLOR_RESET}    -> Iniciar orden de riego (ej: s WS-01 15)\n"
             f"  {COLOR_BOLD}b <WS|ALL>{COLOR_RESET}      -> Bloquear estación (Fuera de Servicio)\n"
             f"  {COLOR_BOLD}a <WS|ALL>{COLOR_RESET}      -> Activar estación (vuelve a DISPONIBLE)\n"
+            f"  {COLOR_BOLD}r <WS> [ubic]{COLOR_RESET}   -> Dar de alta nueva estación (ej: r WS-07 Central Park)\n"
             f"  {COLOR_BOLD}h{COLOR_RESET}               -> Ver histórico de riegos en BD\n"
             f"  {COLOR_BOLD}q{COLOR_RESET}               -> Salir\n"
         )
@@ -1079,6 +1185,10 @@ class WMCentral:
                 self.block_station(parts[1])
             elif cmd == "a" and len(parts) >= 2:
                 self.activate_station(parts[1])
+            elif cmd == "r" and len(parts) >= 2:
+                ws_id = parts[1]
+                loc = " ".join(parts[2:]) if len(parts) >= 3 else "Parque Municipal"
+                self.register_station(ws_id, loc)
             elif cmd == "h":
                 with self._get_db() as db:
                     rows = db.execute("SELECT * FROM watering_history ORDER BY id DESC LIMIT 10").fetchall()

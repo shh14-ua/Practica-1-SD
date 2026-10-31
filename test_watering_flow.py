@@ -166,6 +166,14 @@ class WaterManagementFlowTests(unittest.TestCase):
     def tearDown(self):
         for inst in self.active_instances:
             inst.running = False
+            if hasattr(inst, "ensure_central_connection"):
+                inst.ensure_central_connection = lambda: False
+            if getattr(inst, "_web_server", None) is not None:
+                try:
+                    inst._web_server.shutdown()
+                    inst._web_server.server_close()
+                except Exception:
+                    pass
         self.broker.stop_all()
         time.sleep(0.05)
         for p in reversed(self.patches):
@@ -322,10 +330,13 @@ class WaterManagementFlowTests(unittest.TestCase):
 
         # Simular caída abrupta del Monitor cerrando sus sockets
         monitor.running = False
+        monitor.ensure_central_connection = lambda: False
         if monitor.central_sock:
             monitor.central_sock.close()
+            monitor.central_sock = None
         if monitor.engine_sock:
             monitor.engine_sock.close()
+            monitor.engine_sock = None
 
         deadline = time.time() + 3.0
         while time.time() < deadline:
@@ -708,6 +719,221 @@ class WaterManagementFlowTests(unittest.TestCase):
 
         self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
         self.assertEqual(engine.state, "AVAILABLE")
+
+    def test_11_dynamic_station_registration_auth_persistence_and_existing_preservation(self):
+        """Requisito 18: Verifica:
+        1. Rechazo de una estación no registrada (WS-07 antes del alta y WS-99).
+        2. Alta dinámica de WS-07 sin reiniciar Central y conexión posterior de su Monitor y Engine hasta DISPONIBLE.
+        3. Persistencia del alta en SQLite (se conserva ante un nuevo arranque de WMCentral).
+        4. Si se intenta registrar una estación ya existente (WS-01), devuelve aviso (False) sin alterar
+           su ubicación, su estado ni su conexión activa."""
+        central, monitor1, engine1 = self._start_cluster("WS-01")
+        central_port = monitor1.central_port
+
+        # 1. Intentar autenticar WS-07 antes de darla de alta -> Central debe denegarla
+        monitor7 = WM_WS_M.WSMonitor(
+            engine_port=get_free_port(),
+            central_addr=f"127.0.0.1:{central_port}",
+            ws_id="WS-07",
+            location="Central Park"
+        )
+        self.active_instances.append(monitor7)
+        self.assertFalse(
+            monitor7.ensure_central_connection(),
+            "WS-07 no registrada debe ser rechazada en la autenticación"
+        )
+        self.assertNotIn("WS-07", central.stations)
+        self.assertTrue(
+            any(
+                entry["ws"] == "WS-07" and "Autenticación DENEGADA" in entry["message"]
+                for entry in central.recent_logs
+            )
+        )
+
+        # 2. Intentar registrar una estación que ya existe (WS-01) -> aviso sin modificar ubicación, estado ni socket
+        orig_sock = central.station_sockets.get("WS-01")
+        orig_loc = central.stations["WS-01"]["location"]
+        orig_status = central.stations["WS-01"]["status"]
+        self.assertEqual(orig_status, common.STATUS_AVAILABLE)
+
+        created_dup = central.register_station("WS-01", "Ubicacion Intrusa")
+        self.assertFalse(created_dup)
+        self.assertEqual(central.stations["WS-01"]["location"], orig_loc)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
+        self.assertIs(central.station_sockets.get("WS-01"), orig_sock)
+        self.assertTrue(
+            any(
+                entry["ws"] == "WS-01" and "ya existe; no se modifica" in entry["message"]
+                for entry in central.recent_logs
+            )
+        )
+
+        # 3. Dar de alta dinámicamente WS-07 en Central sin reiniciar
+        created_new = central.register_station("WS-07", "Central Park")
+        self.assertTrue(created_new)
+        self.assertIn("WS-07", central.stations)
+        self.assertEqual(central.stations["WS-07"]["status"], common.STATUS_OFFLINE)
+        self.assertEqual(central.stations["WS-07"]["location"], "Central Park")
+
+        # 4. Conectar Monitor y Engine de WS-07 y verificar que pasa a DISPONIBLE sin afectar a WS-01
+        threading.Thread(target=monitor7.run, daemon=True).start()
+        engine7 = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr=f"127.0.0.1:{monitor7.engine_port}"
+        )
+        self.active_instances.append(engine7)
+        threading.Thread(target=engine7.link_monitor, daemon=True).start()
+        self.assertTrue(engine7.assigned_event.wait(timeout=5.0))
+        threading.Thread(target=engine7.run_commands_consumer, daemon=True).start()
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if central.stations["WS-07"]["status"] == common.STATUS_AVAILABLE:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(central.stations["WS-07"]["status"], common.STATUS_AVAILABLE)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_AVAILABLE)
+
+        # 5. Comprobar que otra estación no dada de alta (WS-99) sigue siendo rechazada
+        monitor99 = WM_WS_M.WSMonitor(
+            engine_port=get_free_port(),
+            central_addr=f"127.0.0.1:{central_port}",
+            ws_id="WS-99",
+            location="Zona No Autorizada"
+        )
+        self.active_instances.append(monitor99)
+        self.assertFalse(monitor99.ensure_central_connection())
+        self.assertNotIn("WS-99", central.stations)
+
+        # 6. Verificar persistencia en SQLite: una nueva instancia de WMCentral sobre la misma BD carga WS-07
+        with central._get_db() as db:
+            row7 = db.execute("SELECT id, location, status FROM stations WHERE id = 'WS-07'").fetchone()
+        self.assertIsNotNone(row7)
+        self.assertEqual(row7["id"], "WS-07")
+
+        central_restarted = WM_Central.WMCentral(
+            socket_port=get_free_port(),
+            kafka_bootstrap="localhost:9092",
+            web_port=0,
+            db_path=self.temp_db.name
+        )
+        self.active_instances.append(central_restarted)
+        self.assertIn("WS-07", central_restarted.stations)
+        self.assertEqual(central_restarted.stations["WS-07"]["status"], common.STATUS_OFFLINE)
+
+    def test_12_http_register_access_control_and_id_validation(self):
+        """Verifica el control de acceso y validación de formato en el alta de estaciones:
+        1. Valida que solo se acepten IDs con formato WS- seguido de al menos 2 dígitos (WS-07, WS-100),
+           rechazando WS-7, WS-AB, ALL o cadenas vacías.
+        2. Una petición HTTP register desde loopback (127.0.0.1) es autorizada (HTTP 200) y registra la estación.
+        3. Una petición HTTP register desde una IP externa o desde el bridge Docker sin token es rechazada con HTTP 403.
+        4. Con WM_ADMIN_TOKEN configurado, una petición desde el host AWS (bridge Docker) con X-Admin-Token válido
+           es autorizada (HTTP 200), y sin él o con token incorrecto recibe HTTP 403."""
+        import json
+        import urllib.error
+        import urllib.request
+
+        web_port = get_free_port()
+        central = WM_Central.WMCentral(
+            socket_port=get_free_port(),
+            kafka_bootstrap="localhost:9092",
+            web_port=web_port,
+            db_path=self.temp_db.name
+        )
+        self.active_instances.append(central)
+        threading.Thread(target=central.run_web_server, daemon=True).start()
+
+        # Esperar a que el servidor HTTP esté escuchando
+        url_status = f"http://127.0.0.1:{web_port}/api/status"
+        url_action = f"http://127.0.0.1:{web_port}/api/action"
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url_status, timeout=1.0) as r:
+                    if r.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.05)
+
+        # 1. Validación de formato de identificador en register_station y vía HTTP
+        self.assertFalse(central.register_station("WS-7", "Formato Invalido 1 digito"))
+        self.assertFalse(central.register_station("WS-AB", "Formato Invalido letras"))
+        self.assertFalse(central.register_station("ALL", "Reservado"))
+        self.assertNotIn("WS-7", central.stations)
+        self.assertNotIn("WS-AB", central.stations)
+
+        req_bad = urllib.request.Request(
+            url_action,
+            data=json.dumps({"action": "register", "ws": "WS-7", "location": "Test"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx_bad:
+            urllib.request.urlopen(req_bad, timeout=2.0)
+        self.assertEqual(ctx_bad.exception.code, 400)
+        self.assertNotIn("WS-7", central.stations)
+
+        # 2. Petición autorizada desde loopback (127.0.0.1) con WS-07 y WS-100 -> HTTP 200
+        for valid_ws in ("WS-07", "WS-100"):
+            req_ok = urllib.request.Request(
+                url_action,
+                data=json.dumps({"action": "register", "ws": valid_ws, "location": "Central Park"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_ok, timeout=2.0) as resp:
+                self.assertEqual(resp.status, 200)
+                body = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(body.get("created"))
+            self.assertIn(valid_ws, central.stations)
+
+        # 3. Petición externa no autorizada (simulando IP pública 203.0.113.50 o bridge Docker 172.18.0.1) -> HTTP 403
+        orig_check = central._is_authorized_admin_request
+        for external_ip in ("203.0.113.50", "172.18.0.1"):
+            central._is_authorized_admin_request = (
+                lambda _ip, headers=None, ip=external_ip: orig_check(ip, headers)
+            )
+            req_ext = urllib.request.Request(
+                url_action,
+                data=json.dumps({"action": "register", "ws": "WS-08", "location": "Intruso"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_403:
+                urllib.request.urlopen(req_ext, timeout=2.0)
+            self.assertEqual(ctx_403.exception.code, 403)
+            self.assertNotIn("WS-08", central.stations)
+
+        # 4. Con WM_ADMIN_TOKEN configurado, petición desde bridge Docker (172.18.0.1) con token válido -> HTTP 200
+        with patch.dict(os.environ, {"WM_ADMIN_TOKEN": "clave-secreta-central"}):
+            central._is_authorized_admin_request = (
+                lambda _ip, headers=None: orig_check("172.18.0.1", headers)
+            )
+            # Token incorrecto -> HTTP 403
+            req_wrong_tok = urllib.request.Request(
+                url_action,
+                data=json.dumps({"action": "register", "ws": "WS-08", "location": "Central Park"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Admin-Token": "token-falso"},
+                method="POST"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_wrong:
+                urllib.request.urlopen(req_wrong_tok, timeout=2.0)
+            self.assertEqual(ctx_wrong.exception.code, 403)
+            self.assertNotIn("WS-08", central.stations)
+
+            # Token correcto -> HTTP 200
+            req_valid_tok = urllib.request.Request(
+                url_action,
+                data=json.dumps({"action": "register", "ws": "WS-08", "location": "Central Park"}).encode("utf-8"),
+                headers={"Content-Type": "application/json", "X-Admin-Token": "clave-secreta-central"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req_valid_tok, timeout=2.0) as resp_tok:
+                self.assertEqual(resp_tok.status, 200)
+                body_tok = json.loads(resp_tok.read().decode("utf-8"))
+                self.assertTrue(body_tok.get("created"))
+            self.assertIn("WS-08", central.stations)
 
 
 if __name__ == "__main__":
