@@ -60,8 +60,11 @@ class WSEngine:
         self.session_id = 0
         self.watering_deadline = 0.0
         self.timer_event = threading.Event()
+        self.started_event = threading.Event()
+        self.started_sent = False
         self.last_interrupted_summary: Optional[dict] = None
         self.pending_finished_events: list = []
+        self.flush_lock = threading.Lock()
 
         # Conexión con Kafka
         self.producer = make_producer(self.kafka_bootstrap)
@@ -84,32 +87,129 @@ class WSEngine:
 
             return send_kafka(self.producer, TOPIC_EVENTS, payload)
 
+    def trigger_flush_pending(self):
+        """Lanza el vaciado de eventos pendientes en segundo plano sin bloquear el hilo del socket."""
+        threading.Thread(target=self.flush_pending_finished, daemon=True).start()
+
     def flush_pending_finished(self) -> int:
-        """Reenvía eventos FINISHED que quedaron pendientes por fallo temporal de Kafka o de Central."""
-        with self.lock:
-            pending = list(self.pending_finished_events)
-        if not pending:
+        """Reenvía eventos FINISHED que quedaron pendientes por fallo temporal de Kafka o de Central.
+        Garantiza mediante flush_lock que no se ejecuten múltiples vaciados simultáneamente."""
+        if not self.flush_lock.acquire(blocking=False):
             return 0
+        try:
+            with self.lock:
+                pending = list(self.pending_finished_events)
+                interrupted = self.last_interrupted_summary
+                if interrupted and not any(p.get("transaction_id") == interrupted.get("transaction_id") for p in pending):
+                    pending.insert(0, interrupted)
+            if not pending:
+                return 0
 
-        flushed = 0
-        remaining = []
-        for summary in pending:
-            if self.send_event("FINISHED", **summary):
-                flushed += 1
-            else:
-                remaining.append(summary)
+            flushed = 0
+            successfully_sent_tx = set()
+            for summary in pending:
+                tx_id = summary.get("transaction_id")
+                if self.send_event("FINISHED", **summary):
+                    flushed += 1
+                    successfully_sent_tx.add(tx_id)
+                    with self.lock:
+                        if (
+                            self.last_interrupted_summary
+                            and self.last_interrupted_summary.get("transaction_id") == tx_id
+                        ):
+                            self.last_interrupted_summary = None
 
-        with self.lock:
-            remaining_tx = {s.get("transaction_id") for s in remaining}
-            self.pending_finished_events = [
-                s for s in self.pending_finished_events
-                if s.get("transaction_id") in remaining_tx
-            ]
-        return flushed
+            with self.lock:
+                unique_tx = set()
+                filtered = []
+                for s in self.pending_finished_events:
+                    tid = s.get("transaction_id")
+                    if tid not in successfully_sent_tx and tid not in unique_tx:
+                        unique_tx.add(tid)
+                        filtered.append(s)
+                self.pending_finished_events = filtered
+            return flushed
+        finally:
+            self.flush_lock.release()
 
     # --------------------------------------------------------------------------
     # CONEXIÓN Y SUPERVISIÓN CON EL MONITOR
     # --------------------------------------------------------------------------
+    def handle_monitor_request(self, req: str) -> str:
+        """Procesa una trama recibida desde el Monitor por socket TCP y genera la respuesta.
+        Garantiza que ninguna operación bloqueante de Kafka demore la respuesta HEALTH."""
+        parts = req.strip().split("#")
+        cmd = parts[0].upper()
+
+        if cmd == "ASSIGN" and len(parts) >= 2:
+            with self.lock:
+                self.ws_id = parts[1].strip().upper()
+                self.monitor_connected = True
+                self.assigned_event.set()
+            self.log(f"ID asignado por el Monitor: {self.ws_id}")
+            return "OK"
+
+        if cmd == "HEALTH":
+            trigger_flush = False
+            summary_to_publish = None
+            started_ev_to_publish = None
+
+            with self.lock:
+                self.monitor_connected = True
+                if len(parts) >= 2:
+                    central_flag = parts[1].strip().upper()
+                    if central_flag == "NO_CENTRAL":
+                        if self.central_connected:
+                            self.central_connected = False
+                            self.log(
+                                "ERROR: Imposible conectar con WM_Central. "
+                                "El riego en curso continuará hasta finalizar, pero no se admitirán nuevos riegos."
+                            )
+                    elif central_flag == "OK":
+                        if not self.central_connected:
+                            self.central_connected = True
+                            self.log("Conexión con WM_Central restablecida.")
+
+                if len(parts) >= 3:
+                    block_flag = parts[2].strip().upper()
+                    if block_flag == "BLOCKED" and self.state != "BLOCKED":
+                        self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
+                        if self.state == "WATERING":
+                            summary_to_publish, started_ev_to_publish = self._close_watering_locked("CENTRAL_BLOCK")
+                        else:
+                            self.state = "BLOCKED"
+                    elif block_flag == "ACTIVE" and self.state == "BLOCKED":
+                        self.state = "AVAILABLE"
+                        self.log("Estación REACTIVADA por CENTRAL: lista para prestar servicio")
+
+                if (self.pending_finished_events or self.last_interrupted_summary) and not self.is_ko:
+                    trigger_flush = True
+
+                if self.is_ko:
+                    if self.state == "WATERING":
+                        summary_to_publish, started_ev_to_publish = self._close_watering_locked("LEAK")
+                    if summary_to_publish:
+                        threading.Thread(
+                            target=self._publish_finished,
+                            args=(summary_to_publish, started_ev_to_publish),
+                            daemon=True
+                        ).start()
+                    return "KO"
+
+            if summary_to_publish:
+                threading.Thread(
+                    target=self._publish_finished,
+                    args=(summary_to_publish, started_ev_to_publish),
+                    daemon=True
+                ).start()
+
+            if trigger_flush:
+                self.trigger_flush_pending()
+
+            return "OK"
+
+        return "KO"
+
     def link_monitor(self):
         """Mantiene el enlace de sockets con el monitor WM_WS_M."""
         while self.running:
@@ -118,79 +218,17 @@ class WSEngine:
                 client_handshake(sock)
                 sock.settimeout(10.0)
 
-                def monitor_handler(req: str) -> str:
-                    parts = req.strip().split("#")
-                    cmd = parts[0].upper()
-
-                    if cmd == "ASSIGN" and len(parts) >= 2:
-                        with self.lock:
-                            self.ws_id = parts[1].strip().upper()
-                            self.monitor_connected = True
-                            self.assigned_event.set()
-                        self.log(f"ID asignado por el Monitor: {self.ws_id}")
-                        return "OK"
-
-                    if cmd == "HEALTH":
-                        with self.lock:
-                            self.monitor_connected = True
-                            if len(parts) >= 2:
-                                central_flag = parts[1].strip().upper()
-                                if central_flag == "NO_CENTRAL":
-                                    if self.central_connected:
-                                        self.central_connected = False
-                                        self.log(
-                                            "ERROR: Imposible conectar con WM_Central. "
-                                            "El riego en curso continuará hasta finalizar, pero no se admitirán nuevos riegos."
-                                        )
-                                elif central_flag == "OK":
-                                    if not self.central_connected:
-                                        self.central_connected = True
-                                        self.log("Conexión con WM_Central restablecida.")
-                                        if self.last_interrupted_summary and not self.is_ko:
-                                            s = self.last_interrupted_summary
-                                            self.log(
-                                                f"[RECUPERACIÓN] Reportando estado final del riego previo: "
-                                                f"{s['vol']:.2f} L en {s['dur']} s (Op: {s['op']})"
-                                            )
-                                            if self.send_event("FINISHED", **s):
-                                                self.last_interrupted_summary = None
-                                                self.pending_finished_events = [
-                                                    p for p in self.pending_finished_events
-                                                    if p.get("transaction_id") != s.get("transaction_id")
-                                                ]
-                                    if self.pending_finished_events and not self.is_ko:
-                                        self.flush_pending_finished()
-
-                            if len(parts) >= 3:
-                                block_flag = parts[2].strip().upper()
-                                if block_flag == "BLOCKED" and self.state != "BLOCKED":
-                                    if self.state == "WATERING":
-                                        self.finish_watering("CENTRAL_BLOCK")
-                                    self.state = "BLOCKED"
-                                    self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
-                                elif block_flag == "ACTIVE" and self.state == "BLOCKED":
-                                    self.state = "AVAILABLE"
-                                    self.log("Estación REACTIVADA por CENTRAL: lista para prestar servicio")
-
-                            if self.is_ko:
-                                # Si hay avería mientras riega, se interrumpe inmediatamente
-                                if self.state == "WATERING":
-                                    self.finish_watering("LEAK")
-                                return "KO"
-                            return "OK"
-
-                    return "KO"
-
                 while self.running:
-                    serve_one_socket(sock, monitor_handler)
+                    serve_one_socket(sock, self.handle_monitor_request)
 
             except (OSError, ConnectionError):
                 with self.lock:
                     was_connected = self.monitor_connected
                     self.monitor_connected = False
-                    if self.state == "WATERING":
-                        self.log("AVERIADA: Se perdió la conexión con el Monitor durante el riego. Deteniendo riego...")
-                        self.finish_watering("MONITOR_DOWN")
+                    watering_to_stop = (self.state == "WATERING")
+                if watering_to_stop:
+                    self.log("AVERIADA: Se perdió la conexión con el Monitor durante el riego. Deteniendo riego...")
+                    self.finish_watering("MONITOR_DOWN")
                 if was_connected:
                     self.log("AVERIADA: Enlace con Monitor perdido. La estación no admite riegos. Reintentando...")
                 else:
@@ -233,20 +271,42 @@ class WSEngine:
             )
             self.session_id += 1
             self.timer_event = threading.Event()
+            self.started_event = threading.Event()
+            self.started_sent = False
 
-            self.send_event("STARTED", op=op, duration=duration, transaction_id=self.current_tx_id)
-            self.log(f">>> ELECTROVÁLVULA ABIERTA. Riego iniciado por {op} (Límite: {duration or 'manual'} s)")
+            sid = self.session_id
+            tx_id = self.current_tx_id
+            deadline = self.watering_deadline
+            timer_ev = self.timer_event
+            started_ev = self.started_event
 
-            # Iniciar hilo de bombeo y telemetría
-            threading.Thread(target=self._water_loop, args=(self.session_id,), daemon=True).start()
-            # Iniciar temporizador independiente para riegos con duración limitada
-            if duration > 0:
-                threading.Thread(
-                    target=self._watering_timer,
-                    args=(self.session_id, self.watering_deadline, self.timer_event),
-                    daemon=True
-                ).start()
+        self.log(f">>> ELECTROVÁLVULA ABIERTA. Riego iniciado por {op} (Límite: {duration or 'manual'} s)")
 
+        # 1. Iniciar hilo de bombeo y telemetría
+        threading.Thread(target=self._water_loop, args=(sid, started_ev), daemon=True).start()
+
+        # 2. Iniciar temporizador independiente de inmediato para controlar la duración desde la apertura
+        if duration > 0:
+            threading.Thread(
+                target=self._watering_timer,
+                args=(sid, deadline, timer_ev),
+                daemon=True
+            ).start()
+
+        # 3. Publicar el evento STARTED en segundo plano para no demorar el temporizador ni bloquear al invocador
+        threading.Thread(
+            target=self._publish_started,
+            args=(sid, op, duration, tx_id, started_ev),
+            daemon=True
+        ).start()
+
+    def _publish_started(self, sid: int, op: str, duration: int, tx_id: str, started_ev: threading.Event):
+        try:
+            sent = self.send_event("STARTED", op=op, duration=duration, transaction_id=tx_id)
+            if self.session_id == sid:
+                self.started_sent = bool(sent)
+        finally:
+            started_ev.set()
 
     def _watering_timer(self, sid: int, deadline: float, stop_event: threading.Event):
         remaining = max(0.0, deadline - time.monotonic())
@@ -254,11 +314,15 @@ class WSEngine:
         if stop_event.wait(timeout=remaining):
             return
 
+        should_finish = False
         with self.lock:
             if self.session_id == sid and self.state == "WATERING":
-                self.finish_watering("TIME")
+                should_finish = True
 
-    def _water_loop(self, sid: int):
+        if should_finish:
+            self.finish_watering("TIME")
+
+    def _water_loop(self, sid: int, started_ev: threading.Event):
         while self.running:
             time.sleep(1.0)
 
@@ -271,13 +335,20 @@ class WSEngine:
                 if self.duration_limit > 0 and elapsed >= self.duration_limit:
                     break
 
-                # Simular el caudal y actualizar el volumen.
+                # Simular el caudal y actualizar el volumen acumulado siempre (físico).
                 flow = round(random.uniform(8.5, 11.5), 2)
                 self.accumulated_vol += flow / 60.0
                 curr_vol = round(self.accumulated_vol, 2)
                 op = self.current_op
                 tx_id = self.current_tx_id
-                self.pending_telemetry += 1
+
+                # Solo emitir telemetría si STARTED ya concluyó su intento y tuvo éxito
+                can_send_telemetry = started_ev.is_set() and getattr(self, "started_sent", False)
+                if can_send_telemetry:
+                    self.pending_telemetry += 1
+
+            if not can_send_telemetry:
+                continue
 
             # Enviar telemetría fuera del bloqueo.
             try:
@@ -297,48 +368,58 @@ class WSEngine:
                     self.pending_telemetry -= 1
                     self.telemetry_done.notify_all()
 
+    def _close_watering_locked(self, reason: str) -> tuple[Optional[dict], Optional[threading.Event]]:
+        """Cierra el riego físicamente y actualiza el estado atómicamente bajo self.lock.
+        Devuelve (summary_data, started_event) para su posterior publicación fuera del cerrojo."""
+        if self.state != "WATERING":
+            if reason == "CENTRAL_BLOCK":
+                self.state = "BLOCKED"
+            return None, None
 
+        elapsed = max(
+            0,
+            int(round(time.monotonic() - self.watering_start_time))
+        )
+        total_vol = round(self.accumulated_vol, 2)
+        op = self.current_op
+        tx_id = self.current_tx_id or f"{self.ws_id}-{op}-{uuid.uuid4().hex[:12]}"
+        started_ev = getattr(self, "started_event", None)
 
-    def finish_watering(self, reason: str):
-        with self.lock:
-            if self.state != "WATERING":
-                return
+        # Cerrar el riego antes de cualquier espera de Kafka.
+        self.state = "BLOCKED" if reason == "CENTRAL_BLOCK" else "AVAILABLE"
+        self.current_op = None
+        self.current_tx_id = None
+        self.timer_event.set()
 
-            elapsed = max(
-                0,
-                int(round(time.monotonic() - self.watering_start_time))
-            )
-            total_vol = round(self.accumulated_vol, 2)
-            op = self.current_op
-            tx_id = self.current_tx_id or f"{self.ws_id}-{op}-{uuid.uuid4().hex[:12]}"
+        summary_data = {
+            "op": op,
+            "reason": reason,
+            "vol": total_vol,
+            "dur": elapsed,
+            "transaction_id": tx_id,
+        }
 
-            # Cerrar el riego antes de cualquier espera de Kafka.
-            self.state = "AVAILABLE"
-            self.current_op = None
-            self.current_tx_id = None
-            self.timer_event.set()
+        self.log(
+            f"<<< ELECTROVÁLVULA CERRADA (Motivo: {reason}). "
+            f"Total: {total_vol} L en {elapsed} s"
+        )
+        return summary_data, started_ev
 
-            summary_data = {
-                "op": op,
-                "reason": reason,
-                "vol": total_vol,
-                "dur": elapsed,
-                "transaction_id": tx_id,
-            }
+    def _publish_finished(self, summary_data: dict, started_ev: Optional[threading.Event]):
+        """Publica el evento FINISHED tras garantizar el orden estricto de eventos."""
+        # 1. Esperar a que la publicación de STARTED haya concluido su intento
+        if started_ev is not None:
+            started_ev.wait()
 
-            self.log(
-                f"<<< ELECTROVÁLVULA CERRADA (Motivo: {reason}). "
-                f"Total: {total_vol} L en {elapsed} s"
-            )
-
-        # Esperar a que se publiquen las mediciones pendientes.
-        # La electroválvula ya está cerrada y self.lock está liberado.
+        # 2. Esperar a que se publiquen las mediciones de telemetría pendientes.
         with self.telemetry_done:
             while self.pending_telemetry > 0:
                 self.telemetry_done.wait()
 
-        # Publicar el evento final después de la telemetría.
+        # 3. Publicar el evento final después de STARTED y de la telemetría.
         sent = self.send_event("FINISHED", **summary_data)
+        reason = summary_data.get("reason", "")
+        tx_id = summary_data.get("transaction_id")
 
         if reason in ("LEAK", "MONITOR_DOWN") or not self.central_connected or not sent:
             with self.lock:
@@ -346,6 +427,13 @@ class WSEngine:
                 if not sent or not self.central_connected:
                     if not any(p.get("transaction_id") == tx_id for p in self.pending_finished_events):
                         self.pending_finished_events.append(summary_data)
+
+    def finish_watering(self, reason: str):
+        with self.lock:
+            summary_data, started_ev = self._close_watering_locked(reason)
+
+        if summary_data:
+            self._publish_finished(summary_data, started_ev)
 
     # --------------------------------------------------------------------------
     # CONSUMO DE ÓRDENES KAFKA (TOPIC_COMMANDS)
@@ -371,23 +459,22 @@ class WSEngine:
                         continue
 
                     cmd = str(data.get("cmd", "")).strip().upper()
-                    with self.lock:
-                        if cmd == "START":
-                            op = str(data.get("op", "CENTRAL")).strip().upper()
-                            duration = int(data.get("duration", 10))
-                            tx_id = data.get("transaction_id")
-                            self.start_watering(op, duration, transaction_id=tx_id)
+                    if cmd == "START":
+                        op = str(data.get("op", "CENTRAL")).strip().upper()
+                        duration = int(data.get("duration", 10))
+                        tx_id = data.get("transaction_id")
+                        self.start_watering(op, duration, transaction_id=tx_id)
 
-                        elif cmd == "STOP":
-                            reason = data.get("reason", "CENTRAL_STOP")
-                            self.finish_watering(reason)
+                    elif cmd == "STOP":
+                        reason = data.get("reason", "CENTRAL_STOP")
+                        self.finish_watering(reason)
 
-                        elif cmd == "BLOCK":
-                            self.finish_watering("CENTRAL_BLOCK")
-                            self.state = "BLOCKED"
-                            self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
+                    elif cmd == "BLOCK":
+                        self.finish_watering("CENTRAL_BLOCK")
+                        self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
 
-                        elif cmd == "ACTIVATE":
+                    elif cmd == "ACTIVATE":
+                        with self.lock:
                             if self.state == "BLOCKED":
                                 self.state = "AVAILABLE"
                                 self.log("Estación REACTIVADA por CENTRAL: lista para prestar servicio")
@@ -425,10 +512,9 @@ class WSEngine:
             if line == "k":
                 with self.lock:
                     self.is_ko = not self.is_ko
-                    if self.is_ko:
+                    ko_now = self.is_ko
+                    if ko_now:
                         self.log("\033[91;1m[SIMULACIÓN] Sensor en estado de AVERÍA (KO / Fuga activa)\033[0m")
-                        if self.state == "WATERING":
-                            self.finish_watering("LEAK")
                     else:
                         self.log("\033[92;1m[SIMULACIÓN] Avería RESUELTA (Sensor en estado OK)\033[0m")
                         if self.last_interrupted_summary:
@@ -437,7 +523,10 @@ class WSEngine:
                                 f"[RECUPERACIÓN] Estado final del riego previo antes de la avería: "
                                 f"{s['vol']:.2f} L consumidos en {s['dur']} s (Operario: {s['op']})"
                             )
-                            self.last_interrupted_summary = None
+                if ko_now:
+                    self.finish_watering("LEAK")
+                else:
+                    self.trigger_flush_pending()
 
             elif line == "s":
                 self.start_watering("MANUAL", 0)
@@ -468,8 +557,9 @@ class WSEngine:
         finally:
             self.running = False
             with self.lock:
-                if self.state == "WATERING":
-                    self.finish_watering("LEAK")
+                to_finish = (self.state == "WATERING")
+            if to_finish:
+                self.finish_watering("LEAK")
 
 
 # ==============================================================================

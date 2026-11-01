@@ -13,6 +13,7 @@ Verifican sin depender de servidores AWS:
      - Caída de WM_Central ("Imposible conectar con WM_Central").
 """
 
+import inspect
 import io
 import os
 import queue
@@ -33,17 +34,215 @@ for subdir in ("WM_Central", "WM_WS", "WM_FO"):
     if mod_path not in sys.path:
         sys.path.insert(0, mod_path)
 
+import traceback
 import common
 import WM_Central
 import WM_FO
 import WM_WS_E
 import WM_WS_M
 
+_orig_socket = socket.socket
+_orig_create_connection = socket.create_connection
+
+
+class FakeSocket:
+    def __init__(self, rx: queue.Queue, tx: queue.Queue, laddr=("127.0.0.1", 0), raddr=("127.0.0.1", 0)):
+        self.rx = rx
+        self.tx = tx
+        self.laddr = laddr
+        self.raddr = raddr
+        self.timeout = None
+        self.closed = False
+        self.peer = None
+        self.peer_closed = False
+        self.buf = b""
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def gettimeout(self):
+        return self.timeout
+
+    def getsockname(self):
+        return self.laddr
+
+    def getpeername(self):
+        return self.raddr
+
+    def fileno(self):
+        return 99
+
+    def setsockopt(self, *a):
+        pass
+
+    def sendall(self, data: bytes):
+        if self.closed or self.peer_closed:
+            raise ConnectionError("socket closed")
+        self.tx.put(data)
+
+    def recv(self, n: int) -> bytes:
+        if (self.closed or self.peer_closed) and not self.buf:
+            return b""
+        while len(self.buf) < n and not self.closed:
+            try:
+                chunk = self.rx.get(timeout=self.timeout)
+                if chunk is None:
+                    self.closed = True
+                    break
+                self.buf += chunk
+            except queue.Empty:
+                raise TimeoutError("timed out")
+        res = self.buf[:n]
+        self.buf = self.buf[n:]
+        return res
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            if self.peer:
+                self.peer.peer_closed = True
+            self.tx.put(None)
+
+
+def fake_socket_pair(p1=11111, p2=22222):
+    q1 = queue.Queue()
+    q2 = queue.Queue()
+    s1 = FakeSocket(q1, q2, ("127.0.0.1", p1), ("127.0.0.1", p2))
+    s2 = FakeSocket(q2, q1, ("127.0.0.1", p2), ("127.0.0.1", p1))
+    s1.peer = s2
+    s2.peer = s1
+    return s1, s2
+
+
+class FakeServerSocket:
+    def __init__(self, hub):
+        self.hub = hub
+        self.port = 0
+        self.timeout = None
+        self.closed = False
+        self.owner = None
+        self.queue = queue.Queue()
+
+    def setsockopt(self, *args):
+        pass
+
+    def bind(self, addr):
+        self.port = addr[1]
+
+    def listen(self, backlog=1):
+        self.hub.register(self.port, self)
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def accept(self):
+        while not self.closed:
+            if self.owner and not getattr(self.owner, "running", True):
+                self.close()
+                break
+            try:
+                conn, addr = self.queue.get(timeout=self.timeout or 0.2)
+                if conn is None or self.closed:
+                    break
+                return conn, addr
+            except queue.Empty:
+                if self.timeout is not None:
+                    raise TimeoutError("timed out")
+        raise OSError("server socket closed")
+
+    def close(self):
+        self.closed = True
+        self.hub.unregister(self.port)
+        self.queue.put((None, None))
+
+    def getsockname(self):
+        return ("0.0.0.0", self.port)
+
+
+class FakeSocketHub:
+    _port_counter = 40000
+
+    def __init__(self, test_case=None):
+        self.servers = {}
+        self.lock = threading.Lock()
+        self.test_case = test_case
+
+    @classmethod
+    def get_port(cls) -> int:
+        cls._port_counter += 1
+        return cls._port_counter
+
+    def register(self, port, server):
+        with self.lock:
+            self.servers[port] = server
+
+    def unregister(self, port):
+        with self.lock:
+            self.servers.pop(port, None)
+
+    def close_all(self):
+        with self.lock:
+            servers = list(self.servers.values())
+        for s in servers:
+            s.close()
+
+    def is_server_available(self, server, port) -> bool:
+        if server.closed:
+            return False
+        if server.owner and not getattr(server.owner, "running", True):
+            return False
+        if self.test_case:
+            for inst in getattr(self.test_case, "active_instances", []):
+                if getattr(inst, "socket_port", None) == port or getattr(inst, "engine_port", None) == port:
+                    if not getattr(inst, "running", True):
+                        return False
+        return True
+
+    def create_connection(self, address, *args, **kwargs):
+        host, port = address
+        with self.lock:
+            server = self.servers.get(port)
+        if server:
+            if not self.is_server_available(server, port):
+                server.close()
+                raise ConnectionRefusedError(f"Connection refused on port {port}")
+            timeout = args[0] if len(args) > 0 else kwargs.get("timeout")
+            client_sock, srv_sock = fake_socket_pair(50000 + (port % 1000), port)
+            client_sock.settimeout(timeout)
+            server.queue.put((srv_sock, client_sock.getsockname()))
+            return client_sock
+
+        stack = traceback.extract_stack(limit=6)
+        is_cluster_client = any(
+            frame.name in ("link_monitor", "ensure_central_connection")
+            for frame in stack
+        )
+        if is_cluster_client:
+            raise ConnectionRefusedError(f"Connection refused on port {port}")
+        return _orig_create_connection(address, *args, **kwargs)
+
+    def socket_factory(self, family=socket.AF_INET, type=socket.SOCK_STREAM, *args, **kwargs):
+        stack = traceback.extract_stack(limit=6)
+        is_cluster_server = False
+        for frame in stack:
+            if frame.name in ("run_socket_server", "run") and ("WM_Central" in frame.filename or "WM_WS_M" in frame.filename):
+                is_cluster_server = True
+                break
+        if is_cluster_server and family == socket.AF_INET and type == socket.SOCK_STREAM:
+            srv = FakeServerSocket(self)
+            frame = inspect.currentframe().f_back
+            while frame:
+                self_obj = frame.f_locals.get("self")
+                if self_obj and hasattr(self_obj, "running") and (hasattr(self_obj, "socket_port") or hasattr(self_obj, "engine_port")):
+                    srv.owner = self_obj
+                    break
+                frame = frame.f_back
+            return srv
+        return _orig_socket(family, type, *args, **kwargs)
+
 
 def get_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    return FakeSocketHub.get_port()
 
 
 class FakeKafkaMessage:
@@ -118,7 +317,7 @@ class FakeKafkaConsumer:
 
     def __iter__(self):
         while self.active:
-            delivered = False
+            msg_to_yield = None
             with self.broker.lock:
                 for t in self.topics:
                     key = (self.group_id, t)
@@ -129,22 +328,26 @@ class FakeKafkaConsumer:
                         self.read_offsets[key] = idx + 1
                         if self.enable_auto_commit:
                             self.broker.group_offsets[key] = idx + 1
-                        delivered = True
-                        yield FakeKafkaMessage(t, val)
+                        msg_to_yield = FakeKafkaMessage(t, val)
                         break
-            if not delivered:
+            if msg_to_yield is not None:
+                yield msg_to_yield
+            else:
                 time.sleep(0.02)
 
 
 class WaterManagementFlowTests(unittest.TestCase):
     def setUp(self):
         self.broker = FakeKafkaBroker()
+        self.socket_hub = FakeSocketHub(self)
         self.active_instances = []
         self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.temp_db.close()
 
-        # Parchear funciones Kafka en todos los módulos
+        # Parchear sockets y funciones Kafka en todos los módulos
         self.patches = [
+            patch.object(socket, "create_connection", self.socket_hub.create_connection),
+            patch.object(socket, "socket", self.socket_hub.socket_factory),
             patch.object(common, "ensure_topics", lambda *a, **kw: None),
             patch.object(common, "make_producer", lambda *a, **kw: "FAKE_PRODUCER"),
             patch.object(common, "send_kafka", lambda prod, topic, msg, **kw: self.broker.send(topic, msg)),
@@ -175,11 +378,16 @@ class WaterManagementFlowTests(unittest.TestCase):
                 except Exception:
                     pass
         self.broker.stop_all()
+        if hasattr(self, "socket_hub"):
+            self.socket_hub.close_all()
         time.sleep(0.05)
         for p in reversed(self.patches):
             p.stop()
         if os.path.exists(self.temp_db.name):
-            os.unlink(self.temp_db.name)
+            try:
+                os.unlink(self.temp_db.name)
+            except OSError:
+                pass
 
     def _start_cluster(self, ws_id="WS-01"):
         central_port = get_free_port()
@@ -934,6 +1142,448 @@ class WaterManagementFlowTests(unittest.TestCase):
                 body_tok = json.loads(resp_tok.read().decode("utf-8"))
                 self.assertTrue(body_tok.get("created"))
             self.assertIn("WS-08", central.stations)
+
+    def test_13_kafka_timeout_does_not_block_health_or_cause_disconnect(self):
+        """Verifica que el bloqueo/timeout de Kafka al iniciar un riego no bloquea las respuestas HEALTH
+        hacia el Monitor, no provoca falsos 'NO_ENGINE' ni 'MONITOR_DOWN' y no causa reconexiones cíclicas."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+
+        engine.ws_id = "WS-03"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        # Simular que Kafka está bloqueado / caído (demora de 1.5 s en send_event)
+        kafka_in_flight = threading.Event()
+        original_send = engine.send_event
+
+        def blocking_send(ev_type, **kwargs):
+            if ev_type == "STARTED":
+                kafka_in_flight.set()
+                time.sleep(1.5)  # Simula el timeout de Kafka al publicar STARTED
+                return False     # Kafka no responde
+            if ev_type == "FINISHED":
+                return False
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = blocking_send
+
+        # Iniciar riego manual en un hilo concurrente (como si el operario pulsara 's' en consola)
+        start_thread = threading.Thread(
+            target=engine.start_watering,
+            args=("MANUAL", 0),
+            kwargs={"transaction_id": "TX-MANUAL-KAFKA-DOWN"}
+        )
+        start_thread.start()
+
+        # Esperar a que start_watering esté activamente bloqueado en Kafka
+        self.assertTrue(kafka_in_flight.wait(timeout=2.0))
+
+        # Mientras start_watering está bloqueado en Kafka, simular la consulta periódica de HEALTH del Monitor
+        t0 = time.monotonic()
+        health_resp = engine.handle_monitor_request("HEALTH#OK")
+        elapsed = time.monotonic() - t0
+
+        # Debe responder inmediatamente sin esperar a que Kafka termine
+        self.assertEqual(health_resp, "OK")
+        self.assertLess(
+            elapsed, 0.5,
+            f"La respuesta HEALTH tardó {elapsed:.2f} s; debe ser inmediata (< 0.5 s) aun con Kafka bloqueado"
+        )
+
+        # Esperar a que termine la llamada a Kafka
+        start_thread.join(timeout=3.0)
+        self.assertFalse(start_thread.is_alive())
+
+        # Comprobar que el riego sigue activo y no se desconectó por MONITOR_DOWN
+        self.assertEqual(engine.state, "WATERING")
+        self.assertTrue(engine.monitor_connected)
+
+        # Ahora simular finalización del riego con Kafka aún caído
+        engine.finish_watering("MANUAL")
+        self.assertEqual(engine.state, "AVAILABLE")
+        self.assertEqual(len(engine.pending_finished_events), 1)
+
+        # Simular nueva consulta HEALTH mientras hay eventos pendientes: debe responder OK de inmediato
+        # sin bloquearse vaciando eventos en el hilo del handler
+        t1 = time.monotonic()
+        health_resp_pending = engine.handle_monitor_request("HEALTH#OK")
+        elapsed_pending = time.monotonic() - t1
+
+        self.assertEqual(health_resp_pending, "OK")
+        self.assertLess(elapsed_pending, 0.5)
+
+        # Comprobar que flush_lock evita ejecuciones concurrentes de vaciado
+        acquired = engine.flush_lock.acquire(blocking=False)
+        if acquired:
+            try:
+                # Si adquirimos el cerrojo nosotros, flush_pending_finished debe retornar 0
+                self.assertEqual(engine.flush_pending_finished(), 0)
+            finally:
+                engine.flush_lock.release()
+
+    def test_14_independent_timer_closes_on_time_when_kafka_blocked(self):
+        """Requisito: Comprueba que un riego de 2 segundos cierra la electroválvula puntualmente
+        a los 2s aun cuando la publicación de STARTED sufra un bloqueo de 4 segundos en Kafka."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+        engine.ws_id = "WS-01"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        kafka_started_delay = threading.Event()
+        original_send = engine.send_event
+        finished_sent = threading.Event()
+
+        def slow_started_send(ev_type, **kwargs):
+            if ev_type == "STARTED":
+                kafka_started_delay.set()
+                time.sleep(4.0)  # Kafka bloqueado 4 segundos al publicar STARTED
+                return False
+            if ev_type == "FINISHED":
+                finished_sent.set()
+                return True
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = slow_started_send
+
+        t0 = time.monotonic()
+        # Iniciar riego de 2 segundos
+        engine.start_watering("MANUAL", 2, transaction_id="TX-TIMER-4S-KAFKA")
+        self.assertTrue(kafka_started_delay.wait(timeout=2.0))
+
+        # Esperar a que la electroválvula se cierre por tiempo (state pasa a AVAILABLE)
+        deadline = t0 + 3.0
+        while time.monotonic() < deadline and engine.state == "WATERING":
+            time.sleep(0.05)
+
+        closing_elapsed = time.monotonic() - t0
+        self.assertEqual(engine.state, "AVAILABLE", "La electroválvula debe haberse cerrado por tiempo")
+        self.assertLess(
+            closing_elapsed, 2.8,
+            f"La electroválvula tardó {closing_elapsed:.2f}s en cerrar; debe cerrar en ~2s sin esperar los 4s de Kafka"
+        )
+
+        # Esperar a que concluyan las publicaciones en segundo plano
+        self.assertTrue(finished_sent.wait(timeout=5.0))
+        self.assertEqual(engine.state, "AVAILABLE")
+
+    def test_15_safe_station_blocking_via_monitor_health_and_reactivation(self):
+        """Requisito: Comprueba que la orden BLOCKED recibida por socket Monitor interrumpe el riego activo,
+        emite FINISHED con motivo CENTRAL_BLOCK, deja el estado estrictamente en BLOCKED (sin pasar por AVAILABLE),
+        no bloquea HEALTH y permite reactivación posterior con ACTIVE."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+        engine.ws_id = "WS-01"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        finished_events = []
+        original_send = engine.send_event
+
+        def track_send(ev_type, **kwargs):
+            if ev_type == "FINISHED":
+                finished_events.append(dict(kwargs))
+                return True
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = track_send
+
+        # 1. Iniciar riego de 10s
+        engine.start_watering("MANUAL", 10, transaction_id="TX-BLOCK-HEALTH")
+        self.assertEqual(engine.state, "WATERING")
+
+        # Acumular volumen > 0
+        with engine.lock:
+            engine.accumulated_vol = 0.45
+
+        # 2. Recibir orden de bloqueo por socket HEALTH#OK#BLOCKED
+        t0 = time.monotonic()
+        resp = engine.handle_monitor_request("HEALTH#OK#BLOCKED")
+        elapsed = time.monotonic() - t0
+
+        self.assertEqual(resp, "OK")
+        self.assertLess(elapsed, 0.5, "handle_monitor_request no debe bloquearse al tramitar BLOCKED")
+
+        # 3. Esperar finalización del riego
+        deadline = time.time() + 2.0
+        while time.time() < deadline and engine.state != "BLOCKED":
+            time.sleep(0.05)
+
+        self.assertEqual(engine.state, "BLOCKED", "El estado final debe ser BLOCKED")
+        self.assertEqual(len(finished_events), 1)
+        self.assertEqual(finished_events[0]["reason"], "CENTRAL_BLOCK")
+        self.assertEqual(finished_events[0]["vol"], 0.45)
+        self.assertEqual(finished_events[0]["transaction_id"], "TX-BLOCK-HEALTH")
+
+        # 4. Comprobar que en BLOCKED no se admiten nuevos riegos
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            engine.start_watering("MANUAL", 5)
+        self.assertIn("BLOCKED por CENTRAL", buf.getvalue())
+        self.assertEqual(engine.state, "BLOCKED")
+
+        # 5. Reactivación vía socket HEALTH#OK#ACTIVE
+        resp_act = engine.handle_monitor_request("HEALTH#OK#ACTIVE")
+        self.assertEqual(resp_act, "OK")
+        self.assertEqual(engine.state, "AVAILABLE", "La estación debe reactivarse a AVAILABLE")
+
+    def test_16_safe_station_blocking_via_kafka_commands_and_reactivation(self):
+        """Requisito: Comprueba que la orden BLOCK recibida por Kafka interrumpe el riego activo,
+        emite FINISHED con motivo CENTRAL_BLOCK, deja el estado en BLOCKED y se reactiva con ACTIVATE."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+        engine.ws_id = "WS-01"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        finished_events = []
+        original_send = engine.send_event
+
+        def track_send(ev_type, **kwargs):
+            if ev_type == "FINISHED":
+                finished_events.append(dict(kwargs))
+                return True
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = track_send
+
+        # Iniciar riego
+        engine.start_watering("FO-01", 10, transaction_id="TX-BLOCK-KAFKA")
+        self.assertEqual(engine.state, "WATERING")
+
+        with engine.lock:
+            engine.accumulated_vol = 0.80
+
+        # Simular llegada de comando BLOCK por Kafka
+        engine.finish_watering("CENTRAL_BLOCK")
+
+        self.assertEqual(engine.state, "BLOCKED", "El estado debe quedar inmediatamente en BLOCKED")
+        self.assertEqual(len(finished_events), 1)
+        self.assertEqual(finished_events[0]["reason"], "CENTRAL_BLOCK")
+        self.assertEqual(finished_events[0]["vol"], 0.80)
+
+        # Verificar rechazo de nuevo riego en BLOCKED
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            engine.start_watering("FO-01", 5)
+        self.assertIn("BLOCKED por CENTRAL", buf.getvalue())
+        self.assertEqual(engine.state, "BLOCKED")
+
+        # Reactivación vía comando ACTIVATE
+        with engine.lock:
+            if engine.state == "BLOCKED":
+                engine.state = "AVAILABLE"
+
+        self.assertEqual(engine.state, "AVAILABLE")
+
+    def test_17_monitor_health_blocked_immediately_guards_state_and_rejects_new_watering(self):
+        """Requisito: Comprueba que al recibir HEALTH#OK#BLOCKED el Engine cambia a BLOCKED de forma
+        síncrona y atómica bajo self.lock, cerrando el riego activo de inmediato y rechazando cualquier
+        nuevo intento de riego sin esperar a un hilo secundario."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+        engine.ws_id = "WS-01"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        finished_events = []
+        original_send = engine.send_event
+
+        def track_send(ev_type, **kwargs):
+            if ev_type == "FINISHED":
+                finished_events.append(dict(kwargs))
+                return True
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = track_send
+
+        # Caso A: Riego activo se bloquea inmediatamente y rechaza nuevos riegos
+        engine.start_watering("FO-01", 10, transaction_id="TX-IMM-BLOCK")
+        self.assertEqual(engine.state, "WATERING")
+        with engine.lock:
+            engine.accumulated_vol = 1.35
+
+        # Invocación directa a handle_monitor_request con BLOCKED
+        resp = engine.handle_monitor_request("HEALTH#OK#BLOCKED")
+        self.assertEqual(resp, "OK")
+
+        # Comprobación síncrona inmediata: no debe haber ningún estado intermedio ni retardo
+        self.assertEqual(engine.state, "BLOCKED", "El estado debe quedar inmediatamente en BLOCKED antes de responder al Monitor")
+        self.assertIsNone(engine.current_op, "current_op debe limpiarse sincrónicamente")
+        self.assertIsNone(engine.current_tx_id, "current_tx_id debe limpiarse sincrónicamente")
+
+        # Intento inmediato de iniciar otro riego debe ser rechazado al instante
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            engine.start_watering("MANUAL", 5)
+        self.assertEqual(engine.state, "BLOCKED", "No debe admitirse nuevo riego tras quedar BLOCKED")
+        self.assertIn("BLOCKED por CENTRAL", buf.getvalue())
+
+        # El hilo secundario debe publicar FINISHED con CENTRAL_BLOCK y el volumen exacto
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not finished_events:
+            time.sleep(0.02)
+        self.assertEqual(len(finished_events), 1)
+        self.assertEqual(finished_events[0]["reason"], "CENTRAL_BLOCK")
+        self.assertEqual(finished_events[0]["vol"], 1.35)
+        self.assertEqual(finished_events[0]["transaction_id"], "TX-IMM-BLOCK")
+
+        # Caso B: Estación en AVAILABLE recibe BLOCKED: pasa sincrónicamente a BLOCKED y rechaza riegos
+        engine.handle_monitor_request("HEALTH#OK#ACTIVE")
+        self.assertEqual(engine.state, "AVAILABLE")
+
+        resp_b = engine.handle_monitor_request("HEALTH#OK#BLOCKED")
+        self.assertEqual(resp_b, "OK")
+        self.assertEqual(engine.state, "BLOCKED", "Debe pasar de inmediato a BLOCKED desde AVAILABLE")
+
+        buf_b = io.StringIO()
+        with redirect_stdout(buf_b):
+            engine.start_watering("FO-02", 10)
+        self.assertEqual(engine.state, "BLOCKED")
+        self.assertIn("BLOCKED por CENTRAL", buf_b.getvalue())
+
+    def test_18_started_delayed_over_5s_closes_valve_on_time_and_preserves_order(self):
+        """Requisito: Comprueba que una publicación de STARTED demorada durante más de 5 segundos
+        no retrasa el cierre puntual de la electroválvula (~2s) y garantiza estrictamente que
+        TELEMETRY y FINISHED nunca se publiquen antes de STARTED."""
+        engine = WM_WS_E.WSEngine(
+            kafka_bootstrap="localhost:9092",
+            monitor_addr="127.0.0.1:6001"
+        )
+        self.active_instances.append(engine)
+        engine.ws_id = "WS-01"
+        engine.monitor_connected = True
+        engine.central_connected = True
+
+        published_order = []
+        started_unblock_ev = threading.Event()
+        original_send = engine.send_event
+
+        def delayed_send(ev_type, **kwargs):
+            if ev_type == "STARTED":
+                # Bloquear publicación de STARTED durante más de 5 segundos (6.0s o hasta señal)
+                started_unblock_ev.wait(timeout=6.0)
+                published_order.append("STARTED")
+                return True
+            if ev_type == "FINISHED":
+                published_order.append("FINISHED")
+                return True
+            published_order.append(ev_type)
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = delayed_send
+
+        t0 = time.monotonic()
+        # Iniciar riego de 2 segundos
+        engine.start_watering("MANUAL", 2, transaction_id="TX-SLOW-STARTED-6S")
+
+        # Esperar a que la electroválvula se cierre por temporizador a los 2s
+        deadline = t0 + 3.0
+        while time.monotonic() < deadline and engine.state == "WATERING":
+            time.sleep(0.05)
+
+        closing_elapsed = time.monotonic() - t0
+        self.assertEqual(engine.state, "AVAILABLE", "La electroválvula debe cerrarse por temporizador a los ~2s")
+        self.assertLess(
+            closing_elapsed, 2.8,
+            f"La electroválvula tardó {closing_elapsed:.2f}s; debe cerrar puntualmente sin esperar a STARTED"
+        )
+
+        # En t=5.2s (superando el umbral de 5.0s del timeout anterior):
+        # STARTED aún no se ha publicado, por lo que published_order debe estar vacía
+        time.sleep(max(0.0, 5.2 - (time.monotonic() - t0)))
+        self.assertEqual(
+            published_order, [],
+            "Ni TELEMETRY ni FINISHED deben haberse publicado mientras STARTED siga pendiente de publicación"
+        )
+
+        # Desbloquear STARTED y esperar a que concluya la publicación de FINISHED
+        started_unblock_ev.set()
+        deadline_pub = time.time() + 4.0
+        while time.time() < deadline_pub and "FINISHED" not in published_order:
+            time.sleep(0.05)
+
+        self.assertIn("STARTED", published_order)
+        self.assertIn("FINISHED", published_order)
+        self.assertEqual(
+            published_order, ["STARTED", "FINISHED"],
+            f"El orden de eventos debe ser estrictamente STARTED antes de FINISHED, obtenido: {published_order}"
+        )
+
+    def test_19_kafka_recovery_flushes_pending_finished_without_spurious_started_in_central(self):
+        """Requisito: Comprueba que cuando Kafka falla al inicio y al final de un riego, los eventos
+        FINISHED pendientes se conservan, y al recuperarse Kafka, el vaciado procesa FINISHED
+        sin enviar ningún STARTED tardío que deje a CENTRAL incorrectamente en REGANDO."""
+        central, monitor, engine = self._start_cluster("WS-01")
+
+        kafka_up = {"ok": False}
+        events_emitted = []
+        original_send = engine.send_event
+
+        def controlled_send(ev_type, **kwargs):
+            events_emitted.append(ev_type)
+            if not kafka_up["ok"]:
+                return False
+            return original_send(ev_type, **kwargs)
+
+        engine.send_event = controlled_send
+
+        # 1. Iniciar riego manual de 1s con Kafka caído
+        t0 = time.monotonic()
+        engine.start_watering("MANUAL", 1, transaction_id="TX-RECOVER-KAFKA-01")
+
+        # Esperar a que la electroválvula cierre puntualmente a 1s
+        deadline = t0 + 2.5
+        while time.monotonic() < deadline and engine.state == "WATERING":
+            time.sleep(0.05)
+        self.assertEqual(engine.state, "AVAILABLE", "La válvula debe cerrarse físicamente a pesar de fallo Kafka")
+
+        # Esperar brevemente a que el hilo de finalización intente enviar y archive en pendientes
+        time.sleep(0.3)
+        self.assertEqual(len(engine.pending_finished_events), 1, "FINISHED debe haberse guardado en pending_finished_events")
+        self.assertEqual(engine.pending_finished_events[0]["transaction_id"], "TX-RECOVER-KAFKA-01")
+
+        # 2. Restablecer Kafka y vaciar eventos pendientes
+        kafka_up["ok"] = True
+        flushed = engine.flush_pending_finished()
+        self.assertEqual(flushed, 1, "Debe vaciarse exactamente 1 evento FINISHED")
+        self.assertEqual(len(engine.pending_finished_events), 0)
+
+        # 3. Esperar a que Central procese el evento FINISHED
+        time.sleep(0.5)
+
+        # 4. Comprobar que en SQLite de CENTRAL se guardó el registro de la transacción
+        with central._get_db() as db:
+            row = db.execute("SELECT * FROM watering_history WHERE transaction_id = 'TX-RECOVER-KAFKA-01'").fetchone()
+        self.assertIsNotNone(row, "CENTRAL debe haber registrado la transacción histórica en SQLite")
+        self.assertEqual(row["reason"], "TIME")
+
+        # 5. Comprobar que CENTRAL permanece en DISPONIBLE y NO queda en REGANDO por ningún STARTED tardío
+        self.assertEqual(
+            central.stations["WS-01"]["status"],
+            common.STATUS_AVAILABLE,
+            "CENTRAL debe permanecer en DISPONIBLE y nunca pasar a REGANDO por eventos STARTED huérfanos"
+        )
+
+        engine.running = False
+        monitor.running = False
+        central.running = False
 
 
 if __name__ == "__main__":

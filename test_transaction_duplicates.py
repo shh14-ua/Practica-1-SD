@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -32,7 +33,7 @@ class TransactionDuplicateTests(unittest.TestCase):
 
     def test_same_finished_event_does_not_duplicate_history(self):
         """Dos eventos FINISHED con el mismo transaction_id producen 1 sola fila en SQLite y 1 solo SUMMARY."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = os.path.join(tmp, "central.db")
             sent_messages = []
 
@@ -89,7 +90,7 @@ class TransactionDuplicateTests(unittest.TestCase):
 
     def test_persistence_failure_prevents_notification_and_allows_recovery(self):
         """Si SQLite falla al guardar FINISHED, no se envía SUMMARY ni se pierde el estado; al recuperar, guarda y notifica 1 vez."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = os.path.join(tmp, "central.db")
             sent_messages = []
 
@@ -162,7 +163,7 @@ class TransactionDuplicateTests(unittest.TestCase):
 
     def test_kafka_events_consumer_commits_offset_only_after_persistence(self):
         """run_kafka_events_consumer no confirma el offset si falla handle_ws_event y reprocesa el evento al recuperar."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = os.path.join(tmp, "central.db")
 
             with patch.object(central_module, "ensure_topics"), \
@@ -236,7 +237,7 @@ class TransactionDuplicateTests(unittest.TestCase):
     def test_interrupted_leak_consolidated_and_late_engine_finished_not_duplicated(self):
         """Si Central consolida un riego por LEAK y luego llega el FINISHED tardío del Engine con el mismo transaction_id,
         se actualiza el volumen final en la misma fila sin duplicar la transacción."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = os.path.join(tmp, "central.db")
             sent_messages = []
 
@@ -345,7 +346,7 @@ class TransactionDuplicateTests(unittest.TestCase):
 
     def test_backward_compatibility_with_legacy_sqlite_schema(self):
         """Una base de datos SQLite existente sin columna transaction_id se migra sin perder su historial previo."""
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             db_path = os.path.join(tmp, "legacy_central.db")
 
             # Crear esquema antiguo (sin transaction_id) e insertar dos registros históricos
@@ -400,6 +401,68 @@ class TransactionDuplicateTests(unittest.TestCase):
 
                 self.assertEqual(total_rows, 3, "Deben conservarse las 2 filas históricas más 1 nueva transacción")
                 self.assertEqual(len(migrated_row), 1)
+
+    def test_flush_pending_finished_concurrent_append_preserves_both_events(self):
+        """Requisito: Comprueba de forma determinista (mediante eventos de sincronización)
+        que un evento añadido a pending_finished_events concurrentemente durante un vaciado
+        nunca sea eliminado ni sobrescrito."""
+        with patch.object(engine_module, "make_producer", return_value="FAKE_PROD"):
+            engine = engine_module.WSEngine(
+                kafka_bootstrap="localhost:9092",
+                monitor_addr="127.0.0.1:6001"
+            )
+            engine.ws_id = "WS-01"
+            engine.monitor_connected = True
+            engine.central_connected = True
+
+            event_1 = {"transaction_id": "TX-1", "reason": "TIME", "vol": 1.25, "dur": 10, "op": "FO-01"}
+            event_2 = {"transaction_id": "TX-2", "reason": "LEAK", "vol": 0.45, "dur": 4, "op": "FO-02"}
+
+            with engine.lock:
+                engine.pending_finished_events.append(event_1)
+
+            tx1_sending = threading.Event()
+            tx1_continue = threading.Event()
+
+            def controlled_send(ev_type, **kwargs):
+                if ev_type == "FINISHED" and kwargs.get("transaction_id") == "TX-1":
+                    tx1_sending.set()
+                    # Esperar a que el otro hilo añada TX-2 de forma determinista
+                    tx1_continue.wait(timeout=5.0)
+                    return True
+                if ev_type == "FINISHED" and kwargs.get("transaction_id") == "TX-2":
+                    return True
+                return False
+
+            engine.send_event = controlled_send
+
+            # Lanzar hilo de vaciado
+            flush_thread = threading.Thread(target=engine.flush_pending_finished)
+            flush_thread.start()
+
+            # Esperar a que el vaciado esté activamente procesando TX-1
+            self.assertTrue(tx1_sending.wait(timeout=2.0))
+
+            # Añadir concurrentemente TX-2 mientras TX-1 se está enviando
+            with engine.lock:
+                engine.pending_finished_events.append(event_2)
+
+            # Permitir que el envío de TX-1 concluya
+            tx1_continue.set()
+            flush_thread.join(timeout=3.0)
+            self.assertFalse(flush_thread.is_alive())
+
+            # Comprobar que TX-1 se envió con éxito y fue eliminado, pero TX-2 se conservó intacto
+            with engine.lock:
+                self.assertEqual(len(engine.pending_finished_events), 1)
+                self.assertEqual(engine.pending_finished_events[0]["transaction_id"], "TX-2")
+                self.assertEqual(engine.pending_finished_events[0]["vol"], 0.45)
+
+            # Ahora vaciar TX-2 en un nuevo ciclo
+            flushed_2 = engine.flush_pending_finished()
+            self.assertEqual(flushed_2, 1)
+            with engine.lock:
+                self.assertEqual(len(engine.pending_finished_events), 0)
 
 
 if __name__ == "__main__":
