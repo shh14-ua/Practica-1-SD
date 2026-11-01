@@ -1,281 +1,224 @@
-# Práctica WaterManagement — Sistemas Distribuidos (Curso 26/27)
+# WaterManagement Network
 
-Sistema distribuido para la gestión y supervisión centralizada del riego inteligente en parques y jardines urbanos, desarrollado en **Python** utilizando **Sockets TCP** y **Apache Kafka**.
+**Práctica 1 — Sistemas Distribuidos · Curso 2026/2027**  
+**Autoras:** Sofía Herrmann Herrero y Katia Hanis
 
----
+Sistema distribuido de gestión y supervisión del riego en parques y zonas verdes urbanas, desarrollado en **Python 3.12**. Combina **sockets TCP** para el registro y la supervisión de estaciones, **Apache Kafka** para las solicitudes, órdenes y telemetría, **SQLite** para persistencia y **Docker** para el despliegue.
 
-## 1. Arquitectura del Sistema
+## Arquitectura
 
-El sistema implementa la arquitectura técnica definida en la especificación (Figura 3):
-
-```
-                        ┌────────────────────────────────────────────────────────┐
-                        │                      CORE SYSTEM                       │
-                        │                                                        │
-                        │  ┌──────────────┐             ┌─────────────────────┐  │
-                        │  │  central.db  │◄──(SQLite)──┤     WM_Central      │  │
-                        │  └──────────────┘             │ (Panel + Web + API) │  │
-                        │                               └──────────┬──────────┘  │
-                        └──────────────────────────────────────────┼─────────────┘
-                                                                   │
-                                     Sockets (<STX><DATA><ETX><LRC>)│  Kafka (Topics)
-                                                                   │
-                ┌──────────────────────────────────────────────────┴───────────────────────────────────────┐
-                │                                                                                          │
-                ▼                                                                                          ▼
-┌───────────────────────────────┐                                                          ┌───────────────────────────────┐
-│     WATERING STATION (WS)     │                                                          │     FIELD OPERATOR (FO)       │
-│                               │                                                          │                               │
-│  ┌─────────────────────────┐  │                                                          │  ┌─────────────────────────┐  │
-│  │         WM_WS_M         │  │                                                          │  │          WM_FO          │  │
-│  │        (Monitor)        │  │                                                          │  │   (App de Operario)     │  │
-│  └────────────┬────────────┘  │                                                          │  └────────────┬────────────┘  │
-│               │ Sockets       │                                                          │               │ Kafka         │
-│  ┌────────────┴────────────┐  │                                                          │               │ (fo_requests, │
-│  │         WM_WS_E         │◄─┼───────────────────────(Kafka: ws_commands / ws_events)─┼───────────────┘  fo_replies,  │
-│  │     (Engine / Actuador) │  │                                                          │                  ws_status)   │
-│  └─────────────────────────┘  │                                                          └───────────────────────────────┘
-└───────────────────────────────┘
+```text
+                   ┌──────────────────────────────┐
+                   │          WM_Central          │
+                   │     Control + panel web      │
+                   │           SQLite             │
+                   └───────┬───────────┬──────────┘
+                           │ TCP       │ Kafka
+                           │           │
+                 ┌─────────▼──────┐    │     ┌─────────────────┐
+                 │ WM_WS_M        │    ├────►│ WM_FO           │
+                 │ Monitor        │    │     │ Operarios       │
+                 └─────────┬──────┘    │     └─────────────────┘
+                           │ TCP       │
+                 ┌─────────▼──────┐    │
+                 │ WM_WS_E        │◄───┘
+                 │ Engine         │  Kafka: órdenes y eventos
+                 └────────────────┘
 ```
 
-### Estructura del Repositorio
+- **WM_Central:** autentica Monitores, gestiona estados y autorizaciones, coordina riegos, almacena el historial y ofrece una interfaz web.
+- **WM_WS_M (Monitor):** establece la conexión TCP con Central, comprueba la salud del Engine y notifica averías y recuperaciones.
+- **WM_WS_E (Engine):** simula la electroválvula y el caudalímetro, ejecuta los riegos y publica telemetría.
+- **WM_FO:** permite a los operarios consultar estaciones, solicitar riegos y recibir sus resultados.
+- **Kafka:** intercambia mensajes asíncronos mediante los tópicos `fo_requests`, `fo_replies`, `ws_commands`, `ws_events` y `ws_status`.
+- **SQLite:** guarda operarios, estaciones y el historial de servicios en `central.db`.
+
+Los enlaces TCP emplean un protocolo de aplicación con tramas `STX–DATA–ETX–LRC`, comprobación XOR y confirmaciones `ACK/NACK`.
+
+## Estructura principal del repositorio
 
 ```text
 Practica-1-SD/
 ├── WM_Central/
-│   ├── WM_Central.py          # Módulo central (Sockets TCP + Kafka + SQLite + Web)
-│   └── dashboard.html         # Cuadro de mandos web embebido
+│   ├── WM_Central.py
+│   └── dashboard.html
 ├── WM_WS/
-│   ├── WM_WS_M.py             # Monitor de la estación de riego (Sockets TCP)
-│   └── WM_WS_E.py             # Motor / actuador de la estación (Sockets TCP + Kafka)
+│   ├── WM_WS_M.py
+│   └── WM_WS_E.py
 ├── WM_FO/
-│   ├── WM_FO.py               # Aplicación del operario de campo (Kafka + CLI)
-│   └── operaciones.txt        # Fichero de peticiones por lotes (--file)
-├── prompts/
-│   └── PROMPTS_IA.md          # Registro detallado de prompts utilizados con IA
-├── common.py                  # Protocolo <STX><DATA><ETX><LRC>, helpers Kafka y colores ANSI
-├── Dockerfile                 # Construcción de imagen Docker para todos los módulos
-├── docker-compose.yml         # Despliegue de Apache Kafka y WM_Central
-├── docker_run.sh              # Script de ejecución en contenedores Docker sin IDE
-├── run_demo.sh                # Lanzador interactivo rápido desde terminal
-├── test_watering_flow.py      # Batería de 6 pruebas automatizadas de flujo y resiliencia
-├── requirements.txt           # Dependencias Python (kafka-python-ng)
-├── Nombres.txt                # Autoras de la práctica
-└── README.md                  # Documentación y guía de despliegue
+│   └── WM_FO.py
+├── common.py
+├── Dockerfile
+├── docker-compose.yml
+├── docker_run.sh
+├── requirements.txt
+├── test_transaction_duplicates.py
+└── test_watering_flow.py
 ```
 
-### Componentes Software
+## Requisitos
 
-1. **`WM_Central` (`WM_Central/WM_Central.py`)**:
-   - Centraliza el gobierno y monitorización de toda la red.
-   - Servidor de sockets TCP para autenticación y supervisión de los monitores de estación (`WM_WS_M`).
-   - Productor y consumidor de Kafka para gestionar peticiones de operarios y órdenes a motores.
-   - Base de datos relacional **SQLite** (`central.db`) para registro de operarios, estaciones e historial de riegos.
-   - **Cuadro de mandos**: Panel con códigos de color ANSI en consola y servidor web embebido en tiempo real (`WM_Central/dashboard.html`) accesible vía navegador (según Figuras 1 y 2).
-
-2. **`WM_WS_M` (`WM_WS/WM_WS_M.py`) — Monitor de la Estación**:
-   - Conexión cliente por socket a `WM_Central` para registrar y autenticar la estación (`REGISTRO#<ID>#<UBICACION>`).
-   - Servidor de socket para conectar con su motor (`WM_WS_E`) y asignarle su ID (`ASSIGN#<ID>`).
-   - Envío de comprobación de salud cada segundo (`HEALTH#OK` / `HEALTH#NO_CENTRAL`).
-   - Si detecta avería o el motor no responde, envía `LEAK#<ID>` a Central. Cuando se resuelve, envía `FIXED#<ID>`.
-   - Envía latidos periódicos (`PING#<ID>`) para mantener activa la conexión con Central.
-
-3. **`WM_WS_E` (`WM_WS/WM_WS_E.py`) — Motor y Actuador de la Estación**:
-   - Conexión por socket al Monitor para recibir su ID asignado.
-   - Conexión a Kafka para recibir órdenes (`ws_commands`) y publicar telemetría y eventos (`ws_events`).
-   - Simula la electroválvula y caudalímetro (~8.5 a 11.5 L/min).
-   - Genera eventos periódicos de telemetría cada segundo durante el riego.
-   - **Simulación de avería**: La tecla `k` conmuta entre funcionamiento normal y KO (fuga simulada).
-   - Permite iniciar riego manual (`s`) y detenerlo (`f`) desde la propia estación.
-
-4. **`WM_FO` (`WM_FO/WM_FO.py`) — Aplicación del Operario de Campo**:
-   - Conexión a Kafka para solicitar servicios de riego (`fo_requests`).
-   - Recibe notificaciones de estado paso a paso (`STEP`), autorización (`AUTH`), denegación (`DENY`), telemetría en tiempo real y resumen final (`SUMMARY`).
-   - Consulta el estado de todas las estaciones registradas (`ws_status`).
-   - **Modo por lotes (`--file WM_FO/operaciones.txt`)**: Procesa las peticiones secuencialmente, esperando a la conclusión de cada servicio y **aguardando exactamente 4 segundos** antes de lanzar el siguiente.
-
-5. **`common.py`**:
-   - Protocolo de tramas por socket `<STX><DATA><ETX><LRC>` con cálculo byte a byte por XOR.
-   - Handshake `ENQ` / `ACK`.
-   - Conexiones y tópicos de Apache Kafka.
-   - Constantes de estado y códigos ANSI de color.
-
----
-
-## 2. Requisitos y Preparación del Entorno
-
-### Dependencias
-- Python 3.10 o superior (compatible con Python 3.12).
+- Python 3.12 (versión utilizada en el proyecto).
 - Docker y Docker Compose.
+- Acceso de red entre Central, Kafka, Monitores, Engines y operarios en un despliegue distribuido.
 
-### Instalación de librerías Python
+Para ejecutar componentes directamente con Python:
+
 ```bash
-# Crear entorno virtual (opcional pero recomendado)
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Instalar dependencias
 pip install -r requirements.txt
 ```
 
----
+## Ejecución local
 
-## 3. Despliegue y Ejecución Local (Terminal o Docker sin IDE)
+En terminales separadas, desde la raíz del repositorio:
 
-Todos los módulos pueden ejecutarse directamente desde la raíz del proyecto (o desde su propia carpeta) o bien mediante contenedores Docker con `./docker_run.sh`.
+**1. Iniciar Kafka**
 
-### Paso 1: Levantar Apache Kafka
-En la raíz del proyecto, ejecuta:
 ```bash
 docker compose up -d kafka
 ```
-Para comprobar que Kafka está funcionando:
+
+**2. Iniciar Central**
+
 ```bash
-docker logs wm_kafka
+python3 WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --db data/central.db
 ```
 
-### Paso 2: Iniciar la Central (`WM_Central`)
-Abre una terminal y ejecuta:
+Panel web: <http://localhost:8080>.
+
+**3. Iniciar una estación ya registrada**
+
 ```bash
-python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080
-# O mediante Docker:
-./docker_run.sh central
-```
-- Parámetros: `<puerto_sockets> <kafka_host:puerto> [--web-port 8080] [--db central.db]`
-- Cuadro de mandos web disponible en `http://localhost:8080/`.
+# Terminal del Monitor
+python3 WM_WS/WM_WS_M.py 6001 localhost:5000 WS-01 --loc "River Park Norte"
 
-### Paso 3: Iniciar una Estación de Riego (`WM_WS_M` y `WM_WS_E`)
-
-**Terminal 2 — Monitor de la Estación 1:**
-```bash
-python WM_WS/WM_WS_M.py 6001 localhost:5000 WS-01 --loc "River Park Norte"
-# O mediante Docker:
-./docker_run.sh monitor 6001 localhost:5000 WS-01 --loc "River Park Norte"
-```
-- Parámetros: `<puerto_engine> <central_host:puerto> <ID_WS> [--loc UBICACION]`
-
-**Terminal 3 — Motor de la Estación 1:**
-```bash
-python WM_WS/WM_WS_E.py localhost:9092 localhost:6001
-# O mediante Docker:
-./docker_run.sh engine localhost:9092 localhost:6001
-```
-- Parámetros: `<kafka_host:puerto> <monitor_host:puerto>`
-
-*(Puedes levantar tantas estaciones como desees cambiando los puertos y el ID, ej: `WS-02` con puerto 6002).*
-
-### Paso 4: Iniciar la Aplicación del Operario (`WM_FO`)
-
-**Terminal 4 — Operario en Modo Interactivo:**
-```bash
-python WM_FO/WM_FO.py localhost:9092 FO-01
-# O mediante Docker:
-./docker_run.sh fo localhost:9092 FO-01
-```
-- Parámetros: `<kafka_host:puerto> <ID_operario>`
-
-**Terminal 4 (Alternativa) — Operario en Modo por Lotes:**
-```bash
-python WM_FO/WM_FO.py localhost:9092 FO-01 --file WM_FO/operaciones.txt
-# O mediante Docker:
-./docker_run.sh fo localhost:9092 FO-01 --file WM_FO/operaciones.txt
+# Terminal del Engine
+python3 WM_WS/WM_WS_E.py localhost:9092 localhost:6001
 ```
 
-### Ejecución de las Pruebas Automatizadas Locales
-Para verificar el recorrido completo de las solicitudes y los escenarios de tolerancia a fallos sin depender de servidores externos:
+**4. Iniciar un operario**
+
 ```bash
-python test_watering_flow.py
+python3 WM_FO/WM_FO.py localhost:9092 FO-01
 ```
 
----
+En su consola:
 
-## 4. Guía de Pruebas y Comprobación de Casos de Uso
-
-Durante la evaluación de la práctica se comprobarán los siguientes escenarios:
-
-### Caso 1: Riego normal autorizado
-1. En la consola del operario (`FO-01`), escribe:
-   ```
-   r WS-01 10
-   ```
-2. Observarás cómo:
-   - Central recibe la petición y notifica los pasos al operario.
-   - El motor de `WS-01` abre la electroválvula y emite telemetría cada segundo (caudal y volumen acumulado).
-   - Al cumplirse los 10 segundos, se cierra la electroválvula y se envía un resumen final (`SUMMARY`) al operario con el volumen total y duración.
-   - La estación vuelve a estado `DISPONIBLE` y se registra en la base de datos SQLite.
-
-### Caso 2: Denegación de riego (operario no registrado o estación no disponible)
-1. Inicia un operario no dado de alta: `python WM_FO/WM_FO.py localhost:9092 FO-99`.
-2. Solicita riego: `r WS-01 10`.
-3. Central deniega la solicitud inmediatamente indicando que el operario no está registrado.
-4. Si una estación ya está regando o en fuga, cualquier solicitud posterior sobre ella será denegada explicando el motivo.
-
-### Caso 3: Simulación de fuga / avería (tecla `k`)
-1. Mientras `WS-01` está regando (o en reposo), pulsa la tecla `k` en la terminal de `WM_WS_E`.
-2. El sensor pasa a estado de avería (KO):
-   - El monitor `WM_WS_M` detecta la avería y envía `LEAK#WS-01` a Central por socket.
-   - El riego se interrumpe de inmediato conservando el volumen regado hasta ese instante.
-   - Central y el cuadro de mandos cambian el estado a **FUGA (ROJO)**.
-   - El operario recibe notificación del corte por avería y el resumen del agua suministrada.
-3. Vuelve a pulsar `k` en `WM_WS_E`:
-   - El sensor vuelve a estado OK.
-   - El monitor envía `FIXED#WS-01` a Central.
-   - La estación informa del estado final del riego previo y pasa automáticamente a **DISPONIBLE (VERDE)**.
-
-### Caso 4: Control arbitrario desde Central
-Desde la terminal de `WM_Central`:
-- `p` -> Imprime el panel con colores ANSI.
-- `b WS-01` -> Bloquea la estación (pasa a **FUERA DE SERVICIO / NARANJA** y cierra electroválvula si estaba regando).
-- `a WS-01` -> Reactiva la estación (vuelve a **DISPONIBLE / VERDE**).
-- `s WS-01 15` -> Inicia un riego ordenado directamente desde la central.
-- `h` -> Muestra los últimos riegos archivados en la base de datos.
-
-### Caso 5: Ejecución automatizada con fichero (`--file WM_FO/operaciones.txt`)
-Al ejecutar:
-```bash
-python WM_FO/WM_FO.py localhost:9092 FO-01 --file WM_FO/operaciones.txt
+```text
+l             # Consultar estaciones
+r WS-01 10    # Solicitar un riego de 10 segundos
+q             # Salir
 ```
-El sistema ejecutará cada orden del fichero, esperará a su conclusión y aguardará **exactamente 4 segundos** entre servicios.
 
----
+> **Importante:** las estaciones nuevas deben **darse de alta primero en WM_Central**. Iniciar un Monitor con un identificador no autorizado provoca el rechazo del registro. Los identificadores de estación admitidos siguen el formato `WS-07`, `WS-10`, `WS-100`, etc.
 
-## 5. Despliegue en Cloud (AWS / Railway) y Equipos del Laboratorio
+### Ejecución con Docker de los módulos
 
-Según el escenario de evaluación de la práctica:
-- **Cloud (AWS)**:
-  - **Instancia AWS 1 (`WM_Central` + SQLite)**: expone el puerto TCP `5000` (sockets para monitores) y el puerto HTTP `8080` (dashboard web).
-  - **Instancia AWS 2 (`Apache Kafka`)**: expone el puerto `9092` (externo) y `19092` (interno), con factor de replicación `1` para `__consumer_offsets`.
-- **Laboratorio (PCs)**:
-  - **`LLIBRE1-12` (Estaciones de riego `WS-01` y `WS-02`)**: ejecuta `WM_WS_M` y `WM_WS_E` para cada estación.
-  - **`LLIBRE1-11` (Operadores de campo `FO-01` y `FO-02`)**: ejecuta dos instancias de `WM_FO`.
+El script `docker_run.sh` permite ejecutar los módulos sin abrir un IDE, pasando sus parámetros por terminal. Ejemplo con Central y Kafka ya accesibles:
 
-### Comandos de ejecución en el escenario AWS + Laboratorio:
+```bash
+./docker_run.sh monitor 6007 <IP_CENTRAL>:5000 WS-07 --loc "Central Park Oeste"
+./docker_run.sh engine <IP_KAFKA>:9092 localhost:6007
+./docker_run.sh fo <IP_KAFKA>:9092 FO-03
+```
 
-1. **En la instancia AWS de `WM_Central`**:
-   ```bash
-   # Ejecución directa o mediante contenedor Docker:
-   docker build -t wm_app .
-   docker run -d --name wm_central --network=host -v "$(pwd)/data:/data" \
-     wm_app python WM_Central/WM_Central.py 5000 <IP_AWS_KAFKA>:9092 --web-port 8080 --db /data/central.db
-   ```
-   - Panel web disponible en: `http://<IP_AWS_CENTRAL>:8080/`
+Iniciar cada componente en una terminal diferente. En estaciones nuevas, ejecutar el alta administrativa antes de arrancar el Monitor.
 
-2. **En `LLIBRE1-12` (Estaciones `WS-01` y `WS-02`)**:
-   ```bash
-   # Estación WS-01 (Monitor en puerto local 6001 + Engine):
-   python WM_WS/WM_WS_M.py 6001 <IP_AWS_CENTRAL>:5000 WS-01 --loc "River Park Norte"
-   python WM_WS/WM_WS_E.py <IP_AWS_KAFKA>:9092 localhost:6001
+## Alta dinámica de estaciones
 
-   # Estación WS-02 (Monitor en puerto local 6002 + Engine):
-   python WM_WS/WM_WS_M.py 6002 <IP_AWS_CENTRAL>:5000 WS-02 --loc "River Park Sur"
-   python WM_WS/WM_WS_E.py <IP_AWS_KAFKA>:9092 localhost:6002
-   ```
+WM_Central permite **registrar estaciones nuevas durante la ejecución**, sin reiniciar Central ni las instancias existentes. El alta guarda la estación en SQLite y en memoria; una estación ya registrada no se sobrescribe.
 
-3. **En `LLIBRE1-11` (Operadores `FO-01` y `FO-02`)**:
-   ```bash
-   # Operador FO-01:
-   python WM_FO/WM_FO.py <IP_AWS_KAFKA>:9092 FO-01
+Ejemplo para una Central desplegada en el contenedor `wm_central` (petición realizada **dentro** del contenedor, desde la máquina que lo administra):
 
-   # Operador FO-02:
-   python WM_FO/WM_FO.py <IP_AWS_KAFKA>:9092 FO-02
-   ```
+```bash
+sudo docker exec -i wm_central python3 - <<'PY'
+import json
+import urllib.request
+
+payload = {"action": "register", "ws": "WS-07", "location": "Central Park Oeste"}
+request = urllib.request.Request(
+    "http://127.0.0.1:8080/api/action",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+    method="POST",
+)
+with urllib.request.urlopen(request) as response:
+    print(response.status, response.read().decode())
+PY
+```
+
+La acción HTTP `register` está restringida a solicitudes administrativas autorizadas. **No se debe exponer el alta de estaciones públicamente ni compartir tokens administrativos.** Tras el alta, conectar primero el Monitor y después el Engine. Sin Engine, la estación debe aparecer averiada; con ambos componentes sanos, disponible.
+
+## Estados de las estaciones
+
+| Estado | Visualización | Significado |
+|---|---|---|
+| `DISPONIBLE` | Verde | Monitor y Engine operativos; acepta riegos. |
+| `REGANDO` | Verde parpadeante | Riego activo y envío de telemetría. |
+| `FUGA` | Rojo | Monitor conectado, pero Engine ausente o averiado. |
+| `FUERA DE SERVICIO` | Naranja | Bloqueo ordenado por Central. |
+| `DESCONECTADA` | Gris | Central no recibe mensajes del Monitor. |
+
+Si el Monitor está desconectado, la estación aparece como `DESCONECTADA` independientemente del estado del Engine.
+
+## Operaciones y pruebas manuales
+
+- **Riego desde FO:** `r WS-01 10`.
+- **Riego manual desde Engine:** `s`; detener con `f`.
+- **Simular avería del Engine:** `k` (volver a pulsar para recuperarlo).
+- **Consultar estaciones desde FO:** `l`.
+- **Control desde Central:** permite iniciar, bloquear y activar estaciones individualmente o mediante `ALL`, respetando sus estados reales.
+- **Caídas de componentes:** se pueden simular deteniendo Monitor, Engine, FO o Central durante un riego; consultar la memoria de prácticas para el procedimiento y los resultados observados.
+
+### Pruebas automatizadas
+
+Desde la raíz del proyecto:
+
+```bash
+python3 -m unittest -v test_transaction_duplicates test_watering_flow
+```
+
+En la revisión del **commit `6b256d7`**, la batería registrada ejecutó **18 pruebas correctamente**: 6 de transacciones y 12 de flujo de riego, incluyendo el alta dinámica de WS y controles de acceso. Este resultado corresponde a esa revisión y no sustituye las pruebas de integración en el despliegue real.
+
+## Despliegue distribuido utilizado (AWS + equipos locales)
+
+En las pruebas se utilizaron dos instancias AWS: una para **WM_Central y SQLite** y otra para **Kafka**. Los Monitores, Engines y operarios se ejecutaron en distintos equipos mediante Docker.
+
+La imagen de Central se construye desde la raíz:
+
+```bash
+sudo docker build -f Dockerfile -t wm_central_aws:latest .
+```
+
+Ejemplo de inicio de Central, ajustando la dirección de Kafka y la ruta persistente al entorno:
+
+```bash
+sudo docker run -d \
+  --name wm_central \
+  --restart unless-stopped \
+  -p 5000:5000 \
+  -p 8080:8080 \
+  -v "$(pwd)/data:/data" \
+  -e DB_PATH=/data/central.db \
+  wm_central_aws:latest \
+  python WM_Central/WM_Central.py \
+  5000 <IP_PRIVADA_KAFKA>:19092 \
+  --web-port 8080 \
+  --db /data/central.db
+```
+
+El puerto `5000` recibe conexiones TCP de los Monitores y el `8080` ofrece el panel web. La carpeta `data` está montada para conservar SQLite al sustituir el contenedor.
+
+> **Seguridad:** el panel y sus acciones administrativas deben protegerse mediante las reglas de red y los controles de acceso apropiados. No se recomienda publicar el puerto `8080` sin restricciones en un despliegue fuera del laboratorio.
+
+## Resiliencia y limitaciones conocidas
+
+Se probaron caídas y recuperaciones de Monitor, Engine, FO, WM_Central y Kafka, incluyendo riegos en curso, notificaciones y conservación de resultados. Las operaciones se identifican con `transaction_id` para evitar duplicados de historial.
+
+Durante las pruebas se observaron dos aspectos pendientes de revisión: la interferencia de una caída de Kafka en la comunicación entre Monitor y Engine, y un primer listado de estaciones desactualizado al iniciar un nuevo FO que se corrigió en la consulta posterior. Por ello, las pruebas de resiliencia deben interpretarse junto con las observaciones y evidencias documentadas en la memoria.
+
+## Documentación
+
+La memoria de prácticas recoge la arquitectura, los protocolos, las decisiones de diseño, el despliegue y las pruebas de validación realizadas siguiendo la guía de corrección de la asignatura.
