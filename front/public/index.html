@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Water Management - Panel de Control Central (Release 2)</title>
+  <script src="/config.js"></script>
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --color-primary: #38bdf8;
+      --color-green: #22c55e;
+      --color-red: #ef4444;
+      --color-orange: #f97316;
+      --color-gray: #64748b;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-main);
+      padding: 20px;
+      line-height: 1.5;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      gap: 15px;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: var(--color-primary);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-badge {
+      font-size: 0.85rem;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: #0284c7;
+      color: white;
+      font-weight: 600;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 15px;
+      margin-bottom: 24px;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 16px;
+      text-align: center;
+    }
+
+    .stat-val {
+      font-size: 2rem;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+
+    .section-title {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 14px;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 24px;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.95rem;
+    }
+
+    th {
+      padding: 12px 14px;
+      background: #0f172a;
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--card-border);
+      text-transform: uppercase;
+      font-size: 0.8rem;
+      letter-spacing: 0.05em;
+    }
+
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    /* Colores oficiales de estado según especificación */
+    .st-disponible {
+      background: #15803d;
+      color: white;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    .st-regando {
+      background: #16a34a;
+      color: white;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: inline-block;
+      animation: blink-animation 1s infinite alternate;
+    }
+
+    .st-fuga {
+      background: #b91c1c;
+      color: white;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    .st-fuera-de-servicio {
+      background: #c2410c;
+      color: white;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    .st-desconectada {
+      background: #475569;
+      color: #e2e8f0;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 6px;
+      display: inline-block;
+    }
+
+    @keyframes blink-animation {
+      from { opacity: 1; }
+      to { opacity: 0.4; }
+    }
+
+    .btn {
+      padding: 6px 12px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.82rem;
+      transition: all 0.2s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .btn-danger {
+      background: #ef4444;
+      color: white;
+    }
+    .btn-danger:hover { background: #dc2626; }
+
+    .btn-warning {
+      background: #f59e0b;
+      color: black;
+    }
+    .btn-warning:hover { background: #d97706; }
+
+    .btn-success {
+      background: #10b981;
+      color: white;
+    }
+    .btn-success:hover { background: #059669; }
+
+    .btn-primary {
+      background: #38bdf8;
+      color: #0f172a;
+    }
+    .btn-primary:hover { background: #0ea5e9; }
+
+    .weather-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 15px;
+    }
+
+    .weather-card {
+      background: #0f172a;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 14px;
+      position: relative;
+    }
+
+    .weather-card.has-alert {
+      border-color: #ef4444;
+      background: rgba(239, 68, 68, 0.08);
+    }
+
+    .alert-pill {
+      display: inline-block;
+      background: #ef4444;
+      color: white;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-top: 6px;
+    }
+
+    .log-box {
+      background: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 6px;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.82rem;
+      max-height: 220px;
+      overflow-y: auto;
+      color: #94a3b8;
+    }
+
+    .log-line {
+      margin-bottom: 4px;
+    }
+
+    .key-badge {
+      font-size: 0.75rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .key-active { background: #065f46; color: #6ee7b7; }
+    .key-revoked { background: #7f1d1d; color: #fca5a5; }
+
+    .audit-action {
+      font-weight: 700;
+      font-size: 0.8rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      display: inline-block;
+    }
+    .act-auth { background: #075985; color: #7dd3fc; }
+    .act-fail { background: #991b1b; color: #fecaca; }
+    .act-revoke { background: #854d0e; color: #fef08a; }
+    .act-weather { background: #1e3a8a; color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>💧 Red Water Management — Central Dashboard</h1>
+        <div style="color: var(--text-muted); font-size: 0.9rem; margin-top: 4px;">
+          Sistemas Distribuidos | Release 2: Seguridad (HTTPS, Cifrado Simétrico, Auditoría) & API REST
+        </div>
+      </div>
+      <div style="display: flex; gap: 10px; align-items: center;">
+        <span id="connStatus" class="status-badge">Conectando...</span>
+        <span id="clock" style="font-family: monospace; font-size: 1rem; color: var(--color-primary);">--:--:--</span>
+      </div>
+    </header>
+
+    <!-- Resumen de Métricas -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Estaciones Registradas</div>
+        <div id="statTotal" class="stat-val" style="color: var(--color-primary);">0</div>
+      </div>
+      <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">En Riego Activo</div>
+        <div id="statWatering" class="stat-val" style="color: var(--color-green);">0</div>
+      </div>
+      <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Incidencias / Fugas</div>
+        <div id="statLeaks" class="stat-val" style="color: var(--color-red);">0</div>
+      </div>
+      <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Fuera de Servicio</div>
+        <div id="statBlocked" class="stat-val" style="color: var(--color-orange);">0</div>
+      </div>
+      <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Alertas Clima (WM_W)</div>
+        <div id="statWeather" class="stat-val" style="color: #f43f5e;">0</div>
+      </div>
+    </div>
+
+    <!-- Panel de Estaciones de Riego -->
+    <div class="card">
+      <div class="section-title">
+        <span>Estaciones de Riego (Watering Stations - WS)</span>
+        <span style="font-size: 0.85rem; color: var(--text-muted);">Sondeo en vivo cada 1.5s</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Ubicación</th>
+            <th>Estado</th>
+            <th>Caudal</th>
+            <th>Vol. Acumulado</th>
+            <th>Operario FO</th>
+            <th>Seguridad (Clave Simétrica)</th>
+            <th>Acciones</th>
+          </tr>
+        </thead>
+        <tbody id="stationsTableBody">
+          <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Cargando estaciones...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Panel Meteorológico (WM_W - Weather Control Office) -->
+    <div class="card">
+      <div class="section-title">
+        <span>🌤️ Oficina Meteorológica (WM_W — OpenWeather Integration)</span>
+        <span style="font-size: 0.85rem; color: var(--text-muted);">Sondeo cada 4s (Alerta si temp &lt; 0ºC o lluvia)</span>
+      </div>
+      <div id="weatherGrid" class="weather-grid">
+        <div style="color: var(--text-muted);">Consultando datos meteorológicos...</div>
+      </div>
+    </div>
+
+    <!-- Registro de Auditoría de Seguridad -->
+    <div class="card">
+      <div class="section-title">
+        <span>🛡️ Registro Estructurado de Auditoría de Seguridad (Audit Log)</span>
+        <span style="font-size: 0.85rem; color: var(--text-muted);">Eventos de autenticación, revocación y cambios de estado</span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Fecha / Hora</th>
+            <th>Origen (IP)</th>
+            <th>Entidad</th>
+            <th>Acción</th>
+            <th>Descripción del Evento</th>
+          </tr>
+        </thead>
+        <tbody id="auditTableBody">
+          <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Sin eventos de auditoría</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Histórico de Riegos en BD SQLite y Logs en Vivo -->
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; flex-wrap: wrap;">
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>📜 Histórico de Transacciones en BD</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>WS</th>
+              <th>Operario</th>
+              <th>Volumen</th>
+              <th>Duración</th>
+              <th>Motivo</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody">
+            <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Cargando historial...</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>📡 Logs Operacionales en Vivo</span>
+        </div>
+        <div id="logBox" class="log-box">
+          <div class="log-line">Esperando eventos de Central...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = window.API_CENTRAL_URL || "";
+
+    function updateClock() {
+      const now = new Date();
+      document.getElementById('clock').innerText = now.toLocaleTimeString();
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+
+    function getStatusClass(status) {
+      const norm = (status || "").toUpperCase();
+      if (norm === "DISPONIBLE") return "st-disponible";
+      if (norm === "REGANDO") return "st-regando";
+      if (norm === "FUGA") return "st-fuga";
+      if (norm === "FUERA DE SERVICIO") return "st-fuera-de-servicio";
+      return "st-desconectada";
+    }
+
+    async function sendAction(action, wsId) {
+      if (action === "revoke_keys") {
+        if (!confirm(`¿Revocar las claves simétricas de seguridad de la estación ${wsId}? La estación quedará FUERA DE SERVICIO y obligada a re-autenticarse.`)) {
+          return;
+        }
+      }
+      try {
+        const resp = await fetch(`${API_BASE}/api/action`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action, ws: wsId })
+        });
+        if (resp.ok) {
+          fetchStatus();
+        }
+      } catch (err) {
+        alert("Error al enviar acción: " + err);
+      }
+    }
+
+    async function fetchStatus() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/status`);
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        const data = await resp.json();
+
+        document.getElementById('connStatus').innerText = "CONECTADO A CENTRAL";
+        document.getElementById('connStatus').style.background = "#15803d";
+
+        const stations = data.stations || [];
+        const weatherAlerts = data.weather_alerts || {};
+        const logs = data.logs || [];
+        const audits = data.audits || [];
+
+        // Estadísticas
+        document.getElementById('statTotal').innerText = stations.length;
+        document.getElementById('statWatering').innerText = stations.filter(s => s.status === "REGANDO").length;
+        document.getElementById('statLeaks').innerText = stations.filter(s => s.status === "FUGA").length;
+        document.getElementById('statBlocked').innerText = stations.filter(s => s.status === "FUERA DE SERVICIO").length;
+        document.getElementById('statWeather').innerText = Object.keys(weatherAlerts).length;
+
+        // Tabla de estaciones
+        const tbody = document.getElementById('stationsTableBody');
+        if (stations.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No hay estaciones registradas</td></tr>`;
+        } else {
+          tbody.innerHTML = stations.map(s => {
+            const hasKey = s.has_key;
+            const keyBadge = hasKey
+              ? `<span class="key-badge key-active">🔑 Clave Activa (AES)</span>`
+              : `<span class="key-badge key-revoked">🚫 Sin Clave / Revocada</span>`;
+
+            const alertBadge = s.weather_alert
+              ? `<div class="alert-pill">❄️ Alerta Clima: ${s.weather_alert.reason}</div>`
+              : '';
+
+            return `
+              <tr>
+                <td><strong>${s.id}</strong></td>
+                <td>${s.location} ${alertBadge}</td>
+                <td><span class="${getStatusClass(s.status)}">${s.status}</span></td>
+                <td>${s.flow.toFixed(1)} L/min</td>
+                <td>${s.vol.toFixed(1)} L</td>
+                <td>${s.operator || '—'}</td>
+                <td>${keyBadge}</td>
+                <td>
+                  <button class="btn btn-warning" onclick="sendAction('revoke_keys', '${s.id}')" title="Revocar claves simétricas ante supuesta vulnerabilidad">
+                    🔑 Restaurar Claves
+                  </button>
+                  ${s.status === 'FUERA DE SERVICIO'
+                    ? `<button class="btn btn-success" onclick="sendAction('activate', '${s.id}')">Activar</button>`
+                    : `<button class="btn btn-danger" onclick="sendAction('block', '${s.id}')">Bloquear</button>`}
+                </td>
+              </tr>
+            `;
+          }).join('');
+        }
+
+        // Panel de Clima (WM_W)
+        const weatherGrid = document.getElementById('weatherGrid');
+        if (stations.length === 0) {
+          weatherGrid.innerHTML = `<div style="color: var(--text-muted);">Sin datos de clima</div>`;
+        } else {
+          weatherGrid.innerHTML = stations.map(s => {
+            const wInfo = weatherAlerts[s.id];
+            const hasAlert = !!wInfo;
+            const tempStr = wInfo ? `${wInfo.temp.toFixed(1)} ºC` : 'Consultando...';
+            const condStr = wInfo ? wInfo.condition : 'Normal';
+            const cityStr = wInfo ? wInfo.city : s.location;
+
+            return `
+              <div class="weather-card ${hasAlert ? 'has-alert' : ''}">
+                <div style="font-weight: 700; color: var(--color-primary);">${s.id} — ${cityStr}</div>
+                <div style="font-size: 1.5rem; font-weight: 700; margin: 4px 0;">${tempStr}</div>
+                <div style="color: var(--text-muted); font-size: 0.85rem;">Condición: ${condStr}</div>
+                ${hasAlert ? `<div class="alert-pill">⚠️ ALERTA: ${wInfo.reason}</div>` : `<div style="color: var(--color-green); font-size: 0.8rem; margin-top: 6px;">✓ Clima favorable para riego</div>`}
+              </div>
+            `;
+          }).join('');
+        }
+
+        // Auditoría
+        const auditBody = document.getElementById('auditTableBody');
+        if (audits.length === 0) {
+          auditBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Sin eventos de auditoría registrados</td></tr>`;
+        } else {
+          auditBody.innerHTML = audits.slice(-10).reverse().map(a => {
+            let actClass = "act-auth";
+            if (a.action.includes("FAIL") || a.action.includes("ALERT")) actClass = "act-fail";
+            if (a.action.includes("REVOKE")) actClass = "act-revoke";
+            if (a.action.includes("WEATHER")) actClass = "act-weather";
+
+            return `
+              <tr>
+                <td style="font-family: monospace; font-size: 0.85rem;">${a.timestamp}</td>
+                <td>${a.source_ip}</td>
+                <td><strong>${a.entity}</strong></td>
+                <td><span class="audit-action ${actClass}">${a.action}</span></td>
+                <td>${a.description} ${a.details ? `<small style="color: var(--text-muted); display: block;">${a.details}</small>` : ''}</td>
+              </tr>
+            `;
+          }).join('');
+        }
+
+        // Logs
+        const logBox = document.getElementById('logBox');
+        if (logs.length > 0) {
+          logBox.innerHTML = logs.map(l => `<div class="log-line">${l.msg}</div>`).join('');
+          logBox.scrollTop = logBox.scrollHeight;
+        }
+
+      } catch (err) {
+        document.getElementById('connStatus').innerText = "DESCONECTADO DE CENTRAL";
+        document.getElementById('connStatus').style.background = "#dc2626";
+      }
+    }
+
+    async function fetchHistory() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/history`);
+        if (!resp.ok) return;
+        const history = await resp.json();
+        const tbody = document.getElementById('historyTableBody');
+        if (!history || history.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Sin historial de riegos</td></tr>`;
+        } else {
+          tbody.innerHTML = history.slice(0, 8).map(h => `
+            <tr>
+              <td>#${h.id}</td>
+              <td><strong>${h.ws_id}</strong></td>
+              <td>${h.operator_id}</td>
+              <td>${Number(h.total_vol).toFixed(2)} L</td>
+              <td>${h.duration_sec} s</td>
+              <td>${h.reason}</td>
+            </tr>
+          `).join('');
+        }
+      } catch (err) {}
+    }
+
+    // Intervalo de sondeo periódico
+    fetchStatus();
+    fetchHistory();
+    setInterval(fetchStatus, 1500);
+    setInterval(fetchHistory, 5000);
+  </script>
+</body>
+</html>

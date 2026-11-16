@@ -22,3 +22,6 @@ data/
 .vscode/
 .idea/
 .DS_Store
+
+# Claves privadas
+WM_Registry/certs/*_key.pem

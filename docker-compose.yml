@@ -17,18 +17,43 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
 
+  registry:
+    build: .
+    container_name: wm_registry
+    command: python WM_Registry/WM_Registry.py 5500 --db /data/registry.db
+    ports:
+      - "5500:5500"
+    volumes:
+      - ./data:/data
+
   central:
     build: .
     container_name: wm_central
+    command: python WM_Central/WM_Central.py 5000 kafka:19092 --web-port 8080 --db /data/central.db
     depends_on:
       - kafka
+      - registry
     ports:
       - "5000:5000"
       - "8080:8080"
     environment:
       DB_PATH: /data/central.db
       KAFKA_BOOTSTRAP: kafka:19092
+      WM_REGISTRY_URL: https://registry:5500
+      WM_REGISTRY_DB: /data/registry.db
     volumes:
       - ./data:/data
     stdin_open: true
     tty: true
+
+  front:
+    image: node:20-alpine
+    container_name: wm_front
+    working_dir: /app
+    volumes:
+      - ./front:/app
+    command: node server.js 3000 http://central:8080
+    depends_on:
+      - central
+    ports:
+      - "3000:3000"

@@ -1,0 +1,12 @@
+{
+  "name": "wm-front",
+  "version": "2.0.0",
+  "description": "Dashboard Web de Water Management (Release 2)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["water-management", "dashboard", "rest-api", "sistemas-distribuidos"],
+  "author": "SD",
+  "license": "ISC"
+}

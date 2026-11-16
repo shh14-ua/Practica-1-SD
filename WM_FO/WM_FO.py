@@ -63,6 +63,7 @@ class FieldOperator:
     def listen_kafka(self):
         while self.running:
             try:
+                #recibe los mensajes de kafka
                 for msg in self.consumer:
                     if not self.running:
                         break
@@ -81,7 +82,7 @@ class FieldOperator:
                     if not isinstance(val, dict):
                         continue
 
-                    # Mensajes dirigidos a este operario (comparación insensible a mayúsculas)
+                    # comprueba que el mensaje está dirigido a este operario
                     target_op = str(val.get("op", "")).strip().upper()
                     if target_op != self.op_id:
                         continue

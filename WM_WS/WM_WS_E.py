@@ -31,6 +31,7 @@ from common import (
     make_producer, send_kafka, make_consumer,
     COLOR_BOLD, COLOR_RESET
 )
+from wm_crypto import encrypt_message, decrypt_message, is_encrypted
 
 class WSEngine:
     def __init__(self, kafka_bootstrap: str, monitor_addr: str):
@@ -50,6 +51,7 @@ class WSEngine:
         self.is_ko = False  # Simulación de avería
         self.monitor_connected = False
         self.central_connected = True
+        self.symmetric_key: Optional[str] = None  # Clave simétrica para cifrado (Release 2)
 
         # Variables de telemetría durante el riego
         self.current_op: Optional[str] = None
@@ -84,6 +86,11 @@ class WSEngine:
                 "timestamp": time.time(),
                 **extra
             }
+
+            # Si la estación tiene clave simétrica activa, añadimos el bloque cifrado (Release 2)
+            if self.symmetric_key:
+                raw_json = json.dumps(payload)
+                payload["encrypted"] = encrypt_message(self.symmetric_key, raw_json)
 
             return send_kafka(self.producer, TOPIC_EVENTS, payload)
 
@@ -147,6 +154,12 @@ class WSEngine:
                 self.monitor_connected = True
                 self.assigned_event.set()
             self.log(f"ID asignado por el Monitor: {self.ws_id}")
+            return "OK"
+
+        if cmd == "SET_KEY" and len(parts) >= 2:
+            with self.lock:
+                self.symmetric_key = parts[1].strip()
+            self.log(f"Clave simétrica recibida del Monitor ({self.symmetric_key[:10]}...). Canal cifrado activado.")
             return "OK"
 
         if cmd == "HEALTH":
@@ -467,7 +480,14 @@ class WSEngine:
 
                     elif cmd == "STOP":
                         reason = data.get("reason", "CENTRAL_STOP")
-                        self.finish_watering(reason)
+                        if reason == "WEATHER_ALERT":
+                            self.log("Aviso de alerta meteorológica: el riego finalizará con normalidad y la estación quedará fuera de servicio.")
+                            # Finaliza el riego y bloquea la estación al terminar
+                            self.finish_watering("WEATHER_ALERT")
+                            with self.lock:
+                                self.state = "BLOCKED"
+                        else:
+                            self.finish_watering(reason)
 
                     elif cmd == "BLOCK":
                         self.finish_watering("CENTRAL_BLOCK")

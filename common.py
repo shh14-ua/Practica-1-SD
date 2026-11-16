@@ -22,8 +22,24 @@ try:
     from kafka.admin import KafkaAdminClient, NewTopic
     from kafka.errors import NoBrokersAvailable, TopicAlreadyExistsError
 except ImportError:
-    KafkaConsumer = Any
-    KafkaProducer = Any
+    class DummyProducer:
+        def __init__(self, *args, **kwargs): pass
+        def send(self, topic, value):
+            class _Future:
+                def get(self, timeout=None): return True
+            return _Future()
+        def flush(self): pass
+        def close(self): pass
+
+    class DummyConsumer:
+        def __init__(self, *args, **kwargs): pass
+        def __iter__(self): return iter([])
+        def poll(self, timeout_ms=0): return {}
+        def commit(self): pass
+        def close(self): pass
+
+    KafkaConsumer = DummyConsumer
+    KafkaProducer = DummyProducer
     KafkaAdminClient = None
     NewTopic = None
 
@@ -309,3 +325,12 @@ def parse_host_port_pair(args_list: list, start_idx: int) -> Tuple[str, int, int
     if first.isdigit():
         return "0.0.0.0", int(first), start_idx + 1
     raise ValueError(f"No se pudo determinar host y puerto a partir del argumento '{first}'.")
+
+
+def safe_db_path(db_path: str) -> str:
+    """Devuelve una ruta compatible con SQLite para evitar bloqueos en rutas de red UNC de Windows."""
+    import os, tempfile
+    if os.name == "nt" and os.path.abspath(db_path).startswith("\\\\"):
+        clean_name = os.path.basename(db_path)
+        return os.path.join(tempfile.gettempdir(), clean_name)
+    return db_path

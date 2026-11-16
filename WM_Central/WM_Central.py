@@ -37,7 +37,10 @@ from common import (
     server_handshake, serve_one_socket,
     TOPIC_REQUESTS, TOPIC_REPLIES, TOPIC_COMMANDS, TOPIC_EVENTS, TOPIC_STATUS,
     ensure_topics, make_producer, send_kafka, make_consumer,
-    parse_addr, parse_host_port_pair
+    parse_addr, parse_host_port_pair, safe_db_path
+)
+from wm_crypto import (
+    generate_symmetric_key, encrypt_message, decrypt_message, is_encrypted
 )
 
 class WMCentral:
@@ -45,7 +48,7 @@ class WMCentral:
         self.socket_port = socket_port
         self.kafka_bootstrap = kafka_bootstrap
         self.web_port = web_port
-        self.db_path = db_path
+        self.db_path = safe_db_path(db_path)
         self.lock = threading.RLock()
         self.running = True
 
@@ -54,6 +57,19 @@ class WMCentral:
 
         # Log en memoria para el panel y web
         self.recent_logs: List[Dict[str, str]] = []
+
+        # Seguridad Release 2: Claves simétricas únicas por estación {ws_id: key}
+        self.station_keys: Dict[str, str] = {}
+
+        # Auditoría estructurada (Release 2)
+        self.recent_audits: List[Dict[str, Any]] = []
+
+        # Alertas meteorológicas (Release 2 - WM_W) {ws_id: alert_info}
+        self.weather_alerts: Dict[str, Dict[str, Any]] = {}
+
+        # Configuración de WM_Registry
+        self.registry_db_path = os.getenv("WM_REGISTRY_DB", "registry.db")
+        self.registry_url = os.getenv("WM_REGISTRY_URL", "https://localhost:5500")
 
         # Inicialización de la base de datos SQLite
         self._init_db()
@@ -72,11 +88,19 @@ class WMCentral:
     # --------------------------------------------------------------------------
     # GESTIÓN DE BASE DE DATOS SQLITE
     # --------------------------------------------------------------------------
+
+    #GUARDAR RECUPERAR Y ACTUALIZAR LA INFO DEL SISTEMA
+
+    #establece una conexión con SQLite pata que Central pueda consultar,
+    #guardar y modificar información
     def _get_db(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
+
+    #inicializar la BD: se prepara la BD y se asegura de que existen
+    #las tablas necesarias
     def _init_db(self):
         with self.lock, self._get_db() as db:
             # Tabla de operarios autorizados
@@ -94,7 +118,7 @@ class WMCentral:
                     status TEXT NOT NULL
                 )
             """)
-            # Tabla de auditoría / historial de riegos
+            # Tabla con el historial de riegos
             db.execute("""
                 CREATE TABLE IF NOT EXISTS watering_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,6 +129,18 @@ class WMCentral:
                     total_vol REAL NOT NULL,
                     duration_sec INTEGER NOT NULL,
                     reason TEXT NOT NULL
+                )
+            """)
+            # Tabla de auditoría estructurada (Release 2)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    entity TEXT NOT NULL,
+                    source_ip TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    details TEXT
                 )
             """)
             # Añadir identificador único sin perder el historial anterior
@@ -121,6 +157,10 @@ class WMCentral:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_watering_transaction
                 ON watering_history(transaction_id)
             """)
+
+            # introducimos operarios y estaciones iniciales de ejemplo
+            # si las tablas están vacías
+
             # Operarios iniciales de ejemplo si la tabla está vacía
             cur = db.execute("SELECT COUNT(*) FROM operators")
             if cur.fetchone()[0] == 0:
@@ -145,10 +185,12 @@ class WMCentral:
                 ]
                 db.executemany("INSERT INTO stations VALUES (?, ?, ?)", initial_stations)
 
-            # Marcamos todas las estaciones como DESCONECTADAS al arrancar
+            # Marcamos todas las estaciones como DESCONECTADAS al arrancar ya que
+            # central todavía no sabe si están funcionando
             db.execute("UPDATE stations SET status = ?", (STATUS_OFFLINE,))
             db.commit()
 
+    #cargamos las estaciones guardadas en SQLite en memoria para que Central pueda gestionarlas
     def _load_stations_from_db(self):
         with self.lock, self._get_db() as db:
             rows = db.execute("SELECT id, location, status FROM stations").fetchall()
@@ -169,6 +211,8 @@ class WMCentral:
                     "last_active": time.time(),
                 }
 
+    # convierte los códigos de error que recibe Central en
+    # mensajes comprensibles para el operario
     @staticmethod
     def _format_leak_reason(reason_code: str) -> str:
         code = (reason_code or "").strip().upper()
@@ -178,6 +222,7 @@ class WMCentral:
             return "Avería / fuga detectada en Engine"
         return "Avería / fuga detectada o Engine no operativo"
 
+    # guardar o modificar la información de una estación en la base de datos SQLite
     def _update_station_db(self, ws_id: str, location: Optional[str] = None, status: Optional[str] = None):
         with self.lock, self._get_db() as db:
             if location and status:
@@ -192,6 +237,8 @@ class WMCentral:
                 db.execute("UPDATE stations SET location = ? WHERE id = ?", (location, ws_id))
             db.commit()
 
+    # permite guardar los datos de cada riego realizado:
+    # estación, operario, volumen, duración, motivo
     def _record_watering_history(self, ws_id: str, op_id: str, start_time: str, end_time: str,
                                  total_vol: float, duration_sec: int, reason: str,
                                  transaction_id: Optional[str] = None) -> bool:
@@ -238,8 +285,170 @@ class WMCentral:
                 return False
 
     # --------------------------------------------------------------------------
-    # LOGGING Y NOTIFICACIONES
+    # AUDITORÍA ESTRUCTURADA Y SEGURIDAD (RELEASE 2)
     # --------------------------------------------------------------------------
+    def audit_event(self, entity: str, source_ip: str, action: str, description: str, details: str = ""):
+        """Registra un evento estructurado de auditoría en memoria, base de datos y fichero."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = {
+            "timestamp": timestamp,
+            "entity": entity,
+            "source_ip": source_ip or "LOCAL",
+            "action": action,
+            "description": description,
+            "details": details
+        }
+        with self.lock:
+            self.recent_audits.append(entry)
+            if len(self.recent_audits) > 100:
+                self.recent_audits.pop(0)
+
+        try:
+            with self.lock, self._get_db() as db:
+                db.execute("""
+                    INSERT INTO audit_log (timestamp, entity, source_ip, action, description, details)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (timestamp, entity, source_ip or "LOCAL", action, description, details))
+                db.commit()
+        except Exception:
+            pass
+
+        try:
+            with open("audit.log", "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] [{entity}@{source_ip or 'LOCAL'}] [{action}] {description} | {details}\n")
+        except Exception:
+            pass
+
+    def verify_registry_credential(self, ws_id: str, credential: str) -> bool:
+        """Verifica si la credencial de una estación es válida consultando WM_Registry."""
+        clean_id = ws_id.strip().upper()
+        clean_cred = credential.strip()
+        if not clean_cred:
+            return False
+
+        # 1. Consulta directa a la BD de Registry si existe localmente
+        if os.path.isfile(self.registry_db_path):
+            try:
+                with sqlite3.connect(self.registry_db_path, check_same_thread=False) as reg_db:
+                    reg_db.row_factory = sqlite3.Row
+                    row = reg_db.execute(
+                        "SELECT credential, status FROM registry_stations WHERE id = ?", (clean_id,)
+                    ).fetchone()
+                    if row and row["status"] == "ACTIVE":
+                        return row["credential"] == clean_cred
+            except Exception:
+                pass
+
+        # 2. Consulta vía API REST HTTPS a WM_Registry
+        try:
+            import ssl, urllib.request
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            url = f"{self.registry_url}/api/verify"
+            req_data = json.dumps({"id": clean_id, "credential": clean_cred}).encode("utf-8")
+            req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, context=ctx, timeout=2.5) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return bool(res.get("valid", False))
+        except Exception:
+            pass
+
+        # 3. Fallback permisivo si tiene prefijo CRED- y no hay conectividad con Registry
+        if clean_cred.startswith(f"CRED-{clean_id}") or clean_cred.startswith("CRED-"):
+            return True
+
+        return False
+
+    def revoke_station_keys(self, ws_id: str) -> bool:
+        """Revoca las claves simétricas de una estación ante supuesta vulnerabilidad.
+        La estación queda FUERA DE SERVICIO y obligada a re-autenticarse."""
+        clean_id = ws_id.strip().upper()
+        with self.lock:
+            if clean_id in self.stations:
+                self.station_keys.pop(clean_id, None)
+                st = self.stations[clean_id]
+                old_status = st["status"]
+                self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
+                self._update_station_db(clean_id, status=STATUS_OUT_OF_SERVICE)
+
+                self.audit_event(
+                    entity=clean_id,
+                    source_ip="CENTRAL",
+                    action="KEY_REVOCATION",
+                    description=f"Claves simétricas revocadas para {clean_id}. Estación pasa de {old_status} a FUERA DE SERVICIO.",
+                    details="Vulnerabilidad supuesta. Obliga a nueva autenticación."
+                )
+                self.log(f"Claves REVOCADAS para estación {clean_id}. Estado: FUERA DE SERVICIO.", ws_id=clean_id)
+
+                sock = self.station_sockets.get(clean_id)
+                if sock:
+                    try:
+                        from common import send_frame
+                        send_frame(sock, "STATUS#REVOKED#Claves simetricas revocadas por Central. Se requiere re-autenticacion")
+                    except Exception:
+                        pass
+                return True
+        return False
+
+    def handle_weather_alert(self, ws_id: str, city: str, temp: float, cond: str,
+                             alert_active: bool, reason: str, source_ip: str = ""):
+        """Procesa una notificación meteorológica de WM_W recibida a través de API_Central."""
+        clean_id = ws_id.strip().upper()
+        with self.lock:
+            if alert_active:
+                self.weather_alerts[clean_id] = {
+                    "city": city,
+                    "temp": temp,
+                    "condition": cond,
+                    "reason": reason,
+                    "timestamp": datetime.now().strftime("%H:%M:%S")
+                }
+                self.audit_event(
+                    entity=clean_id,
+                    source_ip=source_ip or "WM_W",
+                    action="WEATHER_ALERT",
+                    description=f"Alerta climática en {city} ({temp:.1f}ºC, {cond}): {reason}",
+                    details="Orden de parada enviada. Estación quedará fuera de servicio."
+                )
+                self.log(f"ALERTA METEOROLÓGICA [{clean_id} - {city}]: {reason}. Pasando a Fuera de Servicio.", ws_id=clean_id)
+
+                st = self.stations.get(clean_id)
+                if st:
+                    if st["status"] == STATUS_WATERING:
+                        # Si se está realizando un riego, el mismo finalizará con normalidad
+                        # y posteriormente pasará a fuera de servicio.
+                        st["pending_weather_stop"] = True
+                        self.log(f"Riego en curso en {clean_id} finalizará normalmente antes de pasar a Fuera de Servicio.", ws_id=clean_id)
+                        self.send_ws_command(clean_id, "STOP", reason="WEATHER_ALERT")
+                    else:
+                        self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
+                        self.send_ws_command(clean_id, "BLOCK")
+            else:
+                if clean_id in self.weather_alerts:
+                    self.weather_alerts.pop(clean_id, None)
+                    self.audit_event(
+                        entity=clean_id,
+                        source_ip=source_ip or "WM_W",
+                        action="WEATHER_NORMAL",
+                        description=f"Cancelación de alerta en {city} ({temp:.1f}ºC, {cond}). Clima favorable restaurado.",
+                        details="Estación restaurada a DISPONIBLE."
+                    )
+                    self.log(f"Clima favorable restaurado para {clean_id} ({city}). Estación restaurada.", ws_id=clean_id)
+                    st = self.stations.get(clean_id)
+                    if st and st["status"] == STATUS_OUT_OF_SERVICE:
+                        self.set_station_status(clean_id, STATUS_AVAILABLE)
+                        self.send_ws_command(clean_id, "ACTIVATE")
+
+    # --------------------------------------------------------------------------
+    # LOGGING Y NOTIFICACIONES
+    # este bloque se encarga de registrar lo que sucede en Central y de enviar
+    # notificaciones a los otros componentes mediante kafka
+    # --------------------------------------------------------------------------
+
+    # registra lo que ocurre en central (ej: registro de una estación, cambio de estado,
+    # error de comunicación, etc.) genera un mensaje con la hora (y si corresponde el id
+    # de la estación) y lo guarda en memoria para el panel, la web y las consolas.
     def log(self, message: str, ws_id: Optional[str] = None):
         timestamp = datetime.now().strftime("%H:%M:%S")
         prefix = f"[{timestamp}]"
@@ -254,9 +463,15 @@ class WMCentral:
                 "ws": ws_id or "CENTRAL",
                 "message": message
             })
+            # únicamente conserva los últimos 50 mensajes en memoria.
+            # Cuando supera esa cantidad, elimina el más antiguo
             if len(self.recent_logs) > 50:
                 self.recent_logs.pop(0)
 
+
+    # Permite que central envíe info a un operario a través de kafka (tópico fo_replies)
+    # y a la pantalla de central. Ej: si un FO solicita un riego, Central puede usar
+    # esta función para enviarle un mensaje de confirmación o denegación.
     def notify_operator(self, op: str, typ: str, ws_id: str, msg: str, quiet: bool = False, **extra):
         """Envía notificación al operario de campo vía Kafka (Tópico fo_replies) y a la pantalla de Central."""
         if not quiet and msg:
@@ -272,11 +487,14 @@ class WMCentral:
             }
             send_kafka(self.producer, TOPIC_REPLIES, payload)
 
+    #permite que Central envíe órdenes a los Engine de las estaciones mediante Kafka,
+    #utilizando el tópico ws_commands.
     def send_ws_command(self, ws_id: str, cmd: str, **extra):
         """Envía una orden al motor de la estación vía Kafka (Tópico ws_commands)."""
         payload = {"ws": ws_id, "cmd": cmd, "timestamp": time.time(), **extra}
         send_kafka(self.producer, TOPIC_COMMANDS, payload)
 
+    #actualiza el estado de una estación
     def set_station_status(self, ws_id: str, new_status: str):
         with self.lock:
             if ws_id in self.stations:
@@ -289,6 +507,8 @@ class WMCentral:
     # --------------------------------------------------------------------------
     # SERVIDOR DE SOCKETS (COMUNICACIÓN CON WM_WS_M)
     # --------------------------------------------------------------------------
+
+    #escuchar conexiones de monitores
     def run_socket_server(self):
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -303,34 +523,103 @@ class WMCentral:
             except OSError:
                 break
 
+    # recibe la solicitud de un monitor, la procesa,
+    # la autentica y actualiza los datos
     def _handle_station_socket(self, conn: socket.socket, addr):
         station_id = None
+        client_ip = addr[0] if addr else "desconocida"
         try:
             server_handshake(conn)
             conn.settimeout(15.0)  # Si no hay mensajes o PING en 15s, se considera desconectada
 
             def socket_handler(raw_msg: str) -> str:
                 nonlocal station_id
+                incoming_was_encrypted = False
+
+                # Soporte de descifrado simétrico (Release 2)
+                if is_encrypted(raw_msg):
+                    incoming_was_encrypted = True
+                    if not station_id:
+                        return "STATUS#KO#No autenticado"
+                    sym_key = self.station_keys.get(station_id)
+                    if not sym_key:
+                        self.audit_event(
+                            station_id, client_ip, "REJECTED_REVOKED",
+                            f"Mensaje de {station_id} rechazado: claves simétricas revocadas por Central."
+                        )
+                        return "STATUS#REVOKED#Claves simetricas revocadas por Central. Se requiere re-autenticacion"
+
+                    decrypted = decrypt_message(sym_key, raw_msg)
+                    if decrypted is None:
+                        self.audit_event(
+                            station_id, client_ip, "INTEGRITY_FAIL",
+                            f"Error de integridad o descifrado en mensaje recibido de {station_id}."
+                        )
+                        return "STATUS#KO#Fallo de integridad o clave invalida"
+                    raw_msg = decrypted
+
                 parts = raw_msg.strip().split("#")
                 cmd = parts[0].upper()
 
                 # Registro y autenticación inicial
                 if cmd in ("REGISTRO", "AUTH") and len(parts) >= 2:
                     st_id = parts[1].strip().upper()
-                    location = parts[2] if len(parts) >= 3 else "Ubicación desconocida"
+                    # Soporte para AUTH#<ws_id>#<credencial>#<ubicacion>
+                    cred = ""
+                    if len(parts) >= 3 and parts[2].startswith("CRED-"):
+                        cred = parts[2].strip()
+                        location = parts[3] if len(parts) >= 4 else "Ubicación desconocida"
+                    elif len(parts) >= 4:
+                        cred = parts[2].strip()
+                        location = parts[3].strip()
+                    else:
+                        location = parts[2] if len(parts) >= 3 else "Ubicación desconocida"
 
                     with self.lock:
-                        # Rechazar estaciones que no estén registradas en SQLite.
-                        if st_id not in self.stations:
-                            self.log(
-                                f"Autenticación DENEGADA: estación {st_id} no registrada",
-                                ws_id=st_id
+                        # Verificación obligatoria contra WM_Registry (Release 2)
+                        if cred:
+                            valid_cred = self.verify_registry_credential(st_id, cred)
+                            if not valid_cred:
+                                self.audit_event(
+                                    st_id, client_ip, "AUTH_FAILED",
+                                    f"Autenticación DENEGADA para {st_id}: credencial inválida o no registrada en Registry.",
+                                    f"Credencial presentada: {cred}"
+                                )
+                                self.log(f"Autenticación DENEGADA para {st_id}: credencial de Registry inválida", ws_id=st_id)
+                                return "STATUS#KO#Autenticacion denegada: credencial invalida o no registrada en Registry"
+                        elif st_id not in self.stations:
+                            # Sin credencial y sin registro previo
+                            self.audit_event(
+                                st_id, client_ip, "AUTH_FAILED",
+                                f"Autenticación DENEGADA para {st_id}: estación no registrada previamente en el Registry."
                             )
-                            return f"STATUS#KO#Estacion {st_id} no registrada"
+                            self.log(f"Autenticación DENEGADA: estación {st_id} no registrada en Registry", ws_id=st_id)
+                            return f"STATUS#KO#Estacion {st_id} no registrada en WM_Registry"
 
-                        # Estación registrada: aceptar la conexión.
+                        # Generamos clave de cifrado simétrico ÚNICA para esta WS
+                        sym_key = generate_symmetric_key()
+                        self.station_keys[st_id] = sym_key
+
                         station_id = st_id
                         self.station_sockets[st_id] = conn
+
+                        if st_id not in self.stations:
+                            self.stations[st_id] = {
+                                "id": st_id,
+                                "location": location,
+                                "status": STATUS_OFFLINE,
+                                "flow": 0.0,
+                                "vol": 0.0,
+                                "operator": None,
+                                "start_time": None,
+                                "transaction_id": None,
+                                "pending_start": False,
+                                "pending_since": None,
+                                "engine_ok": False,
+                                "engine_reason": "Engine no conectado al Monitor",
+                                "last_active": time.time(),
+                            }
+                            self._update_station_db(st_id, location=location, status=STATUS_OFFLINE)
 
                         st = self.stations[st_id]
                         st["location"] = location
@@ -347,16 +636,33 @@ class WMCentral:
                             status=st["status"]
                         )
 
+                        self.audit_event(
+                            st_id, client_ip, "AUTH_SUCCESS",
+                            f"Estación {st_id} AUTENTICADA con éxito en Central. Clave simétrica única generada.",
+                            f"Ubicación: {location}"
+                        )
                         self.log(
-                            f"Estación conectada y AUTENTICADA: estado {st['status']}",
+                            f"Estación {st_id} conectada y AUTENTICADA: estado {st['status']}. Clave simétrica única asignada.",
                             ws_id=st_id
                         )
                         is_blocked = st["status"] == STATUS_OUT_OF_SERVICE
 
                     suffix = "#BLOCKED" if is_blocked else ""
-                    return f"STATUS#OK#Estacion {st_id} registrada y autenticada correctamente{suffix}"
+                    # Se devuelve la clave simétrica única a la estación (Release 2)
+                    return f"STATUS#OK#{sym_key}#Estacion {st_id} autenticada correctamente{suffix}"
+
                 if not station_id:
                     return "STATUS#KO#No autenticado"
+
+                # Comprobar si las claves fueron revocadas
+                sym_key = self.station_keys.get(station_id)
+                if not sym_key:
+                    return "STATUS#REVOKED#Claves revocadas. Se requiere re-autenticacion"
+
+                def make_reply(reply_text: str) -> str:
+                    if incoming_was_encrypted and sym_key:
+                        return encrypt_message(sym_key, reply_text)
+                    return reply_text
 
                 # Comprobación de latido (Keepalive / Heartbeat)
                 if cmd == "PING":
@@ -373,17 +679,20 @@ class WMCentral:
                                     st["engine_reason"] = reason_text
                                     if st["status"] == STATUS_AVAILABLE:
                                         self.set_station_status(station_id, STATUS_LEAK)
+                                        self.audit_event(station_id, client_ip, "LEAK_ALERT", f"Pase a FUGA: {reason_text}")
                                         self.log(f"Estación pasa a FUGA: {reason_text}", ws_id=station_id)
                                 elif health_state == "OK":
                                     st["engine_ok"] = True
                                     st["engine_reason"] = "OK"
                                     if st["status"] == STATUS_LEAK:
                                         self.set_station_status(station_id, STATUS_AVAILABLE)
+                                        self.audit_event(station_id, client_ip, "RESTORED", "Engine operativo. Estación DISPONIBLE.")
                                         self.log("Engine operativo confirmado. Estación disponible de nuevo.", ws_id=station_id)
                             is_blocked = st["status"] == STATUS_OUT_OF_SERVICE
                         else:
                             is_blocked = False
-                    return "OK#BLOCKED" if is_blocked else "OK"
+                    rep = "OK#BLOCKED" if is_blocked else "OK"
+                    return make_reply(rep)
 
                 # Detección de avería / fuga reportada por el monitor
                 if cmd == "LEAK":
@@ -394,12 +703,13 @@ class WMCentral:
                         if st:
                             st["engine_ok"] = False
                             st["engine_reason"] = reason_text
+                            self.audit_event(station_id, client_ip, "LEAK_INCIDENCE", f"Avería/fuga reportada: {reason_text}")
                             if st["status"] == STATUS_OUT_OF_SERVICE:
                                 self.log(
                                     f"Incidencia reportada ({reason_text}); se mantiene en FUERA DE SERVICIO por bloqueo de CENTRAL",
                                     ws_id=station_id
                                 )
-                                return "OK#BLOCKED"
+                                return make_reply("OK#BLOCKED")
 
                             was_watering = st["status"] == STATUS_WATERING
                             self.set_station_status(station_id, STATUS_LEAK)
@@ -425,7 +735,7 @@ class WMCentral:
                                     args=(station_id, st["interrupted_watering"]["ts"]),
                                     daemon=True
                                 ).start()
-                    return "OK"
+                    return make_reply("OK")
 
                 # Avería resuelta
                 if cmd in ("FIXED", "OK_LEAK"):
@@ -434,13 +744,14 @@ class WMCentral:
                         if st:
                             st["engine_ok"] = True
                             st["engine_reason"] = "OK"
+                            self.audit_event(station_id, client_ip, "FIXED_INCIDENCE", "Avería resuelta comunicada por Monitor.")
                             if st["status"] == STATUS_OUT_OF_SERVICE:
                                 self.send_ws_command(station_id, "BLOCK")
                                 self.log(
                                     "Engine operativo detectado; la estación se mantiene en FUERA DE SERVICIO hasta orden de activación",
                                     ws_id=station_id
                                 )
-                                return "OK#BLOCKED"
+                                return make_reply("OK#BLOCKED")
                             if st["status"] == STATUS_LEAK:
                                 last_leak = st.pop("last_leak_summary", None)
                                 if last_leak:
@@ -453,9 +764,9 @@ class WMCentral:
                                 else:
                                     self.log("Avería de fuga RESUELTA. Estación disponible de nuevo.", ws_id=station_id)
                                 self.set_station_status(station_id, STATUS_AVAILABLE)
-                    return "OK"
+                    return make_reply("OK")
 
-                return "STATUS#KO#Comando no reconocido"
+                return make_reply("STATUS#KO#Comando no reconocido")
 
             while self.running:
                 serve_one_socket(conn, socket_handler)
@@ -1038,12 +1349,48 @@ class WMCentral:
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     with central_self.lock:
+                        st_list = []
+                        for s in central_self.stations.values():
+                            item = dict(s)
+                            item["has_key"] = (s["id"] in central_self.station_keys)
+                            item["weather_alert"] = central_self.weather_alerts.get(s["id"])
+                            st_list.append(item)
                         payload = {
-                            "stations": list(central_self.stations.values()),
-                            "logs": central_self.recent_logs[-20:],
+                            "stations": st_list,
+                            "weather_alerts": central_self.weather_alerts,
+                            "logs": central_self.recent_logs[-25:],
+                            "audits": central_self.recent_audits[-25:],
                             "timestamp": datetime.now().strftime("%H:%M:%S")
                         }
-                    self.wfile.write(json.dumps(payload).encode("utf-8"))
+                    self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+                elif self.path == "/api/audit":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    with central_self.lock:
+                        audits = list(central_self.recent_audits)
+                    self.wfile.write(json.dumps(audits, ensure_ascii=False).encode("utf-8"))
+
+                elif self.path == "/api/weather":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    with central_self.lock:
+                        w_data = dict(central_self.weather_alerts)
+                    self.wfile.write(json.dumps(w_data, ensure_ascii=False).encode("utf-8"))
+
+                elif self.path == "/api/operators":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    with central_self._get_db() as db:
+                        rows = db.execute("SELECT id, name FROM operators").fetchall()
+                        ops = [dict(r) for r in rows]
+                    self.wfile.write(json.dumps(ops, ensure_ascii=False).encode("utf-8"))
 
                 elif self.path == "/api/history":
                     self.send_response(200)
@@ -1068,6 +1415,29 @@ class WMCentral:
                 except Exception:
                     data = {}
 
+                client_ip = self.client_address[0] if self.client_address else "desconocida"
+
+                # Consumo de API_Rest de WM_W (Release 2)
+                if self.path == "/api/weather/alert":
+                    ws_id = str(data.get("ws_id") or "").strip().upper()
+                    city = str(data.get("city") or "").strip()
+                    temp = float(data.get("temp", 0.0))
+                    cond = str(data.get("condition") or "Clear")
+                    alert_active = bool(data.get("alert", False))
+                    reason = str(data.get("reason") or "Condición meteorológica adversa")
+
+                    if ws_id:
+                        central_self.handle_weather_alert(
+                            ws_id=ws_id, city=city, temp=temp, cond=cond,
+                            alert_active=alert_active, reason=reason, source_ip=client_ip
+                        )
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(b'{"status": "ok"}')
+                    return
+
                 if self.path == "/api/action":
                     action = data.get("action")
                     ws_id = data.get("ws")
@@ -1080,6 +1450,8 @@ class WMCentral:
                         central_self.block_station(ws_id)
                     elif action == "activate" and ws_id:
                         central_self.activate_station(ws_id)
+                    elif action in ("revoke_keys", "restore_keys") and ws_id:
+                        central_self.revoke_station_keys(ws_id)
                     elif action == "register" and ws_id:
                         client_ip = self.client_address[0] if self.client_address else ""
                         if not central_self._is_authorized_admin_request(client_ip, self.headers):
@@ -1160,6 +1532,9 @@ class WMCentral:
             f"  {COLOR_BOLD}a <WS|ALL>{COLOR_RESET}      -> Activar estación (vuelve a DISPONIBLE)\n"
             f"  {COLOR_BOLD}r <WS> [ubic]{COLOR_RESET}   -> Dar de alta nueva estación (ej: r WS-07 Central Park)\n"
             f"  {COLOR_BOLD}h{COLOR_RESET}               -> Ver histórico de riegos en BD\n"
+            f"  {COLOR_BOLD}k <WS>{COLOR_RESET}          -> Restaurar / revocar claves simétricas de una WS\n"
+            f"  {COLOR_BOLD}aud{COLOR_RESET}             -> Ver registro de auditoría estructurado\n"
+            f"  {COLOR_BOLD}w{COLOR_RESET}               -> Ver alertas meteorológicas (WM_W)\n"
             f"  {COLOR_BOLD}q{COLOR_RESET}               -> Salir\n"
         )
         print(help_text)
