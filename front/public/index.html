@@ -267,16 +267,19 @@
 
     .key-badge {
       font-size: 0.75rem;
-      padding: 2px 6px;
+      padding: 3px 8px;
       border-radius: 4px;
       font-weight: 600;
+      display: inline-block;
     }
-    .key-active { background: #065f46; color: #6ee7b7; }
-    .key-revoked { background: #7f1d1d; color: #fca5a5; }
+    .key-active { background: #065f46; color: #6ee7b7; border: 1px solid #059669; }
+    .key-revoked { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+    .reg-ok { background: #0c4a6e; color: #7dd3fc; border: 1px solid #0284c7; }
+    .reg-pending { background: #334155; color: #cbd5e1; border: 1px solid #475569; }
 
     .audit-action {
       font-weight: 700;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       padding: 2px 6px;
       border-radius: 4px;
       display: inline-block;
@@ -285,6 +288,19 @@
     .act-fail { background: #991b1b; color: #fecaca; }
     .act-revoke { background: #854d0e; color: #fef08a; }
     .act-weather { background: #1e3a8a; color: #93c5fd; }
+
+    .two-col-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .log-time { color: #38bdf8; font-weight: 600; }
+    .log-ws { color: #f59e0b; font-weight: 700; }
+    .log-err { color: #fca5a5; background: rgba(239, 68, 68, 0.12); padding: 2px 6px; border-left: 3px solid #ef4444; border-radius: 3px; }
+    .log-warn { color: #fde047; background: rgba(245, 158, 11, 0.12); padding: 2px 6px; border-left: 3px solid #f59e0b; border-radius: 3px; }
+    .log-weather { color: #93c5fd; background: rgba(59, 130, 246, 0.12); padding: 2px 6px; border-left: 3px solid #3b82f6; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -293,10 +309,11 @@
       <div>
         <h1>💧 Red Water Management — Central Dashboard</h1>
         <div style="color: var(--text-muted); font-size: 0.9rem; margin-top: 4px;">
-          Sistemas Distribuidos | Release 2: Seguridad (HTTPS, Cifrado Simétrico, Auditoría) & API REST
+          Sistemas Distribuidos | Release 2: Seguridad (HTTPS, Cifrado Simétrico, Auditoría) &amp; API REST
         </div>
       </div>
-      <div style="display: flex; gap: 10px; align-items: center;">
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+        <span id="backendTargetBadge" style="font-size: 0.78rem; color: var(--text-muted); background: #1e293b; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--card-border);">API_Central</span>
         <span id="connStatus" class="status-badge">Conectando...</span>
         <span id="clock" style="font-family: monospace; font-size: 1rem; color: var(--color-primary);">--:--:--</span>
       </div>
@@ -321,6 +338,10 @@
         <div id="statBlocked" class="stat-val" style="color: var(--color-orange);">0</div>
       </div>
       <div class="stat-card">
+        <div style="color: var(--text-muted); font-size: 0.85rem;">Operarios (FO)</div>
+        <div id="statOperators" class="stat-val" style="color: #a855f7;">0</div>
+      </div>
+      <div class="stat-card">
         <div style="color: var(--text-muted); font-size: 0.85rem;">Alertas Clima (WM_W)</div>
         <div id="statWeather" class="stat-val" style="color: #f43f5e;">0</div>
       </div>
@@ -337,58 +358,135 @@
           <tr>
             <th>ID</th>
             <th>Ubicación</th>
-            <th>Estado</th>
+            <th>Registro (WM_Registry)</th>
+            <th>Activación / Estado</th>
+            <th>Token / Clave Simétrica</th>
             <th>Caudal</th>
             <th>Vol. Acumulado</th>
             <th>Operario FO</th>
-            <th>Seguridad (Clave Simétrica)</th>
-            <th>Acciones</th>
+            <th>Acciones Central</th>
           </tr>
         </thead>
         <tbody id="stationsTableBody">
-          <tr><td colspan="8" style="text-align: center; color: var(--text-muted);">Cargando estaciones...</td></tr>
+          <tr><td colspan="9" style="text-align: center; color: var(--text-muted);">Cargando estaciones...</td></tr>
         </tbody>
       </table>
     </div>
 
-    <!-- Panel Meteorológico (WM_W - Weather Control Office) -->
+    <!-- Riegos en Curso y Operarios de Campo (FO) -->
+    <div class="two-col-grid">
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>🚿 Riegos en Curso</span>
+          <span id="activeWateringsBadge" style="font-size: 0.82rem; color: var(--color-green);">0 activos</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Estación WS</th>
+              <th>Ubicación</th>
+              <th>Operario FO</th>
+              <th>Caudal Actual</th>
+              <th>Volumen</th>
+              <th>Inicio / Estado</th>
+            </tr>
+          </thead>
+          <tbody id="activeWateringsBody">
+            <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No hay riegos en curso en este momento</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>👷 Operarios de Campo (Field Operators - WM_FO)</span>
+          <span style="font-size: 0.82rem; color: var(--text-muted);">Autorizados en Central</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID Operario</th>
+              <th>Nombre</th>
+              <th>Estado Actual</th>
+              <th>Estación Asignada</th>
+            </tr>
+          </thead>
+          <tbody id="operatorsTableBody">
+            <tr><td colspan="4" style="text-align: center; color: var(--text-muted);">Cargando operarios...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Panel Meteorológico (WM_W - Weather Control Office) y Mensajes de WM_W -->
     <div class="card">
       <div class="section-title">
         <span>🌤️ Oficina Meteorológica (WM_W — OpenWeather Integration)</span>
         <span style="font-size: 0.85rem; color: var(--text-muted);">Sondeo cada 4s (Alerta si temp &lt; 0ºC o lluvia)</span>
       </div>
-      <div id="weatherGrid" class="weather-grid">
+      <div id="weatherGrid" class="weather-grid" style="margin-bottom: 16px;">
         <div style="color: var(--text-muted);">Consultando datos meteorológicos...</div>
       </div>
-    </div>
-
-    <!-- Registro de Auditoría de Seguridad -->
-    <div class="card">
-      <div class="section-title">
-        <span>🛡️ Registro Estructurado de Auditoría de Seguridad (Audit Log)</span>
-        <span style="font-size: 0.85rem; color: var(--text-muted);">Eventos de autenticación, revocación y cambios de estado</span>
+      <div style="border-top: 1px solid var(--card-border); padding-top: 12px;">
+        <div style="font-size: 0.9rem; font-weight: 600; margin-bottom: 8px; color: #93c5fd;">
+          📨 Alertas y Mensajes recibidos de WM_W (vía API_Central)
+        </div>
+        <div id="weatherMessagesBox" class="log-box" style="max-height: 140px;">
+          <div class="log-line" style="color: var(--text-muted);">Sin alertas ni notificaciones meteorológicas recientes.</div>
+        </div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Fecha / Hora</th>
-            <th>Origen (IP)</th>
-            <th>Entidad</th>
-            <th>Acción</th>
-            <th>Descripción del Evento</th>
-          </tr>
-        </thead>
-        <tbody id="auditTableBody">
-          <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Sin eventos de auditoría</td></tr>
-        </tbody>
-      </table>
     </div>
 
-    <!-- Histórico de Riegos en BD SQLite y Logs en Vivo -->
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; flex-wrap: wrap;">
+    <!-- Errores / Avisos Relevantes de la Central y Logs Operacionales en Vivo -->
+    <div class="two-col-grid">
       <div class="card" style="margin-bottom: 0;">
         <div class="section-title">
-          <span>📜 Histórico de Transacciones en BD</span>
+          <span>⚠️ Errores y Avisos Relevantes de la Central</span>
+          <span id="alertsCountBadge" style="font-size: 0.82rem; color: var(--color-red);">0 incidencias</span>
+        </div>
+        <div id="errorsBox" class="log-box" style="max-height: 220px;">
+          <div class="log-line" style="color: var(--text-muted);">Sin errores ni avisos críticos activos.</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>📡 Logs Operacionales de la Central en Vivo</span>
+          <span style="font-size: 0.82rem; color: var(--text-muted);">Tiempo real</span>
+        </div>
+        <div id="logBox" class="log-box" style="max-height: 220px;">
+          <div class="log-line">Esperando eventos de Central...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Registro de Auditoría de Seguridad e Histórico de Riegos en BD SQLite -->
+    <div class="two-col-grid" style="margin-top: 24px;">
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>🛡️ Registro Estructurado de Auditoría (Audit Log)</span>
+          <span style="font-size: 0.82rem; color: var(--text-muted);">Autenticación, tokens, clima y estado</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Fecha / Hora</th>
+              <th>Origen (IP)</th>
+              <th>Entidad</th>
+              <th>Acción</th>
+              <th>Descripción del Evento</th>
+            </tr>
+          </thead>
+          <tbody id="auditTableBody">
+            <tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Sin eventos de auditoría</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-bottom: 0;">
+        <div class="section-title">
+          <span>📜 Histórico de Transacciones de Riego en BD</span>
+          <span style="font-size: 0.82rem; color: var(--text-muted);">SQLite watering_history</span>
         </div>
         <table>
           <thead>
@@ -406,20 +504,27 @@
           </tbody>
         </table>
       </div>
-
-      <div class="card" style="margin-bottom: 0;">
-        <div class="section-title">
-          <span>📡 Logs Operacionales en Vivo</span>
-        </div>
-        <div id="logBox" class="log-box">
-          <div class="log-line">Esperando eventos de Central...</div>
-        </div>
-      </div>
     </div>
   </div>
 
   <script>
     const API_BASE = window.API_CENTRAL_URL || "";
+    if (window.CENTRAL_BACKEND_TARGET) {
+      const badgeEl = document.getElementById('backendTargetBadge');
+      if (badgeEl) badgeEl.innerText = `API_Central: ${window.CENTRAL_BACKEND_TARGET}`;
+    }
+
+    // Memoria en cliente del último estado meteorológico conocido por estación
+    const lastKnownWeather = {};
+    let cachedOperators = [];
+
+    function escapeHtml(str) {
+      return String(str == null ? "" : str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
 
     function updateClock() {
       const now = new Date();
@@ -443,17 +548,110 @@
           return;
         }
       }
+      let payload = { action: action, ws: wsId };
+      if (action === "start") {
+        const durInput = prompt(`Duración del riego en segundos para ${wsId}:`, "10");
+        if (durInput === null) return;
+        const dur = parseInt(durInput, 10);
+        payload.duration = (!isNaN(dur) && dur > 0) ? dur : 10;
+        payload.op = "CENTRAL";
+      }
       try {
         const resp = await fetch(`${API_BASE}/api/action`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: action, ws: wsId })
+          body: JSON.stringify(payload)
         });
         if (resp.ok) {
           fetchStatus();
+          fetchHistory();
         }
       } catch (err) {
         alert("Error al enviar acción: " + err);
+      }
+    }
+
+    async function fetchOperators() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/operators`);
+        if (!resp.ok) return;
+        const ops = await resp.json();
+        if (Array.isArray(ops)) {
+          cachedOperators = ops;
+          document.getElementById('statOperators').innerText = ops.length;
+        }
+      } catch (err) {}
+    }
+
+    function renderOperatorsAndWaterings(stations) {
+      // 1. Riegos en curso
+      const activeStations = stations.filter(s => s.status === "REGANDO" || s.pending_start);
+      const wateringBadge = document.getElementById('activeWateringsBadge');
+      wateringBadge.innerText = `${activeStations.length} activo${activeStations.length === 1 ? '' : 's'}`;
+
+      const wateringBody = document.getElementById('activeWateringsBody');
+      if (activeStations.length === 0) {
+        wateringBody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No hay riegos en curso en este momento</td></tr>`;
+      } else {
+        wateringBody.innerHTML = activeStations.map(s => {
+          const startTime = s.start_time ? (s.start_time.split('T')[1] || s.start_time).slice(0, 8) : 'Iniciando...';
+          const stLabel = s.status === "REGANDO"
+            ? `<span class="st-regando">REGANDO (${escapeHtml(startTime)})</span>`
+            : `<span class="key-badge reg-ok">⏳ Pendiente confirmación Engine</span>`;
+          return `
+            <tr>
+              <td><strong>${escapeHtml(s.id)}</strong></td>
+              <td>${escapeHtml(s.location)}</td>
+              <td><strong>${escapeHtml(s.operator || 'CENTRAL')}</strong></td>
+              <td>${Number(s.flow || 0).toFixed(1)} L/min</td>
+              <td>${Number(s.vol || 0).toFixed(1)} L</td>
+              <td>${stLabel}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // 2. Operarios FO
+      const opBody = document.getElementById('operatorsTableBody');
+      const activeByOp = {};
+      stations.forEach(s => {
+        if (s.operator && (s.status === "REGANDO" || s.pending_start)) {
+          if (!activeByOp[s.operator]) activeByOp[s.operator] = [];
+          activeByOp[s.operator].push(s);
+        }
+      });
+
+      // Combinar operarios de BD con cualquier operario activo en estaciones
+      const allOps = [...cachedOperators];
+      Object.keys(activeByOp).forEach(opId => {
+        if (!allOps.some(o => o.id === opId)) {
+          allOps.push({ id: opId, name: opId === "CENTRAL" ? "Operador Consola Central" : `Operario ${opId}` });
+        }
+      });
+
+      document.getElementById('statOperators').innerText = cachedOperators.length || allOps.length;
+
+      if (allOps.length === 0) {
+        opBody.innerHTML = `<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">Sin operarios cargados</td></tr>`;
+      } else {
+        opBody.innerHTML = allOps.map(op => {
+          const assigned = activeByOp[op.id] || [];
+          const isWorking = assigned.length > 0;
+          const statusHtml = isWorking
+            ? `<span class="st-regando" style="font-size: 0.78rem; padding: 2px 8px;">🚿 REGANDO</span>`
+            : `<span class="key-badge key-active">✓ Disponible / En espera</span>`;
+          const wsListHtml = isWorking
+            ? assigned.map(s => `<strong>${escapeHtml(s.id)}</strong> (${Number(s.vol || 0).toFixed(1)} L)`).join(', ')
+            : `<span style="color: var(--text-muted);">—</span>`;
+          return `
+            <tr>
+              <td><strong>${escapeHtml(op.id)}</strong></td>
+              <td>${escapeHtml(op.name)}</td>
+              <td>${statusHtml}</td>
+              <td>${wsListHtml}</td>
+            </tr>
+          `;
+        }).join('');
       }
     }
 
@@ -468,8 +666,30 @@
 
         const stations = data.stations || [];
         const weatherAlerts = data.weather_alerts || {};
+        const weatherStatus = data.weather_status || {};
         const logs = data.logs || [];
         const audits = data.audits || [];
+
+        // Actualizar memoria de clima conocido a partir de weather_status, alertas activas y auditoría de WM_W
+        Object.keys(weatherStatus).forEach(wsId => {
+          lastKnownWeather[wsId] = { ...weatherStatus[wsId] };
+        });
+        audits.forEach(a => {
+          if (a.action === "WEATHER_ALERT" || a.action === "WEATHER_NORMAL") {
+            const m = (a.description || "").match(/en\s+([^()]+)\s*\(([-\d.]+)ºC,\s*([^)]+)\)/i);
+            if (m && a.entity && !lastKnownWeather[a.entity]) {
+              lastKnownWeather[a.entity] = {
+                city: m[1].trim(),
+                temp: parseFloat(m[2]),
+                condition: m[3].trim(),
+                timestamp: a.timestamp
+              };
+            }
+          }
+        });
+        Object.keys(weatherAlerts).forEach(wsId => {
+          lastKnownWeather[wsId] = { ...weatherAlerts[wsId] };
+        });
 
         // Estadísticas
         document.getElementById('statTotal').innerText = stations.length;
@@ -478,37 +698,67 @@
         document.getElementById('statBlocked').innerText = stations.filter(s => s.status === "FUERA DE SERVICIO").length;
         document.getElementById('statWeather').innerText = Object.keys(weatherAlerts).length;
 
-        // Tabla de estaciones
+        // Renderizar Riegos en Curso y Operarios FO
+        renderOperatorsAndWaterings(stations);
+
+        // Tabla de estaciones (WS: registro, activación/estado, token/clave)
         const tbody = document.getElementById('stationsTableBody');
         if (stations.length === 0) {
-          tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: var(--text-muted);">No hay estaciones registradas</td></tr>`;
+          tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--text-muted);">No hay estaciones registradas</td></tr>`;
         } else {
           tbody.innerHTML = stations.map(s => {
-            const hasKey = s.has_key;
+            const hasKey = Boolean(s.has_key);
+            const isConnected = s.status !== "DESCONECTADA";
+            const wasRevoked = audits.some(a => a.entity === s.id && a.action === "KEY_REVOCATION") && !hasKey;
+
+            // 1. Estado de Registro
+            const regBadge = (hasKey || isConnected)
+              ? `<span class="key-badge reg-ok">✓ Registrada y Autenticada</span>`
+              : `<span class="key-badge reg-pending">Registrada en BD (Sin Auth activa)</span>`;
+
+            // 2. Estado de Activación y salud del Engine
+            const engineDetail = (s.status === "FUGA" && s.engine_reason)
+              ? `<div style="font-size: 0.75rem; color: #fca5a5; margin-top: 4px;">⚠️ ${escapeHtml(s.engine_reason)}</div>`
+              : (s.status === "FUERA DE SERVICIO"
+                  ? `<div style="font-size: 0.75rem; color: #fdba74; margin-top: 4px;">🔒 Desactivada / Bloqueada</div>`
+                  : (s.engine_ok
+                      ? `<div style="font-size: 0.75rem; color: #86efac; margin-top: 4px;">✓ Activa (Monitor + Engine OK)</div>`
+                      : ''));
+
+            // 3. Estado de Token / Clave Simétrica
             const keyBadge = hasKey
-              ? `<span class="key-badge key-active">🔑 Clave Activa (AES)</span>`
-              : `<span class="key-badge key-revoked">🚫 Sin Clave / Revocada</span>`;
+              ? `<span class="key-badge key-active">🔑 Token / Clave Activa (AES)</span>`
+              : (wasRevoked
+                  ? `<span class="key-badge key-revoked">🚫 Token / Clave Revocada</span>`
+                  : `<span class="key-badge key-revoked">⚪ Sin Token / Pendiente Auth</span>`);
 
             const alertBadge = s.weather_alert
-              ? `<div class="alert-pill">❄️ Alerta Clima: ${s.weather_alert.reason}</div>`
+              ? `<div class="alert-pill">❄️ Alerta Clima: ${escapeHtml(s.weather_alert.reason)}</div>`
               : '';
 
             return `
               <tr>
-                <td><strong>${s.id}</strong></td>
-                <td>${s.location} ${alertBadge}</td>
-                <td><span class="${getStatusClass(s.status)}">${s.status}</span></td>
-                <td>${s.flow.toFixed(1)} L/min</td>
-                <td>${s.vol.toFixed(1)} L</td>
-                <td>${s.operator || '—'}</td>
-                <td>${keyBadge}</td>
+                <td><strong>${escapeHtml(s.id)}</strong></td>
+                <td>${escapeHtml(s.location)} ${alertBadge}</td>
+                <td>${regBadge}</td>
                 <td>
-                  <button class="btn btn-warning" onclick="sendAction('revoke_keys', '${s.id}')" title="Revocar claves simétricas ante supuesta vulnerabilidad">
+                  <span class="${getStatusClass(s.status)}">${escapeHtml(s.status)}</span>
+                  ${engineDetail}
+                </td>
+                <td>${keyBadge}</td>
+                <td>${Number(s.flow || 0).toFixed(1)} L/min</td>
+                <td>${Number(s.vol || 0).toFixed(1)} L</td>
+                <td>${escapeHtml(s.operator || '—')}</td>
+                <td style="white-space: nowrap;">
+                  ${s.status === 'DISPONIBLE'
+                    ? `<button class="btn btn-primary" onclick="sendAction('start', '${escapeHtml(s.id)}')" title="Iniciar riego en ${escapeHtml(s.id)}">▶ Regar</button>`
+                    : ''}
+                  <button class="btn btn-warning" onclick="sendAction('revoke_keys', '${escapeHtml(s.id)}')" title="Revocar claves simétricas ante supuesta vulnerabilidad">
                     🔑 Restaurar Claves
                   </button>
                   ${s.status === 'FUERA DE SERVICIO'
-                    ? `<button class="btn btn-success" onclick="sendAction('activate', '${s.id}')">Activar</button>`
-                    : `<button class="btn btn-danger" onclick="sendAction('block', '${s.id}')">Bloquear</button>`}
+                    ? `<button class="btn btn-success" onclick="sendAction('activate', '${escapeHtml(s.id)}')">Activar</button>`
+                    : `<button class="btn btn-danger" onclick="sendAction('block', '${escapeHtml(s.id)}')">Bloquear</button>`}
                 </td>
               </tr>
             `;
@@ -522,20 +772,86 @@
         } else {
           weatherGrid.innerHTML = stations.map(s => {
             const wInfo = weatherAlerts[s.id];
+            const known = wInfo || lastKnownWeather[s.id];
             const hasAlert = !!wInfo;
-            const tempStr = wInfo ? `${wInfo.temp.toFixed(1)} ºC` : 'Consultando...';
-            const condStr = wInfo ? wInfo.condition : 'Normal';
-            const cityStr = wInfo ? wInfo.city : s.location;
+            const tempStr = (known && typeof known.temp === 'number' && !isNaN(known.temp))
+              ? `${known.temp.toFixed(1)} ºC`
+              : 'Clima OK (≥ 0ºC)';
+            const condStr = known && known.condition ? known.condition : 'Sin precipitaciones';
+            const cityStr = known && known.city ? known.city : s.location;
 
             return `
               <div class="weather-card ${hasAlert ? 'has-alert' : ''}">
-                <div style="font-weight: 700; color: var(--color-primary);">${s.id} — ${cityStr}</div>
-                <div style="font-size: 1.5rem; font-weight: 700; margin: 4px 0;">${tempStr}</div>
-                <div style="color: var(--text-muted); font-size: 0.85rem;">Condición: ${condStr}</div>
-                ${hasAlert ? `<div class="alert-pill">⚠️ ALERTA: ${wInfo.reason}</div>` : `<div style="color: var(--color-green); font-size: 0.8rem; margin-top: 6px;">✓ Clima favorable para riego</div>`}
+                <div style="font-weight: 700; color: var(--color-primary);">${escapeHtml(s.id)} — ${escapeHtml(cityStr)}</div>
+                <div style="font-size: 1.4rem; font-weight: 700; margin: 4px 0;">${escapeHtml(tempStr)}</div>
+                <div style="color: var(--text-muted); font-size: 0.85rem;">Condición: ${escapeHtml(condStr)}</div>
+                ${hasAlert
+                  ? `<div class="alert-pill">⚠️ ALERTA WM_W: ${escapeHtml(wInfo.reason)}</div>`
+                  : `<div style="color: var(--color-green); font-size: 0.8rem; margin-top: 6px;">✓ Clima favorable para riego</div>`}
               </div>
             `;
           }).join('');
+        }
+
+        // Mensajes y Alertas de WM_W
+        const weatherMsgBox = document.getElementById('weatherMessagesBox');
+        const wmAudits = audits.filter(a => a.action === "WEATHER_ALERT" || a.action === "WEATHER_NORMAL");
+        const wmLogs = logs.filter(l => {
+          const text = (l.message || l.msg || "").toUpperCase();
+          return text.includes("METEOROLÓGICA") || text.includes("CLIMA") || text.includes("WM_W");
+        });
+
+        if (wmAudits.length === 0 && wmLogs.length === 0 && Object.keys(weatherAlerts).length === 0) {
+          weatherMsgBox.innerHTML = `<div class="log-line" style="color: var(--text-muted);">Sin alertas ni notificaciones de WM_W registradas hasta el momento.</div>`;
+        } else {
+          const items = [];
+          Object.entries(weatherAlerts).forEach(([wsId, w]) => {
+            items.push(`<div class="log-line log-err">🚨 <strong>[ALERTA ACTIVA - ${escapeHtml(wsId)} (${escapeHtml(w.city)})]</strong> ${ Number(w.temp).toFixed(1) }ºC (${escapeHtml(w.condition)}) — ${escapeHtml(w.reason)}</div>`);
+          });
+          wmAudits.slice().reverse().forEach(a => {
+            const cls = a.action === "WEATHER_ALERT" ? "log-err" : "log-weather";
+            items.push(`<div class="log-line ${cls}"><span class="log-time">[${escapeHtml(a.timestamp)}]</span> <span class="log-ws">[${escapeHtml(a.entity)}]</span> <strong>${escapeHtml(a.action)}:</strong> ${escapeHtml(a.description)} (${escapeHtml(a.details || '')})</div>`);
+          });
+          weatherMsgBox.innerHTML = items.join('');
+        }
+
+        // Errores y Avisos Relevantes de la Central
+        const errorsBox = document.getElementById('errorsBox');
+        const errorItems = [];
+
+        // 1. Estados anómalos actuales de estaciones
+        stations.forEach(s => {
+          if (s.status === "FUGA") {
+            errorItems.push(`<div class="log-line log-err">🚨 <strong>[${escapeHtml(s.id)}] ESTADO FUGA:</strong> ${escapeHtml(s.engine_reason || 'Avería o fuga detectada en la estación')}</div>`);
+          } else if (s.status === "FUERA DE SERVICIO") {
+            const why = s.weather_alert
+              ? `Bloqueada por Alerta Climática (${s.weather_alert.reason})`
+              : (!s.has_key ? 'Fuera de servicio (Claves simétricas revocadas / Sin autenticar)' : 'Bloqueada por orden de Central');
+            errorItems.push(`<div class="log-line log-warn">⚠️ <strong>[${escapeHtml(s.id)}] FUERA DE SERVICIO:</strong> ${escapeHtml(why)}</div>`);
+          }
+        });
+
+        // 2. Eventos de error/denegación en logs y auditoría
+        const errKeywords = ["DENEGAD", "FUGA", "AVERÍA", "ERROR", "REVOCAD", "ALERTA", "DESCONECTAD", "RECHAZAD", "FALLO", "BLOQUEAD", "INTERRUMPID"];
+        logs.slice().reverse().forEach(l => {
+          const text = l.message || l.msg || "";
+          const upper = text.toUpperCase();
+          if (errKeywords.some(k => upper.includes(k))) {
+            const isCrit = upper.includes("FUGA") || upper.includes("DENEGAD") || upper.includes("REVOCAD") || upper.includes("ALERTA");
+            errorItems.push(
+              `<div class="log-line ${isCrit ? 'log-err' : 'log-warn'}">` +
+              `<span class="log-time">[${escapeHtml(l.time || '')}]</span> ` +
+              `<span class="log-ws">[${escapeHtml(l.ws || 'CENTRAL')}]</span> ` +
+              `${escapeHtml(text)}</div>`
+            );
+          }
+        });
+
+        document.getElementById('alertsCountBadge').innerText = `${errorItems.length} aviso${errorItems.length === 1 ? '' : 's'}`;
+        if (errorItems.length === 0) {
+          errorsBox.innerHTML = `<div class="log-line" style="color: var(--color-green);">✓ Sin errores ni avisos críticos en la Central.</div>`;
+        } else {
+          errorsBox.innerHTML = errorItems.slice(0, 25).join('');
         }
 
         // Auditoría
@@ -543,28 +859,33 @@
         if (audits.length === 0) {
           auditBody.innerHTML = `<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">Sin eventos de auditoría registrados</td></tr>`;
         } else {
-          auditBody.innerHTML = audits.slice(-10).reverse().map(a => {
+          auditBody.innerHTML = audits.slice(-12).reverse().map(a => {
             let actClass = "act-auth";
-            if (a.action.includes("FAIL") || a.action.includes("ALERT")) actClass = "act-fail";
+            if (a.action.includes("FAIL") || a.action.includes("ALERT") || a.action.includes("LEAK") || a.action.includes("REJECT")) actClass = "act-fail";
             if (a.action.includes("REVOKE")) actClass = "act-revoke";
             if (a.action.includes("WEATHER")) actClass = "act-weather";
 
             return `
               <tr>
-                <td style="font-family: monospace; font-size: 0.85rem;">${a.timestamp}</td>
-                <td>${a.source_ip}</td>
-                <td><strong>${a.entity}</strong></td>
-                <td><span class="audit-action ${actClass}">${a.action}</span></td>
-                <td>${a.description} ${a.details ? `<small style="color: var(--text-muted); display: block;">${a.details}</small>` : ''}</td>
+                <td style="font-family: monospace; font-size: 0.82rem;">${escapeHtml(a.timestamp)}</td>
+                <td>${escapeHtml(a.source_ip)}</td>
+                <td><strong>${escapeHtml(a.entity)}</strong></td>
+                <td><span class="audit-action ${actClass}">${escapeHtml(a.action)}</span></td>
+                <td>${escapeHtml(a.description)} ${a.details ? `<small style="color: var(--text-muted); display: block;">${escapeHtml(a.details)}</small>` : ''}</td>
               </tr>
             `;
           }).join('');
         }
 
-        // Logs
+        // Logs operacionales en vivo (soporta tanto {time, ws, message} de API_Central como {msg})
         const logBox = document.getElementById('logBox');
         if (logs.length > 0) {
-          logBox.innerHTML = logs.map(l => `<div class="log-line">${l.msg}</div>`).join('');
+          logBox.innerHTML = logs.map(l => {
+            const timePart = l.time ? `<span class="log-time">[${escapeHtml(l.time)}]</span> ` : '';
+            const wsPart = l.ws ? `<span class="log-ws">[${escapeHtml(l.ws)}]</span> ` : '';
+            const msgText = escapeHtml(l.message !== undefined ? l.message : (l.msg || ''));
+            return `<div class="log-line">${timePart}${wsPart}${msgText}</div>`;
+          }).join('');
           logBox.scrollTop = logBox.scrollHeight;
         }
 
@@ -583,14 +904,14 @@
         if (!history || history.length === 0) {
           tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Sin historial de riegos</td></tr>`;
         } else {
-          tbody.innerHTML = history.slice(0, 8).map(h => `
+          tbody.innerHTML = history.slice(0, 10).map(h => `
             <tr>
-              <td>#${h.id}</td>
-              <td><strong>${h.ws_id}</strong></td>
-              <td>${h.operator_id}</td>
+              <td>#${escapeHtml(h.id)}</td>
+              <td><strong>${escapeHtml(h.ws_id)}</strong></td>
+              <td>${escapeHtml(h.operator_id)}</td>
               <td>${Number(h.total_vol).toFixed(2)} L</td>
-              <td>${h.duration_sec} s</td>
-              <td>${h.reason}</td>
+              <td>${escapeHtml(h.duration_sec)} s</td>
+              <td>${escapeHtml(h.reason)}</td>
             </tr>
           `).join('');
         }
@@ -598,9 +919,11 @@
     }
 
     // Intervalo de sondeo periódico
+    fetchOperators();
     fetchStatus();
     fetchHistory();
     setInterval(fetchStatus, 1500);
+    setInterval(fetchOperators, 5000);
     setInterval(fetchHistory, 5000);
   </script>
 </body>

@@ -6,6 +6,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const url = require('url');
@@ -27,28 +28,46 @@ const MIME_TYPES = {
 };
 
 function proxyToCentral(req, res, targetPath) {
-  const centralUrl = new URL(CENTRAL_API_URL);
+  let centralUrl;
+  try {
+    centralUrl = new URL(CENTRAL_API_URL);
+  } catch (e) {
+    res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: 'Config Error', message: `CENTRAL_API_URL inválida: ${CENTRAL_API_URL}` }));
+    return;
+  }
+
+  const isHttps = centralUrl.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  const defaultPort = isHttps ? 443 : 80;
+
   const options = {
     hostname: centralUrl.hostname,
-    port: centralUrl.port || 80,
+    port: centralUrl.port || defaultPort,
     path: targetPath,
     method: req.method,
+    rejectUnauthorized: false,
     headers: {
       ...req.headers,
       host: centralUrl.host
     }
   };
 
-  const proxyReq = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, {
+  const proxyReq = transport.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 200, {
       ...proxyRes.headers,
-      'Access-Control-Allow-Origin': '*'
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token'
     });
     proxyRes.pipe(res);
   });
 
   proxyReq.on('error', (err) => {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.writeHead(502, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Access-Control-Allow-Origin': '*'
+    });
     res.end(JSON.stringify({
       error: 'Bad Gateway',
       message: `No se pudo contactar con API_Central en ${CENTRAL_API_URL}: ${err.message}`
@@ -62,16 +81,32 @@ const server = http.createServer((req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const pathname = parsedUrl.pathname;
 
-  // Redirigir peticiones API a Central
+  // Respuesta rápida a preflight CORS
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Admin-Token'
+    });
+    res.end();
+    return;
+  }
+
+  // Redirigir peticiones API a Central a través del proxy integrado
   if (pathname.startsWith('/api/')) {
     proxyToCentral(req, res, req.url);
     return;
   }
 
   // Configuración para el cliente web: /config.js
+  // Usa ruta relativa "" por defecto para enrutar a través del proxy /api/* de este servidor,
+  // evitando errores de CORS y fallos de resolución de host internos en Docker/Cloud.
   if (pathname === '/config.js') {
     res.writeHead(200, { 'Content-Type': 'application/javascript; charset=utf-8' });
-    res.end(`window.API_CENTRAL_URL = "${CENTRAL_API_URL}";\n`);
+    res.end(
+      `window.API_CENTRAL_URL = "";\n` +
+      `window.CENTRAL_BACKEND_TARGET = ${JSON.stringify(CENTRAL_API_URL)};\n`
+    );
     return;
   }
 

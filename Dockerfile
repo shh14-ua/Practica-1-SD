@@ -8,7 +8,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia de ficheros del proyecto respetando la estructura de carpetas
 COPY common.py ./
+COPY wm_crypto.py ./
 COPY WM_Central/ ./WM_Central/
+COPY WM_Registry/ ./WM_Registry/
+COPY WM_W/ ./WM_W/
 COPY WM_WS/ ./WM_WS/
 COPY WM_FO/ ./WM_FO/
 

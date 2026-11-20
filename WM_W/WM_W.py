@@ -248,19 +248,30 @@ class WeatherControlOffice:
                 prev_state = self.weather_state.get(ws_id)
                 self.weather_state[ws_id] = w_info
 
-                # Detectamos cambios de estado de alerta para notificar
+                # Detectamos cambios de estado de alerta o de datos meteorológicos (ciudad, temp, condición)
                 prev_alert = prev_state.get("alert") if prev_state else None
                 current_alert = w_info["alert"]
+                alert_changed = (prev_alert != current_alert)
+                data_changed = (
+                    prev_state is None
+                    or prev_state.get("city") != w_info.get("city")
+                    or prev_state.get("condition") != w_info.get("condition")
+                    or abs(float(prev_state.get("temp", 0.0)) - float(w_info.get("temp", 0.0))) >= 0.1
+                )
 
-                if prev_alert != current_alert:
+                if alert_changed:
                     if current_alert:
                         self.log(f"¡ALERTA CLIMÁTICA DETECTADA! [{ws_id} - {city}]: {w_info['reason']}. Notificando a Central...")
                     else:
                         self.log(f"Clima normalizado [{ws_id} - {city}]: {w_info['temp']}ºC, {w_info['condition']}. Notificando cancelación a Central...")
 
+                if alert_changed or data_changed:
                     success = self.notify_central(w_info)
                     if not success:
-                        self.log(f"Aviso: no se pudo entregar alerta meteorológica a Central ({self.central_api_url})")
+                        # Si falló la entrega, invalidar prev_state para reintentar en el siguiente ciclo
+                        self.weather_state.pop(ws_id, None)
+                        if alert_changed:
+                            self.log(f"Aviso: no se pudo entregar alerta meteorológica a Central ({self.central_api_url})")
 
             # Dormir hasta completar el intervalo de 4 segundos
             elapsed = time.time() - start_time

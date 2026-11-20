@@ -64,8 +64,10 @@ class WMCentral:
         # Auditoría estructurada (Release 2)
         self.recent_audits: List[Dict[str, Any]] = []
 
-        # Alertas meteorológicas (Release 2 - WM_W) {ws_id: alert_info}
+        # Alertas meteorológicas activas (Release 2 - WM_W) {ws_id: alert_info}
         self.weather_alerts: Dict[str, Dict[str, Any]] = {}
+        # Estado meteorológico actual de todas las estaciones (con o sin alerta) {ws_id: weather_info}
+        self.weather_status: Dict[str, Dict[str, Any]] = {}
 
         # Configuración de WM_Registry
         self.registry_db_path = os.getenv("WM_REGISTRY_DB", "registry.db")
@@ -395,37 +397,53 @@ class WMCentral:
                              alert_active: bool, reason: str, source_ip: str = ""):
         """Procesa una notificación meteorológica de WM_W recibida a través de API_Central."""
         clean_id = ws_id.strip().upper()
+        now_str = datetime.now().strftime("%H:%M:%S")
         with self.lock:
+            prev_w = self.weather_status.get(clean_id)
+            was_alert = clean_id in self.weather_alerts
+
+            w_entry = {
+                "city": city,
+                "temp": temp,
+                "condition": cond,
+                "alert": bool(alert_active),
+                "reason": reason,
+                "timestamp": now_str
+            }
+            self.weather_status[clean_id] = w_entry
+
+            if prev_w and prev_w.get("city") != city and city:
+                self.log(f"Ubicación meteorológica de {clean_id} actualizada en WM_W: {city} ({temp:.1f}ºC, {cond})", ws_id=clean_id)
+
             if alert_active:
-                self.weather_alerts[clean_id] = {
-                    "city": city,
-                    "temp": temp,
-                    "condition": cond,
-                    "reason": reason,
-                    "timestamp": datetime.now().strftime("%H:%M:%S")
-                }
-                self.audit_event(
-                    entity=clean_id,
-                    source_ip=source_ip or "WM_W",
-                    action="WEATHER_ALERT",
-                    description=f"Alerta climática en {city} ({temp:.1f}ºC, {cond}): {reason}",
-                    details="Orden de parada enviada. Estación quedará fuera de servicio."
-                )
-                self.log(f"ALERTA METEOROLÓGICA [{clean_id} - {city}]: {reason}. Pasando a Fuera de Servicio.", ws_id=clean_id)
+                prev_alert_entry = self.weather_alerts.get(clean_id)
+                self.weather_alerts[clean_id] = dict(w_entry)
+
+                # Solo auditar y emitir orden de parada al activarse la alerta o si cambió la razón/ciudad
+                if not was_alert or (prev_alert_entry and prev_alert_entry.get("reason") != reason):
+                    self.audit_event(
+                        entity=clean_id,
+                        source_ip=source_ip or "WM_W",
+                        action="WEATHER_ALERT",
+                        description=f"Alerta climática en {city} ({temp:.1f}ºC, {cond}): {reason}",
+                        details="Orden de parada enviada. Estación quedará fuera de servicio."
+                    )
+                    self.log(f"ALERTA METEOROLÓGICA [{clean_id} - {city}]: {reason}. Pasando a Fuera de Servicio.", ws_id=clean_id)
 
                 st = self.stations.get(clean_id)
                 if st:
                     if st["status"] == STATUS_WATERING:
-                        # Si se está realizando un riego, el mismo finalizará con normalidad
-                        # y posteriormente pasará a fuera de servicio.
-                        st["pending_weather_stop"] = True
-                        self.log(f"Riego en curso en {clean_id} finalizará normalmente antes de pasar a Fuera de Servicio.", ws_id=clean_id)
-                        self.send_ws_command(clean_id, "STOP", reason="WEATHER_ALERT")
-                    else:
+                        if not st.get("pending_weather_stop"):
+                            # Si se está realizando un riego, el mismo finalizará con normalidad
+                            # y posteriormente pasará a fuera de servicio.
+                            st["pending_weather_stop"] = True
+                            self.log(f"Riego en curso en {clean_id} finalizará normalmente antes de pasar a Fuera de Servicio.", ws_id=clean_id)
+                            self.send_ws_command(clean_id, "STOP", reason="WEATHER_ALERT")
+                    elif st["status"] != STATUS_OUT_OF_SERVICE:
                         self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
                         self.send_ws_command(clean_id, "BLOCK")
             else:
-                if clean_id in self.weather_alerts:
+                if was_alert:
                     self.weather_alerts.pop(clean_id, None)
                     self.audit_event(
                         entity=clean_id,
@@ -436,9 +454,11 @@ class WMCentral:
                     )
                     self.log(f"Clima favorable restaurado para {clean_id} ({city}). Estación restaurada.", ws_id=clean_id)
                     st = self.stations.get(clean_id)
-                    if st and st["status"] == STATUS_OUT_OF_SERVICE:
-                        self.set_station_status(clean_id, STATUS_AVAILABLE)
-                        self.send_ws_command(clean_id, "ACTIVATE")
+                    if st:
+                        st.pop("pending_weather_stop", None)
+                        if st["status"] == STATUS_OUT_OF_SERVICE:
+                            self.set_station_status(clean_id, STATUS_AVAILABLE)
+                            self.send_ws_command(clean_id, "ACTIVATE")
 
     # --------------------------------------------------------------------------
     # LOGGING Y NOTIFICACIONES
@@ -1068,12 +1088,13 @@ class WMCentral:
 
                 st["operator"] = None
                 st["flow"] = 0.0
+                pending_weather_stop = bool(st.pop("pending_weather_stop", False)) or (ws_id in self.weather_alerts)
                 if st["status"] == STATUS_WATERING:
                     if reason == "LEAK":
                         self.set_station_status(ws_id, STATUS_LEAK)
                     elif reason == "MONITOR_DOWN":
                         self.set_station_status(ws_id, STATUS_OFFLINE)
-                    elif reason == "CENTRAL_BLOCK":
+                    elif reason in ("CENTRAL_BLOCK", "WEATHER_ALERT") or pending_weather_stop:
                         self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                     else:
                         self.set_station_status(ws_id, STATUS_AVAILABLE)
@@ -1354,10 +1375,12 @@ class WMCentral:
                             item = dict(s)
                             item["has_key"] = (s["id"] in central_self.station_keys)
                             item["weather_alert"] = central_self.weather_alerts.get(s["id"])
+                            item["weather_info"] = central_self.weather_status.get(s["id"])
                             st_list.append(item)
                         payload = {
                             "stations": st_list,
                             "weather_alerts": central_self.weather_alerts,
+                            "weather_status": central_self.weather_status,
                             "logs": central_self.recent_logs[-25:],
                             "audits": central_self.recent_audits[-25:],
                             "timestamp": datetime.now().strftime("%H:%M:%S")
@@ -1379,7 +1402,11 @@ class WMCentral:
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
                     with central_self.lock:
-                        w_data = dict(central_self.weather_alerts)
+                        w_data = {
+                            "weather_status": dict(central_self.weather_status),
+                            "weather_alerts": dict(central_self.weather_alerts),
+                            **central_self.weather_status
+                        }
                     self.wfile.write(json.dumps(w_data, ensure_ascii=False).encode("utf-8"))
 
                 elif self.path == "/api/operators":
@@ -1572,6 +1599,41 @@ class WMCentral:
                         print(f" ID:{r['id']} | WS:{r['ws_id']} | Op:{r['operator_id']} | "
                               f"{r['total_vol']:.2f}L en {r['duration_sec']}s ({r['reason']})")
                     print()
+            elif cmd == "k" and len(parts) >= 2:
+                ws_id = parts[1].upper()
+                if not self.revoke_station_keys(ws_id):
+                    print(f"[ERROR] No se encontró la estación '{ws_id}' para restaurar/revocar sus claves.")
+            elif cmd == "aud":
+                with self._get_db() as db:
+                    rows = db.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 15").fetchall()
+                print(f"\n{COLOR_BOLD}REGISTRO ESTRUCTURADO DE AUDITORÍA (ÚLTIMOS EVENTOS):{COLOR_RESET}")
+                if not rows:
+                    print("  (Sin eventos de auditoría registrados)")
+                else:
+                    for r in rows:
+                        det = f" | {r['details']}" if r["details"] else ""
+                        print(f" [{r['timestamp']}] [{r['entity']}@{r['source_ip']}] [{r['action']}] {r['description']}{det}")
+                print()
+            elif cmd == "w":
+                with self.lock:
+                    w_status = dict(self.weather_status)
+                    w_alerts = dict(self.weather_alerts)
+                    all_ids = sorted(set(self.stations.keys()) | set(w_status.keys()))
+                print(f"\n{COLOR_BOLD}ESTADO METEOROLÓGICO Y ALERTAS (WM_W):{COLOR_RESET}")
+                if not all_ids:
+                    print("  (Sin estaciones registradas)")
+                else:
+                    for wid in all_ids:
+                        info = w_status.get(wid) or w_alerts.get(wid)
+                        if info:
+                            badge = "[ALERTA ACTIVA]" if (wid in w_alerts or info.get("alert")) else "[CLIMA FAVORABLE]"
+                            print(f"  • {wid:<7} | Ciudad: {info.get('city', '—'):<14} | "
+                                  f"Temp: {float(info.get('temp', 0.0)):>5.1f}ºC | Cond: {info.get('condition', '—'):<10} | "
+                                  f"{badge} ({info.get('reason', '')})")
+                        else:
+                            loc = self.stations.get(wid, {}).get("location", "—")
+                            print(f"  • {wid:<7} | Ubicación: {loc:<14} | Sin datos recibidos aún de WM_W")
+                print()
             elif cmd == "q":
                 self.running = False
                 break

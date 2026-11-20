@@ -295,21 +295,101 @@ class WMRegistry:
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] [WM_REGISTRY] {msg}", flush=True)
 
+    def _ensure_tls_certificates(self):
+        """Garantiza que existan un certificado X.509 y su clave privada RSA correspondiente.
+        Si la clave privada no existe (p. ej. ignorada en Git por seguridad) o no coincide con el
+        certificado, genera automáticamente un par autofirmado local con permisos restrictivos."""
+        cert_dir = os.path.dirname(os.path.abspath(self.cert_file))
+        os.makedirs(cert_dir, exist_ok=True)
+
+        need_gen = not (os.path.isfile(self.cert_file) and os.path.isfile(self.key_file))
+        if not need_gen:
+            try:
+                test_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                test_ctx.load_cert_chain(self.cert_file, self.key_file)
+            except Exception:
+                need_gen = True
+
+        if not need_gen:
+            return
+
+        self.log("Generando par de claves RSA-2048 y certificado X.509 autofirmado para HTTPS...")
+        try:
+            from datetime import timezone, timedelta
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            import ipaddress
+
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "ES"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "WaterManagement SD"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "WM_Registry"),
+            ])
+            now_utc = datetime.now(timezone.utc)
+            cert = (
+                x509.CertificateBuilder()
+                .subject_name(subject)
+                .issuer_name(issuer)
+                .public_key(private_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now_utc - timedelta(days=1))
+                .not_valid_after(now_utc + timedelta(days=3650))
+                .add_extension(
+                    x509.SubjectAlternativeName([
+                        x509.DNSName("localhost"),
+                        x509.DNSName("registry"),
+                        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                    ]),
+                    critical=False,
+                )
+                .sign(private_key, hashes.SHA256())
+            )
+
+            key_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            cert_bytes = cert.public_bytes(serialization.Encoding.PEM)
+
+            with open(self.key_file, "wb") as kf:
+                kf.write(key_bytes)
+            try:
+                os.chmod(self.key_file, 0o600)
+            except Exception:
+                pass
+
+            with open(self.cert_file, "wb") as cf:
+                cf.write(cert_bytes)
+
+            self.log(f"Certificado TLS y clave privada generados correctamente en {cert_dir}")
+        except Exception as gen_err:
+            raise RuntimeError(
+                f"No se pudieron generar los certificados TLS para WM_Registry: {gen_err}"
+            ) from gen_err
+
     def run_server(self):
+        self._ensure_tls_certificates()
+
         server_address = ("0.0.0.0", self.port)
         httpd = http.server.ThreadingHTTPServer(server_address, RegistryRequestHandler)
 
-        # Envolvemos el socket con TLS/HTTPS
+        # Envolvemos el socket con TLS/HTTPS obligatorio (sin fallback a HTTP sin cifrar)
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         try:
             ssl_ctx.load_cert_chain(self.cert_file, self.key_file)
             httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
-            proto = "HTTPS"
         except Exception as e:
-            self.log(f"AVISO: No se pudo iniciar en HTTPS ({e}). Iniciando en HTTP estándar...")
-            proto = "HTTP"
+            httpd.server_close()
+            raise RuntimeError(
+                f"ERROR CRÍTICO DE SEGURIDAD: No se pudo iniciar WM_Registry en HTTPS ({e}). "
+                f"Se aborta el inicio para evitar comunicación HTTP sin cifrar."
+            ) from e
 
-        self.log(f"Servidor de Registro iniciado en {proto}://0.0.0.0:{self.port}/")
+        self.log(f"Servidor de Registro iniciado en HTTPS://0.0.0.0:{self.port}/")
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

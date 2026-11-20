@@ -399,7 +399,9 @@ class WSEngine:
         started_ev = getattr(self, "started_event", None)
 
         # Cerrar el riego antes de cualquier espera de Kafka.
-        self.state = "BLOCKED" if reason == "CENTRAL_BLOCK" else "AVAILABLE"
+        was_weather_block = bool(getattr(self, "pending_weather_block", False))
+        self.pending_weather_block = False
+        self.state = "BLOCKED" if (reason in ("CENTRAL_BLOCK", "WEATHER_ALERT") or was_weather_block) else "AVAILABLE"
         self.current_op = None
         self.current_tx_id = None
         self.timer_event.set()
@@ -482,19 +484,29 @@ class WSEngine:
                         reason = data.get("reason", "CENTRAL_STOP")
                         if reason == "WEATHER_ALERT":
                             self.log("Aviso de alerta meteorológica: el riego finalizará con normalidad y la estación quedará fuera de servicio.")
-                            # Finaliza el riego y bloquea la estación al terminar
-                            self.finish_watering("WEATHER_ALERT")
+                            # Si está regando con duración programada, dejamos que concluya normalmente
+                            # y marcamos pending_weather_block para pasar a BLOCKED al terminar.
                             with self.lock:
-                                self.state = "BLOCKED"
+                                if self.state == "WATERING" and self.duration_limit > 0:
+                                    self.pending_weather_block = True
+                                else:
+                                    self.pending_weather_block = False
+                            if not getattr(self, "pending_weather_block", False):
+                                self.finish_watering("WEATHER_ALERT")
+                                with self.lock:
+                                    self.state = "BLOCKED"
                         else:
                             self.finish_watering(reason)
 
                     elif cmd == "BLOCK":
+                        with self.lock:
+                            self.pending_weather_block = False
                         self.finish_watering("CENTRAL_BLOCK")
                         self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
 
                     elif cmd == "ACTIVATE":
                         with self.lock:
+                            self.pending_weather_block = False
                             if self.state == "BLOCKED":
                                 self.state = "AVAILABLE"
                                 self.log("Estación REACTIVADA por CENTRAL: lista para prestar servicio")

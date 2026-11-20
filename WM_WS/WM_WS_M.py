@@ -245,6 +245,10 @@ class WSMonitor:
     # --------------------------------------------------------------------------
     # 4. BUCLE PRINCIPAL DE MONITORIZACIÓN
     # --------------------------------------------------------------------------
+    def run(self):
+        """Alias de compatibilidad con pruebas de la Release 1."""
+        return self.run_monitoring_loop()
+
     def run_monitoring_loop(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
