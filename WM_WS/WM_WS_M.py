@@ -21,6 +21,7 @@ import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from typing import Optional
 
@@ -36,19 +37,38 @@ from wm_crypto import (
     encrypt_message, decrypt_message, is_encrypted
 )
 
+DEFAULT_REGISTRY_CA = os.getenv(
+    "WM_REGISTRY_CA", os.path.join(ROOT_DIR, "WM_Registry", "certs", "registry_cert.pem")
+)
+DEFAULT_CRED_DIR = os.getenv("WM_WS_CRED_DIR", os.path.join(ROOT_DIR, "WM_WS", ".credentials"))
+
+
+def mask_secret(value: Optional[str]) -> str:
+    """Muestra solo el inicio de un secreto para logs y consola."""
+    if not value:
+        return "—"
+    return value[:12] + "…" if len(value) > 12 else "…"
+
 
 class WSMonitor:
     def __init__(self, engine_port: int, central_addr: str, ws_id: str,
-                 location: str = "Parque Municipal", registry_url: str = "https://localhost:5500"):
+                 location: str = "Parque Municipal", registry_url: str = "https://localhost:5500",
+                 registry_ca: Optional[str] = None, cred_file: Optional[str] = None):
         self.engine_port = engine_port
         self.central_host, self.central_port = parse_addr(central_addr)
         self.ws_id = ws_id.strip().upper()
         self.location = location
         self.registry_url = registry_url.rstrip("/")
+        # Certificado del Registry usado como CA de confianza para validar el canal HTTPS
+        self.registry_ca = registry_ca or DEFAULT_REGISTRY_CA
         self.running = True
 
-        # Credenciales obtenidas de WM_Registry (Release 2)
-        self.credential: Optional[str] = None
+        # Credenciales obtenidas de WM_Registry (Release 2), persistidas en un fichero local (0600)
+        # para que un reinicio del Monitor no obligue a una baja administrativa.
+        self.cred_file = cred_file or os.path.join(DEFAULT_CRED_DIR, f"{self.ws_id}.cred")
+        self.credential: Optional[str] = self._load_credential()
+        # Tras una baja voluntaria no se vuelve a dar de alta automáticamente (solo con la opción 'r')
+        self.deregistered: bool = False
 
         # Clave simétrica única asignada por WM_Central tras autenticación (Release 2)
         self.symmetric_key: Optional[str] = None
@@ -67,36 +87,116 @@ class WSMonitor:
     # --------------------------------------------------------------------------
     # 1. REGISTRO SEGURO EN WM_REGISTRY (HTTPS / REST)
     # --------------------------------------------------------------------------
-    def register_in_registry(self) -> bool:
-        """Realiza la petición de alta en WM_Registry a través de un canal seguro HTTPS."""
-        self.log(f"Conectando a WM_Registry en {self.registry_url} vía HTTPS seguro...")
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE  # Acepta certificado autofirmado del laboratorio
+    def _registry_ssl_context(self) -> ssl.SSLContext:
+        """Contexto TLS que valida el certificado del Registry (cadena y nombre de host)."""
+        if not os.path.isfile(self.registry_ca):
+            raise FileNotFoundError(
+                f"No se encuentra el certificado del Registry ({self.registry_ca}). "
+                f"Cópielo desde WM_Registry o indique su ruta con --registry-ca."
+            )
+        return ssl.create_default_context(cafile=self.registry_ca)
 
-        payload = json.dumps({"id": self.ws_id, "location": self.location}).encode("utf-8")
+    def _load_credential(self) -> Optional[str]:
+        try:
+            with open(self.cred_file, "r", encoding="utf-8") as f:
+                value = f.read().strip()
+                return value or None
+        except OSError:
+            return None
+
+    def _save_credential(self, value: str):
+        try:
+            os.makedirs(os.path.dirname(self.cred_file) or ".", exist_ok=True)
+            fd = os.open(self.cred_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(value)
+            try:
+                os.chmod(self.cred_file, 0o600)
+            except OSError:
+                pass
+        except OSError as exc:
+            self.log(f"Aviso: no se pudo guardar la credencial en {self.cred_file} ({exc}).")
+
+    def _delete_credential_file(self):
+        try:
+            os.remove(self.cred_file)
+        except OSError:
+            pass
+
+    def _registry_request(self, method: str, path: str, body: dict):
+        """Petición HTTPS al Registry validando su certificado. Devuelve (código, json)."""
         req = urllib.request.Request(
-            f"{self.registry_url}/api/stations",
-            data=payload,
+            f"{self.registry_url}{path}",
+            data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json"},
-            method="POST"
+            method=method
         )
         try:
-            with urllib.request.urlopen(req, context=ctx, timeout=4.0) as resp:
-                if resp.status in (200, 201):
-                    raw = resp.read().decode("utf-8")
-                    data = json.loads(raw)
-                    st_data = data.get("data", {})
-                    self.credential = st_data.get("credential")
-                    self.key_revoked = False
-                    self.log(f"¡Alta completada en WM_Registry! Credencial obtenida: {self.credential}")
-                    return True
-                else:
-                    self.log(f"Error al registrar en WM_Registry: Código HTTP {resp.status}")
-                    return False
+            with urllib.request.urlopen(req, context=self._registry_ssl_context(), timeout=4.0) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as err:
+            try:
+                return err.code, json.loads(err.read().decode("utf-8") or "{}")
+            except Exception:
+                return err.code, {}
+
+    def register_in_registry(self) -> bool:
+        """Alta en WM_Registry por HTTPS (con validación de certificado).
+        Si ya hay credencial se presenta para renovarla; el Registry emite una nueva."""
+        self.log(f"Conectando a WM_Registry en {self.registry_url} vía HTTPS seguro...")
+        payload = {"id": self.ws_id, "location": self.location}
+        if self.credential:
+            payload["credential"] = self.credential
+        try:
+            status, data = self._registry_request("POST", "/api/stations", payload)
         except Exception as exc:
             self.log(f"Fallo de conexión segura con WM_Registry ({exc}). Reintentando...")
             return False
+
+        if status in (200, 201):
+            new_cred = (data.get("data") or {}).get("credential")
+            if not new_cred:
+                self.log("Respuesta del Registry sin credencial. Alta no completada.")
+                return False
+            self.credential = new_cred
+            self._save_credential(new_cred)
+            self.deregistered = False
+            self.key_revoked = False
+            accion = "Alta completada" if status == 201 else "Credencial renovada"
+            self.log(f"¡{accion} en WM_Registry! Credencial obtenida: {mask_secret(self.credential)}")
+            return True
+        if status == 403:
+            self.log(f"WM_Registry RECHAZÓ el alta: {data.get('message', 'credencial actual requerida')}")
+            return False
+        self.log(f"Error al registrar en WM_Registry: Código HTTP {status} ({data.get('message', '')})")
+        return False
+
+    def deregister_from_registry(self) -> bool:
+        """Baja voluntaria de la estación en WM_Registry presentando su credencial actual."""
+        if not self.credential:
+            self.log("No hay credencial: la estación no está dada de alta desde este Monitor.")
+            return False
+        try:
+            status, data = self._registry_request("DELETE", f"/api/stations/{self.ws_id}",
+                                                  {"credential": self.credential})
+        except Exception as exc:
+            self.log(f"Fallo de conexión segura con WM_Registry ({exc}).")
+            return False
+        if status == 200 or status == 404:
+            self.log("Estación dada de baja en WM_Registry." if status == 200
+                     else "La estación ya no figuraba en WM_Registry.")
+            self.credential = None
+            self._delete_credential_file()
+            self.deregistered = True
+            # Sin registro no puede seguir prestando servicio: se cierra la sesión con Central
+            if self.central_sock:
+                try: self.central_sock.close()
+                except Exception: pass
+                self.central_sock = None
+            self.symmetric_key = None
+            return True
+        self.log(f"WM_Registry rechazó la baja (HTTP {status}): {data.get('message', '')}")
+        return False
 
     # --------------------------------------------------------------------------
     # 2. CONEXIÓN Y AUTENTICACIÓN EN CENTRAL (CON CREDENCIALES Y CLAVE SIMÉTRICA)
@@ -106,8 +206,9 @@ class WSMonitor:
             return True
 
         # Si aún no tenemos credencial de Registry, realizamos el alta primero
+        # (salvo tras una baja voluntaria: entonces solo se da de alta con la opción 'r')
         if not self.credential:
-            if not self.register_in_registry():
+            if self.deregistered or not self.register_in_registry():
                 return False
 
         try:
@@ -332,6 +433,7 @@ class WSMonitor:
         print(f"  {COLOR_BOLD}MONITOR ESTACIÓN {self.ws_id} — MENÚ DE CONTROL{COLOR_RESET}")
         print("  Opciones disponibles:")
         print("    r  -> Registrarse en WM_Registry (Canal seguro HTTPS)")
+        print("    b  -> Darse de baja en WM_Registry")
         print("    a  -> Autenticarse en WM_Central y recibir clave simétrica")
         print("    k  -> Re-autenticarse ante revocación de claves")
         print("    s  -> Ver estado de seguridad (credencial y clave simétrica)")
@@ -347,6 +449,8 @@ class WSMonitor:
 
                 if cmd == "r":
                     self.register_in_registry()
+                elif cmd == "b":
+                    self.deregister_from_registry()
                 elif cmd == "a":
                     self.ensure_central_connection()
                 elif cmd == "k":
@@ -355,7 +459,8 @@ class WSMonitor:
                     print(f"\n--- ESTADO DE SEGURIDAD [{self.ws_id}] ---")
                     print(f"  • Ubicación:      {self.location}")
                     print(f"  • Registry URL:   {self.registry_url}")
-                    print(f"  • Credencial:     {self.credential or 'No registrada aún'}")
+                    print(f"  • Credencial:     {mask_secret(self.credential) if self.credential else 'No registrada aún'}")
+                    print(f"  • CA del Registry:{self.registry_ca}")
                     print(f"  • Clave simétrica:{self.symmetric_key[:12] + '...' if self.symmetric_key else 'Sin clave / Revocada'}")
                     print(f"  • Clave revocada: {'SÍ (Fuera de Servicio)' if self.key_revoked else 'NO'}")
                     print(f"  • Central Socket: {'Conectado' if self.central_sock else 'Desconectado'}")
@@ -365,7 +470,7 @@ class WSMonitor:
                     self.running = False
                     os._exit(0)
                 elif cmd:
-                    print("Opción no válida. Use 'r', 'a', 'k', 's' o 'q'.")
+                    print("Opción no válida. Use 'r', 'b', 'a', 'k', 's' o 'q'.")
             except Exception as e:
                 print(f"Error procesando comando: {e}")
 
@@ -375,12 +480,17 @@ def main():
     parser.add_argument("args", nargs="*", help="[puerto_engine] [central_host:puerto] [ws_id]")
     parser.add_argument("--loc", default="Parque Municipal", help="Ubicación física de la estación")
     parser.add_argument("--registry", default="https://localhost:5500", help="URL de WM_Registry (HTTPS)")
+    parser.add_argument("--registry-ca", default=None,
+                        help="Certificado del Registry para validar HTTPS (por defecto $WM_REGISTRY_CA o "
+                             "WM_Registry/certs/registry_cert.pem)")
+    parser.add_argument("--cred-file", default=None,
+                        help="Fichero local donde se guarda la credencial (por defecto WM_WS/.credentials/<ID>.cred)")
 
     parsed = parser.parse_args()
     raw = parsed.args
 
     if len(raw) < 3:
-        print("Uso: python WM_WS_M.py <puerto_engine> <central_host:puerto> <ID_WS> [--loc UBICACION] [--registry URL]")
+        print("Uso: python WM_WS_M.py <puerto_engine> <central_host:puerto> <ID_WS> [--loc UBICACION] [--registry URL] [--registry-ca CERT]")
         print("Ejemplo: python WM_WS_M.py 6001 localhost:5000 WS-01 --loc 'River Park' --registry https://localhost:5500")
         sys.exit(1)
 
@@ -397,7 +507,9 @@ def main():
         central_addr=central_addr,
         ws_id=ws_id,
         location=parsed.loc,
-        registry_url=parsed.registry
+        registry_url=parsed.registry,
+        registry_ca=parsed.registry_ca,
+        cred_file=parsed.cred_file
     )
 
     t = threading.Thread(target=monitor.run_monitoring_loop, daemon=True)

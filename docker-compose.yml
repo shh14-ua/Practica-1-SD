@@ -20,7 +20,10 @@ services:
   registry:
     build: .
     container_name: wm_registry
-    command: python WM_Registry/WM_Registry.py 5500 --db /data/registry.db
+    command: python WM_Registry/WM_Registry.py 5500 --db /data/registry.db --cert /data/certs/registry_cert.pem --key /data/certs/registry_key.pem
+    environment:
+      # Nombres/IP adicionales del certificado HTTPS (p. ej. la IP pública con la que conectan las WS)
+      WM_REGISTRY_SAN: ${WM_REGISTRY_SAN:-}
     ports:
       - "5500:5500"
     volumes:
@@ -41,6 +44,7 @@ services:
       KAFKA_BOOTSTRAP: kafka:19092
       WM_REGISTRY_URL: https://registry:5500
       WM_REGISTRY_DB: /data/registry.db
+      WM_REGISTRY_CA: /data/certs/registry_cert.pem
     volumes:
       - ./data:/data
     stdin_open: true

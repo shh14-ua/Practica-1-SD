@@ -12,6 +12,7 @@ Funcionalidades:
 """
 
 import argparse
+import json
 import os
 import random
 import socket

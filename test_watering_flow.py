@@ -336,10 +336,43 @@ class FakeKafkaConsumer:
                 time.sleep(0.02)
 
 
+class FakeRegistry:
+    """Simulación de WM_Registry para el arnés de la Release 1 (solo configuración de pruebas).
+    El arnés sustituye los sockets por un hub en memoria, por lo que no puede levantar el
+    servidor HTTPS real. La simulación mantiene las reglas de autenticación:
+      - Una WS obtiene credencial al darse de alta (cada alta emite una credencial distinta).
+      - Central solo acepta la credencial emitida para esa misma WS.
+      - Se considera dada de alta en el Registry la WS que Central conoce (las precargadas y las
+        añadidas con el alta de Central), preservando el rechazo de estaciones no registradas
+        que comprueba test_11 (WS-07 antes del alta y WS-99).
+    Las pruebas con el Registry real (HTTPS, credenciales inválidas, Registry caído) están en
+    test_release2.py."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.issued = {}
+
+    def register(self, monitor) -> bool:
+        with self.lock:
+            cred = f"CRED-{monitor.ws_id}-TEST{len(self.issued) + 1:04d}"
+            self.issued[monitor.ws_id] = cred
+        monitor.credential = cred
+        monitor.key_revoked = False
+        return True
+
+    def verify(self, central, ws_id: str, credential: str) -> bool:
+        ws = (ws_id or "").strip().upper()
+        with self.lock:
+            expected = self.issued.get(ws)
+        return ws in central.stations and expected is not None and credential == expected
+
+
 class WaterManagementFlowTests(unittest.TestCase):
     def setUp(self):
         self.broker = FakeKafkaBroker()
         self.socket_hub = FakeSocketHub(self)
+        self.registry = FakeRegistry()
+        self.cred_dir = tempfile.mkdtemp(prefix="wm_creds_")
         self.active_instances = []
         self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.temp_db.close()
@@ -362,6 +395,12 @@ class WaterManagementFlowTests(unittest.TestCase):
             patch.object(WM_FO, "make_producer", lambda *a, **kw: "FAKE_PRODUCER"),
             patch.object(WM_FO, "send_kafka", lambda prod, topic, msg, **kw: self.broker.send(topic, msg)),
             patch.object(WM_FO, "make_consumer", self.broker.make_consumer),
+            # Simulación de WM_Registry (ver FakeRegistry) y credenciales locales en directorio temporal
+            patch.object(WM_WS_M, "DEFAULT_CRED_DIR", self.cred_dir),
+            patch.object(WM_WS_M.WSMonitor, "register_in_registry",
+                         lambda mon: self.registry.register(mon)),
+            patch.object(WM_Central.WMCentral, "verify_registry_credential",
+                         lambda cen, ws_id, cred: self.registry.verify(cen, ws_id, cred)),
         ]
         for p in self.patches:
             p.start()
@@ -388,6 +427,8 @@ class WaterManagementFlowTests(unittest.TestCase):
                 os.unlink(self.temp_db.name)
             except OSError:
                 pass
+        import shutil
+        shutil.rmtree(self.cred_dir, ignore_errors=True)
 
     def _start_cluster(self, ws_id="WS-01"):
         central_port = get_free_port()

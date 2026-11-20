@@ -25,3 +25,7 @@ data/
 
 # Claves privadas
 WM_Registry/certs/*_key.pem
+
+# Credenciales locales de las estaciones (WM_WS_M)
+WM_WS/.credentials/
+*.cred

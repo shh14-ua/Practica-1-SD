@@ -72,6 +72,10 @@ class WMCentral:
         # Configuración de WM_Registry
         self.registry_db_path = os.getenv("WM_REGISTRY_DB", "registry.db")
         self.registry_url = os.getenv("WM_REGISTRY_URL", "https://localhost:5500")
+        # Certificado del Registry usado como CA de confianza para validar el canal HTTPS
+        self.registry_ca = os.getenv(
+            "WM_REGISTRY_CA", os.path.join(ROOT_DIR, "WM_Registry", "certs", "registry_cert.pem")
+        )
 
         # Inicialización de la base de datos SQLite
         self._init_db()
@@ -337,28 +341,27 @@ class WMCentral:
                         "SELECT credential, status FROM registry_stations WHERE id = ?", (clean_id,)
                     ).fetchone()
                     if row and row["status"] == "ACTIVE":
-                        return row["credential"] == clean_cred
+                        return hmac.compare_digest(row["credential"].encode("utf-8"), clean_cred.encode("utf-8"))
             except Exception:
                 pass
 
         # 2. Consulta vía API REST HTTPS a WM_Registry
         try:
             import ssl, urllib.request
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            if not os.path.isfile(self.registry_ca):
+                raise FileNotFoundError(f"certificado del Registry no encontrado en {self.registry_ca}")
+            # Validación completa del certificado (cadena y nombre de host)
+            ctx = ssl.create_default_context(cafile=self.registry_ca)
             url = f"{self.registry_url}/api/verify"
             req_data = json.dumps({"id": clean_id, "credential": clean_cred}).encode("utf-8")
             req = urllib.request.Request(url, data=req_data, headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, context=ctx, timeout=2.5) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 return bool(res.get("valid", False))
-        except Exception:
-            pass
-
-        # 3. Fallback permisivo si tiene prefijo CRED- y no hay conectividad con Registry
-        if clean_cred.startswith(f"CRED-{clean_id}") or clean_cred.startswith("CRED-"):
-            return True
+        except Exception as exc:
+            # Sin respuesta verificable del Registry se deniega (no hay aceptación por defecto)
+            self.log(f"No se pudo verificar la credencial de {clean_id} en WM_Registry ({exc}). Acceso denegado.",
+                     ws_id=clean_id)
 
         return False
 
@@ -584,38 +587,31 @@ class WMCentral:
                 # Registro y autenticación inicial
                 if cmd in ("REGISTRO", "AUTH") and len(parts) >= 2:
                     st_id = parts[1].strip().upper()
-                    # Soporte para AUTH#<ws_id>#<credencial>#<ubicacion>
-                    cred = ""
-                    if len(parts) >= 3 and parts[2].startswith("CRED-"):
-                        cred = parts[2].strip()
-                        location = parts[3] if len(parts) >= 4 else "Ubicación desconocida"
-                    elif len(parts) >= 4:
-                        cred = parts[2].strip()
-                        location = parts[3].strip()
-                    else:
-                        location = parts[2] if len(parts) >= 3 else "Ubicación desconocida"
+                    # Formato único admitido: AUTH#<ws_id>#<credencial>#<ubicacion>
+                    # (REGISTRO#<ws_id>#<ubicacion> de la Release 1 ya no autentica: falta la credencial)
+                    cred = parts[2].strip() if (cmd == "AUTH" and len(parts) >= 4) else ""
+                    location = parts[3].strip() if (cmd == "AUTH" and len(parts) >= 4) else "Ubicación desconocida"
+
+                    if not cred:
+                        self.audit_event(
+                            st_id, client_ip, "AUTH_FAILED",
+                            f"Autenticación DENEGADA para {st_id}: solicitud sin credencial del Registry.",
+                            f"Comando recibido: {cmd}"
+                        )
+                        self.log(f"Autenticación DENEGADA para {st_id}: solicitud sin credencial", ws_id=st_id)
+                        return "STATUS#KO#Autenticacion denegada: se requiere la credencial emitida por WM_Registry"
+
+                    # Verificación obligatoria contra WM_Registry (Release 2), fuera del lock global
+                    # para no bloquear la Central mientras se consulta el Registry.
+                    if not self.verify_registry_credential(st_id, cred):
+                        self.audit_event(
+                            st_id, client_ip, "AUTH_FAILED",
+                            f"Autenticación DENEGADA para {st_id}: credencial inválida o no registrada en Registry."
+                        )
+                        self.log(f"Autenticación DENEGADA para {st_id}: credencial de Registry inválida", ws_id=st_id)
+                        return "STATUS#KO#Autenticacion denegada: credencial invalida o no registrada en Registry"
 
                     with self.lock:
-                        # Verificación obligatoria contra WM_Registry (Release 2)
-                        if cred:
-                            valid_cred = self.verify_registry_credential(st_id, cred)
-                            if not valid_cred:
-                                self.audit_event(
-                                    st_id, client_ip, "AUTH_FAILED",
-                                    f"Autenticación DENEGADA para {st_id}: credencial inválida o no registrada en Registry.",
-                                    f"Credencial presentada: {cred}"
-                                )
-                                self.log(f"Autenticación DENEGADA para {st_id}: credencial de Registry inválida", ws_id=st_id)
-                                return "STATUS#KO#Autenticacion denegada: credencial invalida o no registrada en Registry"
-                        elif st_id not in self.stations:
-                            # Sin credencial y sin registro previo
-                            self.audit_event(
-                                st_id, client_ip, "AUTH_FAILED",
-                                f"Autenticación DENEGADA para {st_id}: estación no registrada previamente en el Registry."
-                            )
-                            self.log(f"Autenticación DENEGADA: estación {st_id} no registrada en Registry", ws_id=st_id)
-                            return f"STATUS#KO#Estacion {st_id} no registrada en WM_Registry"
-
                         # Generamos clave de cifrado simétrico ÚNICA para esta WS
                         sym_key = generate_symmetric_key()
                         self.station_keys[st_id] = sym_key
