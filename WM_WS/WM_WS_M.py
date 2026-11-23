@@ -34,7 +34,7 @@ from common import (
     parse_addr, COLOR_BOLD, COLOR_RESET
 )
 from wm_crypto import (
-    encrypt_message, decrypt_message, is_encrypted
+    encrypt_message, decrypt_message, is_encrypted, is_valid_symmetric_key, require_cryptography
 )
 
 DEFAULT_REGISTRY_CA = os.getenv(
@@ -204,6 +204,7 @@ class WSMonitor:
             with self.central_lock:
                 self._close_central_sock()
                 self.symmetric_key = None
+                self._send_key_to_engine()  # CLEAR_KEY: sin registro el Engine no conserva la clave
             return True
         self.log(f"WM_Registry rechazó la baja (HTTP {status}): {data.get('message', '')}")
         return False
@@ -269,7 +270,7 @@ class WSMonitor:
 
                 parts = resp.split("#")
                 # Parts: STATUS, OK, <sym_key>, <mensaje>
-                if len(parts) < 4 or len(parts[2].strip()) < 16:
+                if len(parts) < 4 or not is_valid_symmetric_key(parts[2].strip()):
                     self.log("Central aceptó la autenticación pero no envió una clave simétrica válida. "
                              "Se cierra la conexión.")
                     sock.close()
@@ -326,6 +327,7 @@ class WSMonitor:
                     self.key_revoked = True
                     self.central_blocked = True
                     self._close_central_sock()
+                    self._send_key_to_engine()  # CLEAR_KEY: el Engine deja de usar la clave revocada
                     return False
 
                 self.central_blocked = "#BLOCKED" in resp
@@ -357,11 +359,13 @@ class WSMonitor:
     # 3. COMUNICACIÓN CON ENGINE (WM_WS_E)
     # --------------------------------------------------------------------------
     def _send_key_to_engine(self):
-        """Envía la clave simétrica al Engine por socket."""
+        """Sincroniza la clave simétrica con el Engine por el enlace local: SET_KEY con la clave
+        vigente o CLEAR_KEY si no hay ninguna (revocada, baja o aún sin autenticar)."""
         with self.engine_lock:
-            if self.engine_sock and self.symmetric_key:
+            if self.engine_sock:
+                msg = f"SET_KEY#{self.symmetric_key}" if self.symmetric_key else "CLEAR_KEY"
                 try:
-                    request_socket(self.engine_sock, f"SET_KEY#{self.symmetric_key}")
+                    request_socket(self.engine_sock, msg)
                 except Exception:
                     pass
 
@@ -522,6 +526,12 @@ class WSMonitor:
 
 
 def main():
+    try:
+        require_cryptography()
+    except RuntimeError as exc:
+        print(f"[MONITOR] ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(description="WM_WS_M: Monitor de la Estación de Riego (Release 2)")
     parser.add_argument("args", nargs="*", help="[puerto_engine] [central_host:puerto] [ws_id]")
     parser.add_argument("--loc", default="Parque Municipal", help="Ubicación física de la estación")

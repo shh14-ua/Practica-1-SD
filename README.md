@@ -10,7 +10,7 @@ Sistema distribuido de gestión, supervisión y seguridad del riego en parques y
 4. **Módulo Web Front (Node.js)** que visualiza el cuadro de monitorización interactivo en tiempo real desde cualquier navegador.
 5. **Tres pilares de seguridad:**
    - **Autenticación segura:** Canal cifrado HTTPS/SSL para la comunicación con `WM_Registry` y verificación obligatoria de credenciales en `WM_Central`. La autenticación de las WS en Central y la entrega de la clave simétrica viajan por un canal TLS (certificado propio de Central validado por el Monitor).
-   - **Cifrado simétrico de datos:** Clave simétrica única por estación otorgada por Central para evitar ataques Man-In-The-Middle (MITM), con soporte de revocación y restauración de claves ante supuesta vulnerabilidad.
+   - **Cifrado simétrico de datos:** Clave simétrica única por estación otorgada por Central para evitar ataques Man-In-The-Middle (MITM), con soporte de revocación y restauración de claves ante supuesta vulnerabilidad. Todos los mensajes entre Central y la estación van cifrados y autenticados con Fernet (AES-128-CBC + HMAC-SHA256): por socket con el Monitor y por Kafka (`ws_commands` y `ws_events`) con el Engine.
    - **Auditoría estructurada:** Registro detallado de eventos de seguridad (fecha/hora, IP de origen, entidad, acción y descripción).
 
 ---
@@ -102,7 +102,7 @@ Practica-1-SD/
 │   ├── WM_FO.py                # Operarios de campo
 │   └── operaciones.txt
 ├── common.py                   # Protocolos de sockets, Kafka y utilidades
-├── wm_crypto.py                # Módulo criptográfico (clave simétrica, cifrado HMAC/AES, tokens)
+├── wm_crypto.py                # Módulo criptográfico (clave simétrica, cifrado Fernet, mensajes Kafka, certificados)
 ├── test_release2.py            # Suite de pruebas automatizadas de integración
 ├── docker-compose.yml          # Despliegue completo de servicios Cloud
 ├── Dockerfile
@@ -186,6 +186,14 @@ python WM_WS/WM_WS_E.py <IP_KAFKA>:9092 localhost:6001
 ```
 - Recibe del Monitor el identificador `WS-01` y la clave simétrica.
 - Ejecuta las órdenes de riego y publica telemetría.
+
+**Canal Kafka cifrado Central ↔ Engine (`ws_commands` / `ws_events`):**
+- Cada mensaje viaja como `{"ws": "<WS>", "enc": "ENC:<token Fernet>"}`: solo el identificador de la estación es visible (para elegir la clave) y se rechaza cualquier otro campo en claro (`CAMPOS_EXTRA`). Dentro del cifrado van la orden o el evento, el tipo (`cmd`/`evt`), la WS y un número de secuencia creciente.
+- Se rechazan los mensajes en claro, manipulados, cifrados con otra clave (anterior o revocada), de otra WS, del sentido contrario o repetidos. Central registra los rechazos en la auditoría (`KAFKA_REJECTED`, como máximo uno cada 30 s por estación y motivo).
+- Sin clave vigente Central no envía órdenes a esa estación y el Engine no acepta órdenes ni nuevos riegos (tampoco manuales), no publica nada en claro y conserva los `FINISHED` pendientes, que reenvía cifrados al recibir una clave nueva. Al revocarse las claves o darse de baja, el Monitor ordena al Engine borrar la suya (`CLEAR_KEY`).
+- Central confirma cada `FINISHED` registrado con la orden cifrada `ACK_FINISHED` (también los duplicados). El Engine conserva los `FINISHED` no confirmados y, si su clave cambia antes de la confirmación (re-autenticación, reinicio de Central o revocación), los reenvía cifrados con la clave nueva; Central descarta los duplicados por `transaction_id` y un `FINISHED` de una transacción anterior nunca altera el estado de un riego en curso.
+- El Engine guarda en `WM_WS/.engine_state/<WS>.json` (o `$WM_ENGINE_STATE_DIR`; con Docker, `data/engine_state`) la huella de su clave y el último número de secuencia aceptado, para no aceptar órdenes repetidas tras reiniciarse con la misma clave. No contiene la clave.
+- Es obligatoria la librería `cryptography` (`pip install -r requirements.txt`) en todas las máquinas: no existe cifrado alternativo y Central, Monitor y Engine no arrancan sin ella.
 
 ---
 

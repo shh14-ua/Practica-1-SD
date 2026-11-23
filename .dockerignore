@@ -12,6 +12,7 @@
 **/*.pfx
 **/*.cred
 WM_WS/.credentials
+WM_WS/.engine_state
 **/.env
 **/.env.*
 

@@ -34,4 +34,7 @@ WM_Central/certs/central_cert.pem
 
 # Credenciales locales de las estaciones (WM_WS_M)
 WM_WS/.credentials/
+
+# Estado local del Engine (último número de secuencia de órdenes aceptado por clave)
+WM_WS/.engine_state/
 *.cred

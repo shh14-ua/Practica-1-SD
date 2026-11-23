@@ -36,6 +36,7 @@ for subdir in ("WM_Central", "WM_WS", "WM_FO"):
 
 import traceback
 import common
+from wm_crypto import generate_symmetric_key, open_kafka_message, KAFKA_KIND_EVENT
 import WM_Central
 import WM_FO
 import WM_WS_E
@@ -263,8 +264,10 @@ class FakeKafkaBroker:
 
     def send(self, topic: str, msg: dict) -> bool:
         if isinstance(msg, dict) and self.clock_skew_central != 0.0:
-            # Simular desfase de reloj en mensajes emitidos por CENTRAL
-            if topic in (common.TOPIC_COMMANDS, common.TOPIC_REPLIES):
+            # Simular desfase de reloj en mensajes emitidos por CENTRAL. Las órdenes a los Engine
+            # (ws_commands) van cifradas y solo admiten los campos {ws, enc}: su hora viaja dentro del
+            # cifrado y el desfase entre máquinas se prueba en test_kafka_encryption.py.
+            if topic == common.TOPIC_REPLIES:
                 msg = dict(msg)
                 msg["timestamp"] = time.time() - self.clock_skew_central
         with self.lock:
@@ -396,6 +399,7 @@ class WaterManagementFlowTests(unittest.TestCase):
             patch.object(WM_FO, "make_consumer", self.broker.make_consumer),
             # Simulación de WM_Registry (ver FakeRegistry) y credenciales locales en directorio temporal
             patch.object(WM_WS_M, "DEFAULT_CRED_DIR", self.cred_dir),
+            patch.object(WM_WS_E, "DEFAULT_STATE_DIR", os.path.join(self.cred_dir, "engine_state")),
             patch.object(WM_WS_M.WSMonitor, "register_in_registry",
                          lambda mon: self.registry.register(mon)),
             patch.object(WM_Central.WMCentral, "verify_registry_credential",
@@ -504,6 +508,11 @@ class WaterManagementFlowTests(unittest.TestCase):
     def test_1_full_watering_flow_and_clock_skew(self):
         """Prueba el ciclo completo FO -> CENTRAL -> Engine -> CENTRAL -> FO incluso con 120s de desfase de reloj."""
         self.broker.clock_skew_central = 120.0  # Simula que el reloj de AWS va 2 minutos por detrás del laboratorio
+        # Canal cifrado: los números de secuencia de Central también salen de su reloj atrasado 120 s
+        skewed_seq = lambda last: max(int(last) + 1, time.time_ns() - 120 * 10**9)
+        skew_patch = patch.object(WM_Central, "next_kafka_seq", skewed_seq)
+        skew_patch.start()
+        self.addCleanup(skew_patch.stop)
         central, monitor, engine = self._start_cluster("WS-01")
 
         fo = WM_FO.FieldOperator("localhost:9092", "FO-01")
@@ -740,6 +749,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-TEST"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         original_send = engine.send_event
 
@@ -780,6 +790,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-TEST"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         original_send = engine.send_event
 
@@ -794,11 +805,11 @@ class WaterManagementFlowTests(unittest.TestCase):
         time.sleep(5.0)
 
         events = self.broker.topics.get(common.TOPIC_EVENTS, [])
-        types = [
-            e["type"]
-            for e in events
-            if e.get("ws") == "WS-TEST"
-        ]
+        # Los eventos viajan cifrados: se descifran con la clave de esta estación para ver su orden.
+        # Solo cuentan los de este Engine (los hilos tardíos de test_7, también WS-TEST, usan otra clave).
+        decoded = [open_kafka_message(engine.symmetric_key, e, KAFKA_KIND_EVENT, "WS-TEST")[0]
+                   for e in events if e.get("ws") == "WS-TEST"]
+        types = [d["type"] for d in decoded if d is not None]
 
         self.assertIn("TELEMETRY", types)
         self.assertIn("FINISHED", types)
@@ -1201,6 +1212,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-03"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         # Simular que Kafka está bloqueado / caído (demora de 1.5 s en send_event)
         kafka_in_flight = threading.Event()
@@ -1282,6 +1294,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-01"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         kafka_started_delay = threading.Event()
         original_send = engine.send_event
@@ -1332,6 +1345,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-01"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         finished_events = []
         original_send = engine.send_event
@@ -1394,6 +1408,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-01"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         finished_events = []
         original_send = engine.send_event
@@ -1447,6 +1462,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-01"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         finished_events = []
         original_send = engine.send_event
@@ -1516,6 +1532,7 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.ws_id = "WS-01"
         engine.monitor_connected = True
         engine.central_connected = True
+        engine.symmetric_key = generate_symmetric_key()  # estación autenticada (clave recibida del Monitor)
 
         published_order = []
         started_unblock_ev = threading.Event()
@@ -1702,6 +1719,152 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertIn("WS-01", central.station_keys)
         time.sleep(1.5)
         self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        engine.running = False
+        monitor.running = False
+        central.running = False
+
+
+    # ------------------------------------------------------------------------------------------
+    # Release 2 - bloque 4: canal Kafka cifrado Central <-> Engine (sockets y Kafka simulados,
+    # criptografía real)
+    # ------------------------------------------------------------------------------------------
+    def _kafka_msgs(self, topic):
+        with self.broker.lock:
+            return list(self.broker.topics.get(topic, []))
+
+    def _history_count(self, central, tx_id):
+        with central._get_db() as db:
+            return db.execute("SELECT COUNT(*) FROM watering_history WHERE transaction_id = ?",
+                              (tx_id,)).fetchone()[0]
+
+    def test_21_all_kafka_messages_encrypted_replays_forgeries_rejected_and_weather(self):
+        import json as _json
+        from wm_crypto import KAFKA_KIND_COMMAND
+        central, monitor, engine = self._start_cluster("WS-01")
+        key = central.station_keys["WS-01"]
+        self.assertEqual(engine.symmetric_key, key)
+
+        central.request_watering("FO-01", "WS-01", 2)
+        self.assertTrue(self._wait_until(lambda: engine.state == "WATERING", 4))
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        self.assertTrue(self._wait_until(lambda: self._history_count(central, tx_id) == 1, 8))
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE, 3))
+
+        cmds, evts = self._kafka_msgs(common.TOPIC_COMMANDS), self._kafka_msgs(common.TOPIC_EVENTS)
+        for m in cmds + evts:
+            self.assertEqual(set(m), {"ws", "enc"}, f"Mensaje Kafka con campos en claro: {m}")
+        raw = _json.dumps(cmds + evts)
+        for secret in ("FO-01", tx_id, "START", "FINISHED", "TELEMETRY"):
+            self.assertNotIn(secret, raw)
+        ev_types = [open_kafka_message(key, m, KAFKA_KIND_EVENT, "WS-01")[0]["type"] for m in evts]
+        self.assertEqual((ev_types[0], ev_types[-1]), ("STARTED", "FINISHED"))
+        decoded_cmds = [open_kafka_message(key, m, KAFKA_KIND_COMMAND, "WS-01")[0]["cmd"] for m in cmds]
+        self.assertEqual(decoded_cmds, ["START", "ACK_FINISHED"], "Orden de riego y confirmación del FINISHED")
+        start_msg = cmds[0]
+
+        # Orden repetida (capturada de Kafka) y orden falsificada en claro: no deben iniciar riego
+        self.broker.send(common.TOPIC_COMMANDS, start_msg)
+        self.broker.send(common.TOPIC_COMMANDS, {"ws": "WS-01", "cmd": "START", "op": "FO-99", "duration": 5})
+        time.sleep(1.0)
+        self.assertEqual(engine.state, "AVAILABLE")
+        self.assertEqual(self._history_count(central, tx_id), 1)
+
+        # Alerta climática y cancelación: órdenes cifradas BLOCK / ACTIVATE
+        n = len(self._kafka_msgs(common.TOPIC_COMMANDS))
+        central.handle_weather_alert("WS-01", "Madrid", -3.0, "Snow", True, "Helada")
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 4))
+        central.handle_weather_alert("WS-01", "Madrid", 12.0, "Clear", False, "Normal")
+        self.assertTrue(self._wait_until(lambda: engine.state == "AVAILABLE", 4))
+        new_cmds = [open_kafka_message(key, m, KAFKA_KIND_COMMAND, "WS-01")[0]["cmd"]
+                    for m in self._kafka_msgs(common.TOPIC_COMMANDS)[n:]]
+        self.assertEqual(new_cmds, ["BLOCK", "ACTIVATE"])
+
+        engine.running = False
+        monitor.running = False
+        central.running = False
+
+    def test_22_revocation_during_watering_keeps_finished_and_rejects_old_key_commands(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        old_key = central.station_keys["WS-01"]
+        central.request_watering("FO-01", "WS-01", 30)
+        self.assertTrue(self._wait_until(
+            lambda: engine.state == "WATERING" and central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        from wm_crypto import KAFKA_KIND_COMMAND
+        captured_start = next(m for m in self._kafka_msgs(common.TOPIC_COMMANDS)
+                              if open_kafka_message(old_key, m, KAFKA_KIND_COMMAND, "WS-01")[0]["cmd"] == "START")
+
+        central.revoke_station_keys("WS-01")
+        # El Monitor recibe REVOKED, envía CLEAR_KEY al Engine y lo bloquea
+        self.assertTrue(self._wait_until(
+            lambda: monitor.key_revoked and engine.symmetric_key is None and engine.state == "BLOCKED", 8))
+        self.assertTrue(self._wait_until(
+            lambda: any(p.get("transaction_id") == tx_id for p in engine.pending_finished_events), 3),
+            "El FINISHED del riego interrumpido debe quedar pendiente (no hay clave para publicarlo)")
+        self.assertEqual(self._history_count(central, tx_id), 0)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Re-autenticación (opción 'k'): clave nueva; el FINISHED pendiente llega cifrado y se registra una vez
+        monitor.reauthenticate()
+        new_key = central.station_keys["WS-01"]
+        self.assertNotEqual(new_key, old_key)
+        self.assertTrue(self._wait_until(lambda: engine.symmetric_key == new_key, 3))
+        self.assertTrue(self._wait_until(lambda: self._history_count(central, tx_id) == 1, 8))
+        self.assertTrue(self._wait_until(lambda: not engine.pending_finished_events, 3))
+
+        # La orden START capturada con la clave revocada no se acepta
+        self.assertTrue(self._wait_until(lambda: engine.state == "AVAILABLE", 6))
+        self.broker.send(common.TOPIC_COMMANDS, captured_start)
+        time.sleep(1.0)
+        self.assertNotEqual(engine.state, "WATERING")
+        self.assertEqual(self._history_count(central, tx_id), 1)
+
+        engine.running = False
+        monitor.running = False
+        central.running = False
+
+
+    def test_23_fast_reauthentication_does_not_lose_finished(self):
+        """El FINISHED enviado con la clave anterior que Central aún no había procesado cuando se
+        re-autentica la WS se rechaza (clave antigua), pero el Engine lo reenvía con la clave nueva
+        porque Central no lo había confirmado: se registra exactamente una vez."""
+        central, monitor, engine = self._start_cluster("WS-01")
+        old_key = central.station_keys["WS-01"]
+
+        # Retener los eventos en Kafka (Central "lento") durante la re-autenticación
+        held, holding = [], {"on": True}
+        real_process = central._process_kafka_event
+
+        def slow_central(msg):
+            if holding["on"]:
+                held.append(msg)
+                return
+            real_process(msg)
+
+        central._process_kafka_event = slow_central
+        central.request_watering("FO-01", "WS-01", 1)
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        self.assertTrue(self._wait_until(lambda: tx_id in engine._unconfirmed_finished, 6),
+                        "El FINISHED enviado debe conservarse hasta que Central lo confirme")
+
+        # Re-autenticación rápida del Monitor (sin revocación): nueva clave
+        with monitor.central_lock:
+            monitor._close_central_sock()
+            monitor.symmetric_key = None
+        self.assertTrue(monitor.ensure_central_connection(manual=True))
+        self.assertNotEqual(central.station_keys["WS-01"], old_key)
+        self.assertTrue(self._wait_until(lambda: engine.symmetric_key == central.station_keys["WS-01"], 3))
+
+        # Central procesa ahora lo retenido: lo de la clave anterior se rechaza, el reenvío se acepta
+        holding["on"] = False
+        for msg in list(held):
+            real_process(msg)
+        self.assertTrue(self._wait_until(lambda: self._history_count(central, tx_id) == 1, 6))
+        self.assertTrue(self._wait_until(lambda: tx_id not in engine._unconfirmed_finished, 4),
+                        "Tras la confirmación de Central el Engine deja de conservarlo")
+        time.sleep(0.5)
+        self.assertEqual(self._history_count(central, tx_id), 1)
 
         engine.running = False
         monitor.running = False

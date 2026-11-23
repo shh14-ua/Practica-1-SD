@@ -27,6 +27,9 @@ import common
 import WM_Central as central_module
 import WM_WS_E as engine_module
 import WM_FO as fo_module
+from wm_crypto import (
+    generate_symmetric_key, seal_kafka_message, open_kafka_message, next_kafka_seq, KAFKA_KIND_EVENT
+)
 
 
 class TransactionDuplicateTests(unittest.TestCase):
@@ -187,13 +190,20 @@ class TransactionDuplicateTests(unittest.TestCase):
                     "transaction_id": "TX-KAFKA-COMMIT-01"
                 }
 
+                # El evento llega cifrado con la clave vigente de la estación (Release 2)
+                station_key = generate_symmetric_key()
+                central.station_keys["WS-01"] = station_key
+                sealed_event = seal_kafka_message(station_key, KAFKA_KIND_EVENT, "WS-01",
+                                                  {k: v for k, v in event.items() if k != "ws"},
+                                                  next_kafka_seq(0))
+
                 class ScriptedConsumer:
                     def __init__(self, should_stop_after_commit: bool):
                         self.committed = 0
                         self.should_stop_after_commit = should_stop_after_commit
 
                     def __iter__(self):
-                        msg = type("Msg", (), {"value": event})()
+                        msg = type("Msg", (), {"value": sealed_event})()
                         yield msg
 
                     def commit(self):
@@ -304,8 +314,11 @@ class TransactionDuplicateTests(unittest.TestCase):
         """WSEngine propaga el mismo transaction_id en STARTED y FINISHED, y reintenta FINISHED si Kafka falla temporalmente."""
         sent_events = []
         kafka_available = {"ok": True}
+        station_key = generate_symmetric_key()
 
-        def fake_send_kafka(prod, topic, payload, **kw):
+        def fake_send_kafka(prod, topic, message, **kw):
+            # Los eventos viajan cifrados: se descifran con la clave de la estación
+            payload, _ = open_kafka_message(station_key, message, KAFKA_KIND_EVENT, "WS-01")
             if payload.get("type") == "FINISHED" and not kafka_available["ok"]:
                 return False
             sent_events.append(payload)
@@ -318,6 +331,7 @@ class TransactionDuplicateTests(unittest.TestCase):
             engine.ws_id = "WS-01"
             engine.monitor_connected = True
             engine.central_connected = True
+            engine.symmetric_key = station_key  # estación autenticada (clave recibida del Monitor)
 
             # Iniciar riego con transaction_id asignado por Central (duración=0 para control manual en el test)
             engine.start_watering("FO-01", 0, transaction_id="TX-ENGINE-001")

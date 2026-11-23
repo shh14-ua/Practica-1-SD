@@ -8,6 +8,9 @@ Funcionalidades:
   - Simulación de actuador (electroválvula) y caudalímetro (flujo ~8-12 L/min).
   - Publicación periódica (cada segundo) de telemetría por Apache Kafka (ws_events).
   - Recepción de órdenes centrales por Kafka (ws_commands): START, STOP, BLOCK, ACTIVATE.
+  - Release 2: todos los mensajes Kafka con Central van cifrados y autenticados con la clave
+    simétrica de la WS (recibida del Monitor). Se rechazan órdenes manipuladas, de otra WS,
+    cifradas con otra clave o repetidas (número de secuencia persistido por clave).
   - Control manual interactivo desde la propia estación: iniciar riego manual y finalizar suministro.
 """
 
@@ -32,11 +35,19 @@ from common import (
     make_producer, send_kafka, make_consumer,
     COLOR_BOLD, COLOR_RESET
 )
-from wm_crypto import encrypt_message, decrypt_message, is_encrypted
+from wm_crypto import (
+    require_cryptography, is_valid_symmetric_key, key_fingerprint,
+    seal_kafka_message, open_kafka_message, next_kafka_seq, KAFKA_KIND_COMMAND, KAFKA_KIND_EVENT
+)
+
+# Último número de secuencia de órdenes aceptado, por clave (solo su huella), para que tras
+# reiniciar el Engine con la misma clave no se acepten órdenes repetidas
+DEFAULT_STATE_DIR = os.getenv("WM_ENGINE_STATE_DIR", os.path.join(ROOT_DIR, "WM_WS", ".engine_state"))
 
 class WSEngine:
-    def __init__(self, kafka_bootstrap: str, monitor_addr: str):
+    def __init__(self, kafka_bootstrap: str, monitor_addr: str, state_dir: Optional[str] = None):
         self.kafka_bootstrap = kafka_bootstrap
+        self.state_dir = state_dir
         self.monitor_host, self.monitor_port = parse_addr(monitor_addr)
         self.lock = threading.RLock()
         self.event_lock = threading.RLock()
@@ -53,6 +64,13 @@ class WSEngine:
         self.monitor_connected = False
         self.central_connected = True
         self.symmetric_key: Optional[str] = None  # Clave simétrica para cifrado (Release 2)
+        self._last_cmd_seq = 0   # último seq de orden aceptado con la clave vigente
+        self._last_evt_seq = 0   # último seq de evento emitido
+        self._reject_log_ts: dict = {}
+        # FINISHED publicados que Central aún no ha confirmado (ACK_FINISHED) {transaction_id: resumen}.
+        # Si la clave cambia antes de la confirmación, vuelven a la cola de pendientes y se
+        # reenvían cifrados con la clave nueva (Central descarta los duplicados por transaction_id).
+        self._unconfirmed_finished: dict = {}
 
         # Variables de telemetría durante el riego
         self.current_op: Optional[str] = None
@@ -77,23 +95,127 @@ class WSEngine:
         print(f"[{time.strftime('%H:%M:%S')}] [ENGINE {id_str}] {msg}", flush=True)
 
     def send_event(self, ev_type: str, **extra) -> bool:
+        """Publica un evento en ws_events cifrado y autenticado con la clave de la WS.
+        Sin clave vigente no se publica nada (nunca en claro): devuelve False y los FINISHED
+        quedan pendientes para reenviarse cuando llegue una clave nueva."""
         with self.event_lock:
-            if not self.ws_id:
+            with self.lock:
+                ws_id, key = self.ws_id, self.symmetric_key
+            if not ws_id or not key:
                 return False
 
-            payload = {
-                "type": ev_type,
-                "ws": self.ws_id,
-                "timestamp": time.time(),
-                **extra
-            }
+            payload = {"type": ev_type, "timestamp": time.time(), **extra}
+            self._last_evt_seq = next_kafka_seq(self._last_evt_seq)
+            message = seal_kafka_message(key, KAFKA_KIND_EVENT, ws_id, payload, self._last_evt_seq)
+            sent = send_kafka(self.producer, TOPIC_EVENTS, message)
+            if sent and ev_type == "FINISHED" and extra.get("transaction_id"):
+                with self.lock:
+                    self._unconfirmed_finished[extra["transaction_id"]] = dict(extra)
+            return sent
 
-            # Si la estación tiene clave simétrica activa, añadimos el bloque cifrado (Release 2)
-            if self.symmetric_key:
-                raw_json = json.dumps(payload)
-                payload["encrypted"] = encrypt_message(self.symmetric_key, raw_json)
+    def _requeue_unconfirmed_finished_locked(self):
+        """Pasa a la cola de pendientes los FINISHED sin confirmar (se llama al cambiar de clave:
+        los enviados con la clave anterior pueden no haber llegado a procesarse en Central)."""
+        for tx_id, summary in self._unconfirmed_finished.items():
+            if not any(p.get("transaction_id") == tx_id for p in self.pending_finished_events):
+                self.pending_finished_events.append(dict(summary))
+        self._unconfirmed_finished.clear()
 
-            return send_kafka(self.producer, TOPIC_EVENTS, payload)
+    def _confirm_finished(self, tx_id: str):
+        """Central confirmó el registro del FINISHED: deja de conservarse para reenvío."""
+        with self.lock:
+            known = self._unconfirmed_finished.pop(tx_id, None) is not None
+            before = len(self.pending_finished_events)
+            self.pending_finished_events = [p for p in self.pending_finished_events
+                                            if p.get("transaction_id") != tx_id]
+            known = known or len(self.pending_finished_events) != before
+            if self.last_interrupted_summary and self.last_interrupted_summary.get("transaction_id") == tx_id:
+                self.last_interrupted_summary = None
+        if known:
+            self.log(f"Central confirmó el registro del riego (transaction_id={tx_id}).")
+
+    # --------------------------------------------------------------------------
+    # CLAVE SIMÉTRICA Y PROTECCIÓN FRENTE A ÓRDENES REPETIDAS
+    # --------------------------------------------------------------------------
+    def _state_file(self) -> str:
+        return os.path.join(self.state_dir or DEFAULT_STATE_DIR, f"{self.ws_id}.json")
+
+    def _load_last_cmd_seq(self, key: str) -> int:
+        """Último seq de orden aceptado con esta clave en una ejecución anterior (0 si no consta)."""
+        try:
+            with open(self._state_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("key_id") == key_fingerprint(key):
+                return int(data.get("last_cmd_seq", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return 0
+
+    def _save_last_cmd_seq(self, key: str, seq: int):
+        """Guarda de forma atómica (0600) la huella de la clave y el último seq aceptado."""
+        path = self._state_file()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"key_id": key_fingerprint(key), "last_cmd_seq": int(seq)}, f)
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.log(f"Aviso: no se pudo guardar el estado de órdenes aceptadas ({exc}).")
+
+    def _set_key(self, key: str) -> bool:
+        if not is_valid_symmetric_key(key):
+            self.log("Clave simétrica recibida del Monitor NO válida: se ignora.")
+            return False
+        with self.lock:
+            if key != self.symmetric_key:
+                self.symmetric_key = key
+                self._last_cmd_seq = self._load_last_cmd_seq(key)
+                self._requeue_unconfirmed_finished_locked()
+            has_pending = bool(self.pending_finished_events)
+        self.log(f"Clave simétrica recibida del Monitor ({key[:10]}...). Canal Kafka cifrado activado.")
+        if has_pending:
+            self.trigger_flush_pending()  # reenvía con la clave nueva los FINISHED no confirmados
+        return True
+
+    def _clear_key(self):
+        with self.lock:
+            had_key = self.symmetric_key is not None
+            self.symmetric_key = None
+            self._last_cmd_seq = 0
+            self._requeue_unconfirmed_finished_locked()
+        if had_key:
+            self.log("Clave simétrica ELIMINADA por el Monitor (revocación o baja). "
+                     "No se aceptan órdenes ni nuevos riegos hasta recibir una clave nueva.")
+
+    def _log_rejected_command(self, reason: str):
+        """Informa de órdenes rechazadas como máximo una vez cada 10 s por motivo."""
+        now = time.time()
+        if now - self._reject_log_ts.get(reason, 0.0) >= 10.0:
+            self._reject_log_ts[reason] = now
+            self.log(f"Orden Kafka RECHAZADA ({reason}).")
+
+    def _open_command(self, message: dict) -> Optional[dict]:
+        """Descifra y valida una orden de ws_commands dirigida a esta WS. Devuelve su contenido
+        o None si no es auténtica, no tiene clave vigente o es repetida/antigua."""
+        with self.lock:
+            key, last = self.symmetric_key, self._last_cmd_seq
+        if not key:
+            self._log_rejected_command("SIN_CLAVE")
+            return None
+        inner, reason = open_kafka_message(key, message, KAFKA_KIND_COMMAND, self.ws_id)
+        if inner is None:
+            self._log_rejected_command(reason)
+            return None
+        seq = inner["seq"]
+        with self.lock:
+            if self.symmetric_key != key or seq <= self._last_cmd_seq:
+                self._log_rejected_command("REPETIDO" if self.symmetric_key == key else "CLAVE_CAMBIADA")
+                return None
+            self._last_cmd_seq = seq
+        self._save_last_cmd_seq(key, seq)
+        return inner
 
     def trigger_flush_pending(self):
         """Lanza el vaciado de eventos pendientes en segundo plano sin bloquear el hilo del socket."""
@@ -158,9 +280,10 @@ class WSEngine:
             return "OK"
 
         if cmd == "SET_KEY" and len(parts) >= 2:
-            with self.lock:
-                self.symmetric_key = parts[1].strip()
-            self.log(f"Clave simétrica recibida del Monitor ({self.symmetric_key[:10]}...). Canal cifrado activado.")
+            return "OK" if self._set_key(parts[1].strip()) else "KO"
+
+        if cmd == "CLEAR_KEY":
+            self._clear_key()
             return "OK"
 
         if cmd == "HEALTH":
@@ -259,6 +382,10 @@ class WSEngine:
                 return
             if not self.central_connected:
                 self.log("ERROR: Imposible conectar con WM_Central. No se admiten nuevos riegos.")
+                return
+            if not self.symmetric_key:
+                self.log("No se admiten riegos: la estación no tiene clave simétrica vigente "
+                         "(sin autenticar o claves revocadas por CENTRAL).")
                 return
             if self.is_ko:
                 self.log("AVERIADA: No se puede iniciar riego: sensor en estado de avería (KO).")
@@ -466,12 +593,14 @@ class WSEngine:
                 for msg in consumer:
                     if not self.running:
                         break
-                    data = msg.value
-                    if not isinstance(data, dict):
+                    if not isinstance(msg.value, dict):
                         continue
 
-                    target_ws = str(data.get("ws", "")).strip().upper()
+                    target_ws = str(msg.value.get("ws", "")).strip().upper()
                     if target_ws != self.ws_id:
+                        continue
+                    data = self._open_command(msg.value)
+                    if data is None:
                         continue
 
                     cmd = str(data.get("cmd", "")).strip().upper()
@@ -504,6 +633,11 @@ class WSEngine:
                             self.pending_weather_block = False
                         self.finish_watering("CENTRAL_BLOCK")
                         self.log("Estación puesta FUERA DE SERVICIO por orden de CENTRAL")
+
+                    elif cmd == "ACK_FINISHED":
+                        tx_ack = data.get("transaction_id")
+                        if tx_ack:
+                            self._confirm_finished(str(tx_ack))
 
                     elif cmd == "ACTIVATE":
                         with self.lock:
@@ -599,6 +733,12 @@ class WSEngine:
 # ENTRADA PRINCIPAL
 # ==============================================================================
 def main():
+    try:
+        require_cryptography()
+    except RuntimeError as exc:
+        print(f"[ENGINE] ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     parser = argparse.ArgumentParser(
         description="WM_WS_E: Motor de la Estación de Riego (Watering Station Engine)."
     )

@@ -33,7 +33,9 @@ case $MODO in
     ;;
   engine)
     echo "Iniciando WM_WS_E (Engine) en contenedor Docker..."
-    docker run --rm $TTY_FLAG --network=host $IMAGE_NAME python WM_WS/WM_WS_E.py "$@"
+    # data/engine_state conserva entre reinicios el último número de secuencia de órdenes aceptado
+    docker run --rm $TTY_FLAG --network=host -v "$(pwd)/data/engine_state:/data/engine_state" \
+      -e WM_ENGINE_STATE_DIR=/data/engine_state $IMAGE_NAME python WM_WS/WM_WS_E.py "$@"
     ;;
   fo)
     echo "Iniciando WM_FO (Field Operator) en contenedor Docker..."

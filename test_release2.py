@@ -41,7 +41,7 @@ def run_tests():
     # --------------------------------------------------------------------------
     # PRUEBA 1: Criptografía simétrica (wm_crypto)
     # --------------------------------------------------------------------------
-    print("\n[TEST 1] Verificando cifrado y descifrado simétrico con HMAC-SHA256...")
+    print("\n[TEST 1] Verificando cifrado y descifrado simétrico autenticado (Fernet)...")
     key = generate_symmetric_key()
     original_msg = "PING#WS-99#OK#SENSOR_OK"
     encrypted_msg = encrypt_message(key, original_msg)

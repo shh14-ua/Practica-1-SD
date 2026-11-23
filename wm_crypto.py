@@ -4,20 +4,23 @@ wm_crypto.py: Utilidades criptográficas para la práctica Water Management (Rel
 Proporciona:
   - Generación de credenciales seguras de registro (tokens).
   - Generación de claves de cifrado simétrico únicas por estación.
-  - Cifrado y descifrado simétrico de mensajes (con soporte para Fernet/AES y fallback puro).
+  - Cifrado simétrico autenticado de mensajes (exclusivamente Fernet, librería 'cryptography').
+  - Mensajes Kafka cifrados entre WM_Central y WM_WS_E (formato, tipo, WS y número de secuencia).
   - Generación automática de certificados SSL autofirmados para el canal seguro HTTPS de WM_Registry.
   - Generación del certificado TLS (con nombres SAN) del canal seguro WM_Central <-> WM_WS_M.
 """
 
 import base64
 import hashlib
-import hmac
+import json
 import os
 import secrets
 import ssl
+import time
 from typing import Optional, Tuple
 
-# Intentamos importar cryptography si está disponible
+# 'cryptography' es obligatoria para cifrar (ver require_cryptography); la importación no falla
+# aquí para que los módulos que no cifran (p. ej. la generación de credenciales) puedan cargarse.
 try:
     from cryptography.fernet import Fernet
     _HAS_CRYPTOGRAPHY = True
@@ -39,112 +42,66 @@ def generate_credential(prefix: str = "CRED") -> str:
 def generate_symmetric_key() -> str:
     """
     Genera una clave de cifrado simétrico única (32 bytes en formato base64 URL-safe).
-    Compatible con Fernet y con el cifrado simétrico integrado.
+    Formato de clave Fernet.
     """
     key_bytes = secrets.token_bytes(32)
     return base64.urlsafe_b64encode(key_bytes).decode("ascii")
 
 
 # ==============================================================================
-# 2. CIFRADO SIMÉTRICO (AES / Fernet con fallback a HMAC-SHA256 CTR)
+# 2. CIFRADO SIMÉTRICO AUTENTICADO (Fernet: AES-128-CBC + HMAC-SHA256)
 # ==============================================================================
+# Se usa exclusivamente la implementación Fernet de la librería 'cryptography'.
+# Si no está instalada no se recurre a ningún algoritmo alternativo: se lanza un error.
 
-def _derive_keys(raw_key: bytes) -> Tuple[bytes, bytes]:
-    """Deriva dos claves de 32 bytes (cifrado y autenticación) usando SHA-256."""
-    enc_key = hashlib.sha256(raw_key + b":enc").digest()
-    auth_key = hashlib.sha256(raw_key + b":auth").digest()
-    return enc_key, auth_key
-
-
-def _keystream_block(enc_key: bytes, nonce: bytes, counter: int) -> bytes:
-    """Genera un bloque de flujo pseudoaleatorio usando HMAC-SHA256."""
-    counter_bytes = counter.to_bytes(8, byteorder="big")
-    return hmac.new(enc_key, nonce + counter_bytes, hashlib.sha256).digest()
+class CryptoUnavailableError(RuntimeError):
+    """Falta la librería 'cryptography', imprescindible para el cifrado simétrico."""
 
 
-def _xor_crypt(data: bytes, enc_key: bytes, nonce: bytes) -> bytes:
-    """Cifra o descifra datos mediante XOR con un keystream basado en HMAC-SHA256 CTR."""
-    output = bytearray(len(data))
-    block_size = 32
-    for offset in range(0, len(data), block_size):
-        counter = offset // block_size
-        stream = _keystream_block(enc_key, nonce, counter)
-        chunk = data[offset:offset + block_size]
-        for i in range(len(chunk)):
-            output[offset + i] = chunk[i] ^ stream[i]
-    return bytes(output)
+def require_cryptography():
+    """Comprueba que el cifrado Fernet está disponible (llamar al arrancar cada módulo)."""
+    if not _HAS_CRYPTOGRAPHY:
+        raise CryptoUnavailableError(
+            "Falta la librería 'cryptography' (cifrado Fernet). Instálela con: pip install -r requirements.txt"
+        )
+
+
+def is_valid_symmetric_key(key_str: Optional[str]) -> bool:
+    """Indica si la cadena es una clave Fernet válida (32 bytes en base64 URL-safe)."""
+    require_cryptography()
+    try:
+        Fernet(key_str.encode("ascii"))
+        return True
+    except Exception:
+        return False
 
 
 def encrypt_message(key_str: str, plaintext: str) -> str:
     """
-    Cifra un mensaje de texto plano con la clave simétrica especificada.
-    Devuelve una cadena prefijada con 'ENC:' y el contenido en base64.
+    Cifra y autentica un mensaje con la clave simétrica (Fernet).
+    Devuelve una cadena prefijada con 'ENC:' seguida del token Fernet.
+    Lanza ValueError si la clave no es válida.
     """
     if not plaintext:
         return ""
-
-    raw_data = plaintext.encode("utf-8")
-
-    if _HAS_CRYPTOGRAPHY and Fernet is not None:
-        try:
-            f = Fernet(key_str.encode("ascii"))
-            token = f.encrypt(raw_data)
-            return "ENC:" + token.decode("ascii")
-        except Exception:
-            pass
-
-    # Fallback criptográfico estándar (HMAC-SHA256 CTR + Tag de integridad)
-    raw_key = base64.urlsafe_b64decode(key_str.encode("ascii"))
-    enc_key, auth_key = _derive_keys(raw_key)
-
-    nonce = secrets.token_bytes(16)
-    ciphertext = _xor_crypt(raw_data, enc_key, nonce)
-    tag = hmac.new(auth_key, nonce + ciphertext, hashlib.sha256).digest()
-
-    package = nonce + tag + ciphertext
-    b64 = base64.urlsafe_b64encode(package).decode("ascii")
-    return f"ENC:{b64}"
+    require_cryptography()
+    token = Fernet(key_str.encode("ascii")).encrypt(plaintext.encode("utf-8"))
+    return "ENC:" + token.decode("ascii")
 
 
 def decrypt_message(key_str: str, cipher_str: str) -> Optional[str]:
     """
-    Descifra un mensaje previamente cifrado con encrypt_message.
-    Devuelve el texto plano original o None si la clave o el mensaje son inválidos.
+    Descifra un mensaje cifrado con encrypt_message verificando su integridad.
+    Devuelve el texto original o None si la clave es incorrecta o el mensaje fue manipulado.
     """
     if not cipher_str:
         return ""
-
     if not cipher_str.startswith("ENC:"):
         return None  # No es un mensaje cifrado reconocido
-
-    payload = cipher_str[4:]
-
-    if _HAS_CRYPTOGRAPHY and Fernet is not None:
-        try:
-            f = Fernet(key_str.encode("ascii"))
-            raw = f.decrypt(payload.encode("ascii"), ttl=None)
-            return raw.decode("utf-8", errors="replace")
-        except Exception:
-            pass
-
+    require_cryptography()
     try:
-        package = base64.urlsafe_b64decode(payload.encode("ascii"))
-        if len(package) < 48:  # 16 nonce + 32 tag
-            return None
-
-        nonce = package[:16]
-        expected_tag = package[16:48]
-        ciphertext = package[48:]
-
-        raw_key = base64.urlsafe_b64decode(key_str.encode("ascii"))
-        enc_key, auth_key = _derive_keys(raw_key)
-
-        actual_tag = hmac.new(auth_key, nonce + ciphertext, hashlib.sha256).digest()
-        if not hmac.compare_digest(expected_tag, actual_tag):
-            return None  # Mensaje manipulado o clave incorrecta
-
-        plaintext_bytes = _xor_crypt(ciphertext, enc_key, nonce)
-        return plaintext_bytes.decode("utf-8", errors="replace")
+        raw = Fernet(key_str.encode("ascii")).decrypt(cipher_str[4:].encode("ascii"))
+        return raw.decode("utf-8")
     except Exception:
         return None
 
@@ -152,6 +109,65 @@ def decrypt_message(key_str: str, cipher_str: str) -> Optional[str]:
 def is_encrypted(message: str) -> bool:
     """Indica si una cadena tiene el formato de un mensaje cifrado."""
     return isinstance(message, str) and message.startswith("ENC:")
+
+
+# ------------------------------------------------------------------------------
+# Mensajes Kafka cifrados entre WM_Central y WM_WS_E (ws_commands / ws_events)
+# ------------------------------------------------------------------------------
+# Formato en Kafka: {"ws": "<WS>", "enc": "ENC:<token Fernet>"}. El identificador de la WS
+# va visible solo para elegir la clave; dentro del cifrado viaja el mensaje completo con:
+#   kind -> "cmd" (Central -> Engine) o "evt" (Engine -> Central): evita reinyectar un sentido en el otro.
+#   ws   -> debe coincidir con el identificador visible.
+#   seq  -> número creciente del emisor; el receptor rechaza los que no superen al último aceptado.
+KAFKA_KIND_COMMAND = "cmd"
+KAFKA_KIND_EVENT = "evt"
+KAFKA_OUTER_FIELDS = frozenset({"ws", "enc"})  # únicos campos visibles admitidos en Kafka
+
+
+def next_kafka_seq(last_seq: int) -> int:
+    """Siguiente número de secuencia: creciente y basado en el reloj del propio emisor
+    (el receptor solo compara con mensajes anteriores del mismo emisor, nunca entre relojes)."""
+    return max(int(last_seq) + 1, time.time_ns())
+
+
+def seal_kafka_message(key_str: str, kind: str, ws_id: str, payload: dict, seq: int) -> dict:
+    """Construye el mensaje Kafka cifrado y autenticado."""
+    inner = dict(payload)
+    inner.update({"kind": kind, "ws": ws_id, "seq": int(seq)})
+    return {"ws": ws_id, "enc": encrypt_message(key_str, json.dumps(inner, separators=(",", ":")))}
+
+
+def open_kafka_message(key_str: str, message, kind: str, ws_id: str) -> Tuple[Optional[dict], str]:
+    """
+    Descifra y valida un mensaje Kafka. Devuelve (contenido, "") si es auténtico y va dirigido
+    a ws_id con el tipo esperado; si no, (None, motivo). La comprobación de 'seq' frente al
+    último aceptado corresponde al receptor.
+    """
+    if not isinstance(message, dict) or not is_encrypted(message.get("enc")):
+        return None, "NO_CIFRADO"
+    if set(message) != KAFKA_OUTER_FIELDS:
+        return None, "CAMPOS_EXTRA"  # ningún dato adicional puede viajar en claro
+    if str(message.get("ws", "")).strip().upper() != ws_id:
+        return None, "OTRA_WS"
+    plain = decrypt_message(key_str, message["enc"])
+    if plain is None:
+        return None, "CLAVE_O_INTEGRIDAD"
+    try:
+        inner = json.loads(plain)
+    except ValueError:
+        return None, "FORMATO"
+    if not isinstance(inner, dict) or not isinstance(inner.get("seq"), int):
+        return None, "FORMATO"
+    if inner.get("kind") != kind:
+        return None, "TIPO"
+    if str(inner.get("ws", "")).strip().upper() != ws_id:
+        return None, "OTRA_WS"
+    return inner, ""
+
+
+def key_fingerprint(key_str: str) -> str:
+    """Huella SHA-256 de una clave (permite asociar datos a una clave sin almacenarla)."""
+    return hashlib.sha256(key_str.encode("ascii")).hexdigest()
 
 
 # ==============================================================================

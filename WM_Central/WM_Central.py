@@ -42,7 +42,8 @@ from common import (
 )
 from wm_crypto import (
     generate_symmetric_key, encrypt_message, decrypt_message, is_encrypted,
-    ensure_tls_certificate
+    ensure_tls_certificate, require_cryptography,
+    seal_kafka_message, open_kafka_message, next_kafka_seq, KAFKA_KIND_COMMAND, KAFKA_KIND_EVENT
 )
 
 class WMCentral:
@@ -70,6 +71,14 @@ class WMCentral:
 
         # Auditoría estructurada (Release 2)
         self.recent_audits: List[Dict[str, Any]] = []
+
+        # Canal Kafka cifrado con los Engine (Release 2): números de secuencia por estación.
+        # _cmd_seq: último enviado en ws_commands; _evt_seq: último aceptado en ws_events (clave vigente).
+        self.kafka_cmd_lock = threading.Lock()
+        self._cmd_seq: Dict[str, int] = {}
+        self._evt_seq: Dict[str, int] = {}
+        # Limitación de la auditoría de mensajes rechazados {(entidad, motivo): [último_registro, omitidos]}
+        self._kafka_reject_audit: Dict[tuple, list] = {}
 
         # Alertas meteorológicas activas (Release 2 - WM_W) {ws_id: alert_info}
         self.weather_alerts: Dict[str, Dict[str, Any]] = {}
@@ -396,6 +405,7 @@ class WMCentral:
                 if not st.get("keys_revoked"):
                     st["oos_before_revocation"] = (old_status == STATUS_OUT_OF_SERVICE)
                 st["keys_revoked"] = True
+                self._evt_seq.pop(clean_id, None)
                 self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
                 self._update_station_db(clean_id, status=STATUS_OUT_OF_SERVICE)
 
@@ -534,10 +544,73 @@ class WMCentral:
 
     #permite que Central envíe órdenes a los Engine de las estaciones mediante Kafka,
     #utilizando el tópico ws_commands.
-    def send_ws_command(self, ws_id: str, cmd: str, **extra):
-        """Envía una orden al motor de la estación vía Kafka (Tópico ws_commands)."""
-        payload = {"ws": ws_id, "cmd": cmd, "timestamp": time.time(), **extra}
-        send_kafka(self.producer, TOPIC_COMMANDS, payload)
+    def send_ws_command(self, ws_id: str, cmd: str, **extra) -> bool:
+        """Envía una orden al motor de la estación vía Kafka (Tópico ws_commands), cifrada y
+        autenticada con la clave simétrica de esa WS. Sin clave vigente (no autenticada o claves
+        revocadas) la orden no se envía: el Engine no podría ni debería aceptarla."""
+        payload = {"cmd": cmd, "timestamp": time.time(), **extra}
+        with self.kafka_cmd_lock:
+            key = self.station_keys.get(ws_id)
+            if key:
+                # Número de secuencia y envío bajo el mismo cerrojo: el orden en Kafka es el de los seq
+                seq = next_kafka_seq(self._cmd_seq.get(ws_id, 0))
+                self._cmd_seq[ws_id] = seq
+                message = seal_kafka_message(key, KAFKA_KIND_COMMAND, ws_id, payload, seq)
+                return send_kafka(self.producer, TOPIC_COMMANDS, message)
+        self.log(f"Orden {cmd} NO enviada al Engine: la estación no tiene clave simétrica vigente", ws_id=ws_id)
+        self._audit_kafka_reject(ws_id, "SIN_CLAVE", f"Orden {cmd} no enviada a {ws_id}: sin clave simétrica vigente.",
+                                 action="KAFKA_CMD_NOT_SENT")
+        return False
+
+    def _ack_finished(self, ws_id: str, tx_id: str):
+        """Confirma al Engine que su FINISHED quedó registrado. Sin clave vigente (p. ej. claves
+        revocadas) se omite sin registrarlo como error: el Engine lo conserva y lo reenviará con la
+        clave nueva tras re-autenticarse, y entonces se confirmará."""
+        if self.station_keys.get(ws_id):
+            self.send_ws_command(ws_id, "ACK_FINISHED", transaction_id=tx_id)
+
+    def _audit_kafka_reject(self, ws_id: str, reason: str, description: str,
+                            action: str = "KAFKA_REJECTED", interval: float = 30.0):
+        """Audita un mensaje Kafka rechazado (o no enviado) limitando la frecuencia: como máximo un
+        registro por estación y motivo cada 'interval' segundos, indicando cuántos se omitieron."""
+        entity = ws_id if ws_id in self.stations else "DESCONOCIDA"
+        now = time.time()
+        with self.lock:
+            entry = self._kafka_reject_audit.setdefault((entity, action, reason), [0.0, 0])
+            if now - entry[0] < interval:
+                entry[1] += 1
+                return
+            omitted = entry[1]
+            entry[0], entry[1] = now, 0
+        details = f"Motivo: {reason}"
+        if omitted:
+            details += f" | {omitted} mensajes similares omitidos en los últimos {int(interval)} s"
+        self.audit_event(entity, "KAFKA", action, description, details)
+        if action == "KAFKA_REJECTED":
+            self.log(f"{description} ({details})", ws_id=entity if entity != "DESCONOCIDA" else None)
+
+    def _process_kafka_event(self, message) -> None:
+        """Descifra y valida un mensaje de ws_events antes de procesarlo. Rechaza los mensajes en
+        claro, manipulados, cifrados con otra clave (anterior o revocada), de otra WS o repetidos.
+        El último 'seq' se actualiza solo tras procesar con éxito (permite reintentar tras un fallo)."""
+        ws_id = str(message.get("ws", "")).strip().upper() if isinstance(message, dict) else ""
+        key = self.station_keys.get(ws_id)
+        if not key:
+            self._audit_kafka_reject(ws_id, "SIN_CLAVE",
+                                     f"Evento Kafka de {ws_id or '?'} rechazado: no hay clave simétrica vigente.")
+            return
+        inner, reason = open_kafka_message(key, message, KAFKA_KIND_EVENT, ws_id)
+        if inner is None:
+            self._audit_kafka_reject(ws_id, reason, f"Evento Kafka de {ws_id} rechazado: {reason}.")
+            return
+        seq = inner["seq"]
+        if seq <= self._evt_seq.get(ws_id, 0):
+            self._audit_kafka_reject(ws_id, "REPETIDO", f"Evento Kafka de {ws_id} rechazado: mensaje repetido o antiguo.")
+            return
+        self.handle_ws_event(inner)
+        with self.lock:
+            if self.station_keys.get(ws_id) == key:
+                self._evt_seq[ws_id] = max(seq, self._evt_seq.get(ws_id, 0))
 
     #actualiza el estado de una estación
     def set_station_status(self, ws_id: str, new_status: str):
@@ -676,6 +749,7 @@ class WMCentral:
                         # Generamos clave de cifrado simétrico ÚNICA para esta WS
                         sym_key = generate_symmetric_key()
                         self.station_keys[st_id] = sym_key
+                        self._evt_seq.pop(st_id, None)  # los eventos con la clave anterior dejan de valer
 
                         station_id = st_id
                         self.station_sockets[st_id] = conn
@@ -1144,6 +1218,22 @@ class WMCentral:
                     reason=reason,
                     transaction_id=tx_id,
                 )
+                engine_tx = ev.get("transaction_id")
+
+                # FINISHED de una transacción anterior (duplicado o tardío) mientras hay otra en curso:
+                # se registra en el historial pero nunca altera el estado del riego nuevo.
+                active_tx = st.get("transaction_id")
+                if engine_tx and active_tx and tx_id != active_tx:
+                    if inserted:
+                        self.notify_operator(
+                            op_id, "SUMMARY", ws_id,
+                            f"Riego FINALIZADO ({reason}): {total_vol:.2f} L consumidos en {dur} s",
+                            total_vol=total_vol, duration=dur, reason=reason, transaction_id=tx_id
+                        )
+                    self.log(f"FINISHED de una transacción anterior (transaction_id={tx_id}) registrado sin alterar "
+                             f"el riego en curso ({active_tx})", ws_id=ws_id)
+                    self._ack_finished(ws_id, tx_id)
+                    return
 
                 # 2. Actualizar estado en memoria tras persistir con éxito
                 st["pending_start"] = False
@@ -1181,6 +1271,10 @@ class WMCentral:
                     )
                 else:
                     self.log(f"Evento FINISHED duplicado ignorado (transaction_id={tx_id})", ws_id=ws_id)
+
+                # 4. Confirmar al Engine el registro (también de duplicados) para que deje de conservarlo
+                if engine_tx:
+                    self._ack_finished(ws_id, tx_id)
 
     # --------------------------------------------------------------------------
     # CONSUMIDORES Y PUBLICADORES KAFKA
@@ -1228,8 +1322,8 @@ class WMCentral:
                 for msg in consumer:
                     if not self.running:
                         break
-                    if isinstance(msg.value, dict):
-                        self.handle_ws_event(msg.value)
+                    if msg.value is not None:
+                        self._process_kafka_event(msg.value)
                     if hasattr(consumer, "commit"):
                         consumer.commit()
             except Exception as exc:
@@ -1755,6 +1849,12 @@ class WMCentral:
 # ENTRADA PRINCIPAL
 # ==============================================================================
 def main():
+    try:
+        require_cryptography()
+    except RuntimeError as exc:
+        print(f"[CENTRAL] ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
     # Detectar puerto web automático si Railway o el entorno define PORT
     env_port = os.getenv("PORT")
     default_web = int(env_port) if env_port and env_port.isdigit() else 8080
