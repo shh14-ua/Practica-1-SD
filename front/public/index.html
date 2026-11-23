@@ -709,7 +709,7 @@
           tbody.innerHTML = stations.map(s => {
             const hasKey = Boolean(s.has_key);
             const isConnected = s.status !== "DESCONECTADA";
-            const wasRevoked = audits.some(a => a.entity === s.id && a.action === "KEY_REVOCATION") && !hasKey;
+            const isRevoked = Boolean(s.keys_revoked);  // estado real de revocación (API_Central)
 
             // 1. Estado de Registro
             const regBadge = (hasKey || isConnected)
@@ -726,10 +726,10 @@
                       : ''));
 
             // 3. Estado de Token / Clave Simétrica
-            const keyBadge = hasKey
-              ? `<span class="key-badge key-active">🔑 Token / Clave Activa (AES)</span>`
-              : (wasRevoked
-                  ? `<span class="key-badge key-revoked">🚫 Token / Clave Revocada</span>`
+            const keyBadge = isRevoked
+              ? `<span class="key-badge key-revoked">🚫 Token / Clave Revocada (pendiente de re-autenticación)</span>`
+              : (hasKey
+                  ? `<span class="key-badge key-active">🔑 Token / Clave Activa (AES)</span>`
                   : `<span class="key-badge key-revoked">⚪ Sin Token / Pendiente Auth</span>`);
 
             const alertBadge = s.weather_alert
@@ -824,9 +824,11 @@
           if (s.status === "FUGA") {
             errorItems.push(`<div class="log-line log-err">🚨 <strong>[${escapeHtml(s.id)}] ESTADO FUGA:</strong> ${escapeHtml(s.engine_reason || 'Avería o fuga detectada en la estación')}</div>`);
           } else if (s.status === "FUERA DE SERVICIO") {
-            const why = s.weather_alert
-              ? `Bloqueada por Alerta Climática (${s.weather_alert.reason})`
-              : (!s.has_key ? 'Fuera de servicio (Claves simétricas revocadas / Sin autenticar)' : 'Bloqueada por orden de Central');
+            const why = s.keys_revoked
+              ? 'Claves simétricas revocadas por Central: pendiente de re-autenticación con credencial renovada (opción k del Monitor)'
+              : (s.weather_alert
+                  ? `Bloqueada por Alerta Climática (${s.weather_alert.reason})`
+                  : 'Bloqueada por orden de Central');
             errorItems.push(`<div class="log-line log-warn">⚠️ <strong>[${escapeHtml(s.id)}] FUERA DE SERVICIO:</strong> ${escapeHtml(why)}</div>`);
           }
         });

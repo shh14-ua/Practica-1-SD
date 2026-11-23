@@ -354,10 +354,12 @@ class FakeRegistry:
     def __init__(self):
         self.lock = threading.Lock()
         self.issued = {}
+        self.counter = 0
 
     def register(self, monitor) -> bool:
         with self.lock:
-            cred = f"CRED-{monitor.ws_id}-TEST{len(self.issued) + 1:04d}"
+            self.counter += 1  # cada alta o renovación emite una credencial distinta
+            cred = f"CRED-{monitor.ws_id}-TEST{self.counter:04d}"
             self.issued[monitor.ws_id] = cred
         monitor.credential = cred
         return True
@@ -1802,7 +1804,8 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertTrue(self._wait_until(
             lambda: any(p.get("transaction_id") == tx_id for p in engine.pending_finished_events), 3),
             "El FINISHED del riego interrumpido debe quedar pendiente (no hay clave para publicarlo)")
-        self.assertEqual(self._history_count(central, tx_id), 0)
+        # Central ya consolidó el riego con el volumen conocido (motivo KEYS_REVOKED)
+        self.assertEqual(self._history_count(central, tx_id), 1)
         self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
 
         # Re-autenticación (opción 'k'): clave nueva; el FINISHED pendiente llega cifrado y se registra una vez
@@ -1869,6 +1872,294 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.running = False
         monitor.running = False
         central.running = False
+
+
+    # ------------------------------------------------------------------------------------------
+    # Release 2 - bloque 5: revocación de claves y recuperación de estaciones
+    # ------------------------------------------------------------------------------------------
+    def _disconnect_monitor_from_central(self, central, monitor):
+        """Simula un corte de red entre Monitor y Central; devuelve la función para restaurarlo."""
+        real_ensure = monitor.ensure_central_connection
+        monitor.ensure_central_connection = lambda manual=False: False
+        with monitor.central_lock:
+            monitor._close_central_sock()
+            monitor.symmetric_key = None
+        self.assertTrue(self._wait_until(lambda: "WS-01" not in central.station_sockets, 4))
+
+        def restore():
+            monitor.ensure_central_connection = real_ensure
+        return restore
+
+    def test_24_revocation_while_monitor_offline_requires_renewed_credential(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        restore = self._disconnect_monitor_from_central(central, monitor)
+        central.revoke_station_keys("WS-01")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Vuelve la red: la reconexión automática con la credencial anterior se rechaza
+        restore()
+        self.assertTrue(self._wait_until(lambda: monitor.key_revoked, 6))
+        self.assertTrue(self._wait_until(lambda: engine.symmetric_key is None and engine.state == "BLOCKED", 4),
+                        "El Engine debe borrar su clave y quedar bloqueado")
+        rejected = lambda: len([a for a in central.recent_audits if a["action"] == "REJECTED_REVOKED"])
+        n = rejected()
+        time.sleep(3.0)
+        self.assertEqual(rejected(), n, "El Monitor no debe reintentar automáticamente tras el rechazo")
+        self.assertNotIn("WS-01", central.station_keys)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Opción 'a' (misma credencial): rechazada. Opción 'k' (credencial renovada): recupera la WS
+        self.assertFalse(monitor.ensure_central_connection(manual=True))
+        self.assertNotIn("WS-01", central.station_keys)
+        monitor.reauthenticate()
+        self.assertIn("WS-01", central.station_keys)
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 8))
+        engine.running = monitor.running = central.running = False
+
+    def test_25_monitor_restart_after_revocation_does_not_bypass_it(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        monitor._save_credential(monitor.credential)  # credencial persistida como en un Monitor real
+        restore = self._disconnect_monitor_from_central(central, monitor)
+        central.revoke_station_keys("WS-01")
+        monitor.running = False
+
+        # Nuevo proceso de Monitor: carga la credencial anterior y se autentica solo -> rechazado
+        monitor2 = WM_WS_M.WSMonitor(engine_port=get_free_port(), central_addr=f"127.0.0.1:{central.socket_port}",
+                                     ws_id="WS-01", location="River Park")
+        self.active_instances.append(monitor2)
+        self.assertEqual(monitor2.credential, monitor.credential)
+        self.assertFalse(monitor2.ensure_central_connection())
+        self.assertTrue(monitor2.key_revoked)
+        self.assertNotIn("WS-01", central.station_keys)
+        monitor2.reauthenticate()
+        self.assertIn("WS-01", central.station_keys)
+        self.assertFalse(central.stations["WS-01"].get("keys_revoked", False))
+        engine.running = monitor2.running = central.running = False
+
+    def test_26_revocation_survives_central_restart_and_keeps_previous_block(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        central.block_station("WS-01")                     # bloqueo previo por orden de CENTRAL
+        central.revoke_station_keys("WS-01")
+        self.assertTrue(self._wait_until(lambda: monitor.key_revoked, 6))
+        central.running = False
+        with central._get_db() as db:
+            row = dict(db.execute("SELECT * FROM station_security WHERE ws_id='WS-01'").fetchone())
+        self.assertEqual((row["revoked"], row["central_block"]), (1, 1))
+        self.assertEqual(len(row["revoked_cred_fp"]), 64)
+        self.assertNotIn(monitor.credential, str(row), "Solo se guardan huellas, nunca la credencial")
+
+        # Reinicio de Central con la misma base de datos
+        port2 = get_free_port()
+        central2 = WM_Central.WMCentral(socket_port=port2, kafka_bootstrap="localhost:9092",
+                                        web_port=0, db_path=self.temp_db.name)
+        self.active_instances.append(central2)
+        threading.Thread(target=central2.run_socket_server, daemon=True).start()
+        self.assertTrue(self._wait_until(lambda: port2 in self.socket_hub.servers, 3),
+                        "El servidor de sockets de la nueva Central debe estar escuchando")
+        st = central2.stations["WS-01"]
+        self.assertEqual(st["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertTrue(st.get("keys_revoked") and st.get("central_block"))
+
+        monitor.central_port = port2
+        self.assertFalse(monitor.ensure_central_connection(manual=True), "La credencial anterior sigue rechazada")
+        self.assertNotIn("WS-01", central2.station_keys)
+        monitor.reauthenticate()
+        self.assertIn("WS-01", central2.station_keys)
+        time.sleep(1.5)
+        self.assertEqual(central2.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE,
+                         "Se conserva el bloqueo previo de CENTRAL tras la re-autenticación")
+        with central2._get_db() as db:
+            self.assertEqual(db.execute("SELECT revoked FROM station_security WHERE ws_id='WS-01'").fetchone()[0], 0)
+        engine.running = monitor.running = central2.running = False
+
+    def test_27_revocation_during_watering_closes_transaction_and_late_finished_updates_it(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        central.request_watering("FO-01", "WS-01", 30)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        time.sleep(2.5)
+        n = len(self._kafka_msgs(common.TOPIC_REPLIES))
+
+        central.revoke_station_keys("WS-01")
+        replies = [m for m in self._kafka_msgs(common.TOPIC_REPLIES)[n:] if m.get("ws") == "WS-01"]
+        summaries = [m for m in replies if m.get("type") == "SUMMARY"]
+        self.assertEqual(len(summaries), 1, "El operario debe recibir el resumen del riego interrumpido")
+        self.assertEqual((summaries[0]["reason"], summaries[0]["transaction_id"]), ("KEYS_REVOKED", tx_id))
+        with central._get_db() as db:
+            row = db.execute("SELECT reason, total_vol FROM watering_history WHERE transaction_id=?", (tx_id,)).fetchone()
+        self.assertEqual(row["reason"], "KEYS_REVOKED")
+        first_vol = row["total_vol"]
+        st = central.stations["WS-01"]
+        self.assertEqual((st["operator"], st["transaction_id"]), (None, None))
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 8), "La válvula debe cerrarse")
+
+        # Re-autenticación: el FINISHED tardío actualiza la misma transacción, sin duplicados ni nuevo resumen
+        monitor.reauthenticate()
+        self.assertTrue(self._wait_until(lambda: tx_id not in engine._unconfirmed_finished
+                                         and not engine.pending_finished_events, 8))
+        with central._get_db() as db:
+            rows = db.execute("SELECT total_vol FROM watering_history WHERE transaction_id=?", (tx_id,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertGreaterEqual(rows[0]["total_vol"], first_vol)
+        later = [m for m in self._kafka_msgs(common.TOPIC_REPLIES)[n:]
+                 if m.get("type") in ("SUMMARY", "DENY") and m.get("transaction_id") == tx_id]
+        self.assertEqual(len(later), 1, "Ningún mensaje posterior al operario sobre esa transacción")
+        engine.running = monitor.running = central.running = False
+
+
+    def test_28_revocation_during_monitor_central_partition_stops_engine_by_kafka(self):
+        """Corte Monitor-Central que Central aún no ha detectado: el Monitor no puede recibir REVOKED,
+        pero el BLOCK cifrado por Kafka (enviado antes de borrar la clave) detiene el riego. Al volver
+        la red, la opción 'k' recupera la estación y el Engine vuelve a servicio."""
+        central, monitor, engine = self._start_cluster("WS-01")
+        central.request_watering("FO-01", "WS-01", 30)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        time.sleep(1.5)
+
+        real_send, real_ensure = monitor.send_to_central, monitor.ensure_central_connection
+        monitor.send_to_central = lambda msg: False
+        monitor.ensure_central_connection = lambda manual=False: False
+        self.assertTrue(self._wait_until(lambda: not engine.central_connected, 4))
+        self.assertEqual(engine.state, "WATERING", "Release 1: sin Central el riego en curso continúa")
+        self.assertIn("WS-01", central.station_sockets, "Central aún no ha detectado el corte")
+
+        central.revoke_station_keys("WS-01")
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 3),
+                        "El BLOCK por Kafka debe detener el riego aunque el Monitor no reciba REVOKED")
+        self.assertFalse(monitor.key_revoked)
+        self.assertEqual(self._history_count(central, tx_id), 1)
+
+        # Vuelve la red y el operario usa 'k' de inmediato (antes de cualquier reintento automático)
+        with monitor.central_lock:
+            monitor.send_to_central, monitor.ensure_central_connection = real_send, real_ensure
+            monitor._close_central_sock()
+            monitor.symmetric_key = None
+            monitor.reauthenticate()
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 8),
+            f"Central={central.stations['WS-01']['status']} Engine={engine.state}")
+        self.assertTrue(self._wait_until(lambda: tx_id not in engine._unconfirmed_finished
+                                         and not engine.pending_finished_events, 6))
+        self.assertEqual(self._history_count(central, tx_id), 1)
+        engine.running = monitor.running = central.running = False
+
+    def test_29_weather_cancellation_keeps_manual_block(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        # Bloqueo manual + alerta + cancelación: sigue FUERA DE SERVICIO hasta activar
+        central.block_station("WS-01")
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        time.sleep(1.0)
+        self.assertEqual(engine.state, "BLOCKED")
+        central.activate_station("WS-01")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 4))
+
+        # Solo alerta + cancelación: se restaura (comportamiento anterior)
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 4))
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 4))
+
+        # Alerta y después bloqueo manual: la cancelación tampoco lo levanta
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        central.block_station("WS-01")
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Revocada con bloqueo manual y alerta: tras 'k' sigue bloqueada; cancelada la alerta, también
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        central.revoke_station_keys("WS-01")
+        self.assertTrue(self._wait_until(lambda: monitor.key_revoked, 6))
+        monitor.reauthenticate()
+        self.assertIn("WS-01", central.station_keys)
+        time.sleep(1.0)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        time.sleep(1.0)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE,
+                         "El bloqueo manual se conserva tras revocar, re-autenticar y cancelar la alerta")
+        self.assertEqual(engine.state, "BLOCKED")
+        central.activate_station("WS-01")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 6))
+        engine.running = monitor.running = central.running = False
+
+
+    def _deregister(self, monitor):
+        """Opción 'b' del Monitor (el arnés no levanta el Registry HTTPS: se simula su respuesta)."""
+        monitor._registry_request = lambda method, path, body: (200, {"status": "ok"})
+        self.assertTrue(monitor.deregister_from_registry())
+
+    def test_30_deregistration_during_watering_stops_it_like_release_1(self):
+        from wm_crypto import KAFKA_KIND_COMMAND
+        central, monitor, engine = self._start_cluster("WS-01")
+        key = central.station_keys["WS-01"]
+        central.request_watering("FO-01", "WS-01", 30)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        tx_id = central.stations["WS-01"]["transaction_id"]
+        time.sleep(1.5)
+        n_replies = len(self._kafka_msgs(common.TOPIC_REPLIES))
+        n_cmds = len(self._kafka_msgs(common.TOPIC_COMMANDS))
+
+        self._deregister(monitor)
+        self.assertTrue(self._wait_until(lambda: engine.state != "WATERING", 1.5),
+                        "La baja del Monitor debe interrumpir el riego (Release 1)")
+        self.assertIsNone(engine.symmetric_key)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_OFFLINE, 3))
+        with central._get_db() as db:
+            row = db.execute("SELECT reason, total_vol FROM watering_history WHERE transaction_id=?", (tx_id,)).fetchone()
+        self.assertEqual(row["reason"], "MONITOR_DOWN")
+        summaries = [m for m in self._kafka_msgs(common.TOPIC_REPLIES)[n_replies:]
+                     if m.get("type") == "SUMMARY" and m.get("transaction_id") == tx_id]
+        self.assertEqual(len(summaries), 1)
+        stops = [open_kafka_message(key, m, KAFKA_KIND_COMMAND, "WS-01")[0]["cmd"]
+                 for m in self._kafka_msgs(common.TOPIC_COMMANDS)[n_cmds:]]
+        self.assertIn("STOP", stops, "Central envía STOP por Kafka; el Engine ya lo había detenido")
+        self.assertTrue(self._wait_until(
+            lambda: [(p["transaction_id"], p["reason"]) for p in engine.pending_finished_events]
+            == [(tx_id, "KEYS_CLEARED")], 3))
+        time.sleep(1.0)
+        self.assertNotEqual(engine.state, "WATERING")
+
+        # Nueva alta ('r') y autenticación: el FINISHED pendiente actualiza la misma transacción
+        monitor.register_in_registry()
+        monitor.deregistered = False
+        self.assertTrue(self._wait_until(lambda: engine.symmetric_key == central.station_keys.get("WS-01"), 6))
+        self.assertTrue(self._wait_until(lambda: not engine.pending_finished_events
+                                         and tx_id not in engine._unconfirmed_finished, 6))
+        with central._get_db() as db:
+            rows = db.execute("SELECT reason, total_vol FROM watering_history WHERE transaction_id=?",
+                              (tx_id,)).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["reason"], "MONITOR_DOWN")
+        self.assertGreaterEqual(rows[0]["total_vol"], row["total_vol"])
+        later = [m for m in self._kafka_msgs(common.TOPIC_REPLIES)[n_replies:]
+                 if m.get("type") in ("SUMMARY", "DENY") and m.get("transaction_id") == tx_id]
+        self.assertEqual(len(later), 1, "Sin avisos adicionales al operario")
+        engine.running = monitor.running = central.running = False
+
+    def test_31_deregistration_with_idle_engine(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        self._deregister(monitor)
+        self.assertTrue(self._wait_until(lambda: engine.symmetric_key is None, 3))
+        self.assertEqual(engine.state, "AVAILABLE")
+        time.sleep(0.5)
+        self.assertEqual(engine.pending_finished_events, [])
+        engine.start_watering("MANUAL", 0)
+        self.assertNotEqual(engine.state, "WATERING", "Sin clave no se admiten riegos")
+
+        monitor.register_in_registry()
+        monitor.deregistered = False
+        self.assertTrue(self._wait_until(
+            lambda: engine.symmetric_key is not None and central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE, 8))
+        central.request_watering("FO-01", "WS-01", 1)
+        self.assertTrue(self._wait_until(lambda: engine.state == "WATERING", 4), "Tras el alta vuelve a operar")
+        engine.running = monitor.running = central.running = False
 
 
 if __name__ == "__main__":

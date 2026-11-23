@@ -263,6 +263,18 @@ class WSMonitor:
                 auth_msg = f"AUTH#{self.ws_id}#{self.credential}#{self.location}"
                 resp = request_socket(sock, auth_msg)
 
+                if resp.startswith("STATUS#REVOKED"):
+                    # Claves revocadas (p. ej. mientras este Monitor estaba desconectado o tras reiniciarlo):
+                    # la credencial actual ya no vale; no se reintenta hasta la opción 'k'
+                    sock.close()
+                    self.log("Central RECHAZÓ la autenticación: claves revocadas. Estación FUERA DE SERVICIO. "
+                             "Use la opción 'k' para renovar la credencial y obtener nuevas claves.")
+                    self.symmetric_key = None
+                    self.key_revoked = True
+                    self.central_blocked = True
+                    self._send_key_to_engine()  # CLEAR_KEY
+                    return False
+
                 if not resp.startswith("STATUS#OK#"):
                     self.log(f"Central DENEGÓ la autenticación: {resp}")
                     sock.close()
@@ -282,6 +294,11 @@ class WSMonitor:
                          f"({self.symmetric_key[:10]}...)")
                 self.central_sock = sock
                 self.central_blocked = "#BLOCKED" in resp
+                # Tras autenticarse se envía al Engine el estado explícito que indica Central (BLOCKED o
+                # ACTIVE): pudo bloquearse por Kafka sin que este Monitor lo supiera (p. ej. BLOCK de una
+                # revocación durante un corte de red con Central)
+                with self.engine_lock:
+                    self.engine_block_synced = not self.central_blocked
                 self.leak_active = None
 
                 # Transmitimos la clave simétrica al Engine si ya está conectado

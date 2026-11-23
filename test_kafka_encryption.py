@@ -243,12 +243,16 @@ class EngineKafkaTests(unittest.TestCase):
         e = self._engine()
         e.start_watering("FO-01", 0, transaction_id="TX-PEND")
         time.sleep(0.2)
-        e.handle_monitor_request("CLEAR_KEY")        # revocación durante el riego
         before = len(self.sent)
+        e.handle_monitor_request("CLEAR_KEY")        # revocación o baja durante el riego: lo detiene
+        self.assertNotEqual(e.state, "WATERING")
         self.assertFalse(e.send_event("TELEMETRY", flow=1.0, vol=0.1))
-        e.finish_watering("CENTRAL_BLOCK")
+        deadline = time.time() + 3                   # el FINISHED se publica en segundo plano
+        while time.time() < deadline and not e.pending_finished_events:
+            time.sleep(0.05)
         self.assertEqual(len(self.sent), before, "Sin clave no se publica nada en Kafka")
-        self.assertEqual([p["transaction_id"] for p in e.pending_finished_events], ["TX-PEND"])
+        self.assertEqual([(p["transaction_id"], p["reason"]) for p in e.pending_finished_events],
+                         [("TX-PEND", "KEYS_CLEARED")])
 
         new_key = generate_symmetric_key()
         e.handle_monitor_request(f"SET_KEY#{new_key}")  # la clave nueva dispara el reenvío de pendientes

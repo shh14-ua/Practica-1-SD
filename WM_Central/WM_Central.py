@@ -42,7 +42,7 @@ from common import (
 )
 from wm_crypto import (
     generate_symmetric_key, encrypt_message, decrypt_message, is_encrypted,
-    ensure_tls_certificate, require_cryptography,
+    ensure_tls_certificate, require_cryptography, key_fingerprint,
     seal_kafka_message, open_kafka_message, next_kafka_seq, KAFKA_KIND_COMMAND, KAFKA_KIND_EVENT
 )
 
@@ -79,6 +79,11 @@ class WMCentral:
         self._evt_seq: Dict[str, int] = {}
         # Limitación de la auditoría de mensajes rechazados {(entidad, motivo): [último_registro, omitidos]}
         self._kafka_reject_audit: Dict[tuple, list] = {}
+
+        # Revocación: huella de la última credencial aceptada por WS y de la credencial en uso al revocar
+        # (tras una revocación solo se acepta una credencial renovada en WM_Registry)
+        self._last_cred_fp: Dict[str, str] = {}
+        self._revoked_cred_fp: Dict[str, Optional[str]] = {}
 
         # Alertas meteorológicas activas (Release 2 - WM_W) {ws_id: alert_info}
         self.weather_alerts: Dict[str, Dict[str, Any]] = {}
@@ -174,6 +179,20 @@ class WMCentral:
                     details TEXT
                 )
             """)
+            # Revocación de claves (Release 2): sobrevive a reinicios de Central.
+            # Se guardan huellas SHA-256 de las credenciales, nunca las credenciales.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS station_security (
+                    ws_id TEXT PRIMARY KEY,
+                    last_cred_fp TEXT,
+                    revoked INTEGER NOT NULL DEFAULT 0,
+                    revoked_cred_fp TEXT,
+                    central_block INTEGER NOT NULL DEFAULT 0,
+                    revoked_at TEXT
+                )
+            """)
+            if "central_block" not in {f[1] for f in db.execute("PRAGMA table_info(station_security)")}:
+                db.execute("ALTER TABLE station_security ADD COLUMN central_block INTEGER NOT NULL DEFAULT 0")
             # Añadir identificador único sin perder el historial anterior
             columnas = {
                 fila[1] for fila in db.execute("PRAGMA table_info(watering_history)")
@@ -241,6 +260,46 @@ class WMCentral:
                     "engine_reason": "Engine no conectado al Monitor",
                     "last_active": time.time(),
                 }
+            # Revocaciones vigentes: la WS sigue FUERA DE SERVICIO hasta re-autenticarse con una
+            # credencial renovada, conservando si ya estaba fuera de servicio por otro motivo
+            for r in db.execute("SELECT * FROM station_security").fetchall():
+                if r["last_cred_fp"]:
+                    self._last_cred_fp[r["ws_id"]] = r["last_cred_fp"]
+                st = self.stations.get(r["ws_id"])
+                if r["revoked"] and st:
+                    st["keys_revoked"] = True
+                    st["central_block"] = bool(r["central_block"])
+                    st["status"] = STATUS_OUT_OF_SERVICE
+                    self._revoked_cred_fp[r["ws_id"]] = r["revoked_cred_fp"]
+
+    def _keep_oos_after_reauth(self, ws_id: str, central_block: bool) -> bool:
+        """Tras re-autenticarse una WS revocada sigue FUERA DE SERVICIO si tiene un bloqueo manual
+        de CENTRAL (central_block) o una alerta climática vigente."""
+        return bool(central_block) or ws_id in self.weather_alerts
+
+    def _save_security_state(self, ws_id: str):
+        """Persiste el estado de revocación y la huella de la última credencial de una WS."""
+        st = self.stations.get(ws_id) or {}
+        revoked = bool(st.get("keys_revoked"))
+        with self.lock, self._get_db() as db:
+            db.execute(
+                """INSERT INTO station_security (ws_id, last_cred_fp, revoked, revoked_cred_fp,
+                                                 central_block, revoked_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(ws_id) DO UPDATE SET
+                       last_cred_fp = excluded.last_cred_fp,
+                       revoked = excluded.revoked,
+                       revoked_cred_fp = excluded.revoked_cred_fp,
+                       central_block = excluded.central_block,
+                       revoked_at = CASE WHEN excluded.revoked = 1
+                                         THEN COALESCE(station_security.revoked_at, excluded.revoked_at)
+                                         ELSE NULL END""",
+                (ws_id, self._last_cred_fp.get(ws_id), int(revoked),
+                 self._revoked_cred_fp.get(ws_id) if revoked else None,
+                 int(bool(st.get("central_block"))) if revoked else 0,
+                 datetime.now().isoformat() if revoked else None)
+            )
+            db.commit()
 
     # convierte los códigos de error que recibe Central en
     # mensajes comprensibles para el operario
@@ -396,18 +455,26 @@ class WMCentral:
         clean_id = ws_id.strip().upper()
         with self.lock:
             if clean_id in self.stations:
+                # Última orden con la clave aún vigente: BLOCK por Kafka. Llega al Engine aunque su
+                # Monitor no pueda recibir REVOKED (p. ej. corte de red con Central). Tras borrar la
+                # clave no se envía ni se acepta nada cifrado con ella.
+                if self.station_keys.get(clean_id):
+                    self.send_ws_command(clean_id, "BLOCK", reason="KEYS_REVOKED")
                 self.station_keys.pop(clean_id, None)
                 st = self.stations[clean_id]
                 old_status = st["status"]
                 # La WS sigue FUERA DE SERVICIO (aunque su Monitor se desconecte) hasta que se
-                # re-autentique; entonces recupera el servicio salvo que ya estuviera fuera de
-                # servicio antes por otro motivo (bloqueo de CENTRAL o alerta climática).
+                # re-autentique; entonces recupera el servicio salvo que tenga un bloqueo manual de
+                # CENTRAL (central_block) o una alerta climática vigente (WM_W las renueva).
                 if not st.get("keys_revoked"):
-                    st["oos_before_revocation"] = (old_status == STATUS_OUT_OF_SERVICE)
+                    # La credencial en uso queda invalidada: solo se aceptará una renovada en WM_Registry
+                    self._revoked_cred_fp[clean_id] = self._last_cred_fp.get(clean_id)
                 st["keys_revoked"] = True
                 self._evt_seq.pop(clean_id, None)
+                self._interrupt_watering_for_revocation(clean_id, st)
                 self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
                 self._update_station_db(clean_id, status=STATUS_OUT_OF_SERVICE)
+                self._save_security_state(clean_id)
 
                 self.audit_event(
                     entity=clean_id,
@@ -421,6 +488,48 @@ class WMCentral:
                 # el Monitor recibe STATUS#REVOKED como respuesta a su siguiente mensaje (PING cada 3 s).
                 return True
         return False
+
+    def _interrupt_watering_for_revocation(self, ws_id: str, st: Dict[str, Any]):
+        """Cierra en Central el riego en curso (o pendiente de confirmar) de una WS revocada.
+        Físicamente lo detiene el Monitor (BLOCKED + CLEAR_KEY al Engine). Aquí se consolida el
+        historial con el volumen conocido (motivo KEYS_REVOKED) y se avisa al operario; el FINISHED
+        tardío del Engine solo actualizará el volumen de esa misma transacción, sin duplicados."""
+        op = st.get("operator")
+        tx_id = st.get("transaction_id")
+        if st["status"] == STATUS_WATERING:
+            vol = float(st.get("vol") or 0.0)
+            start_iso = st.get("start_time") or datetime.now().isoformat()
+            try:
+                dur = max(0, int((datetime.now() - datetime.fromisoformat(start_iso)).total_seconds()))
+            except ValueError:
+                dur = 0
+            tx_id = tx_id or f"{ws_id}-{op or 'MANUAL'}-{uuid.uuid4().hex[:12]}"
+            inserted = self._record_watering_history(
+                ws_id=ws_id, op_id=op or "MANUAL", start_time=start_iso,
+                end_time=datetime.now().isoformat(), total_vol=vol, duration_sec=dur,
+                reason="KEYS_REVOKED", transaction_id=tx_id,
+            )
+            if inserted:
+                self.notify_operator(
+                    op, "SUMMARY", ws_id,
+                    f"Riego INTERRUMPIDO: claves de la estación revocadas por CENTRAL ({vol:.2f} L consumidos en {dur} s)",
+                    total_vol=vol, duration=dur, reason="KEYS_REVOKED", transaction_id=tx_id
+                )
+            self.log(f"Riego interrumpido por revocación de claves ({vol:.2f} L, transaction_id={tx_id})", ws_id=ws_id)
+        elif st.get("pending_start"):
+            self.notify_operator(op, "DENY", ws_id,
+                                 "DENEGADO: claves de la estación revocadas por CENTRAL antes de iniciar el riego")
+        else:
+            return
+        st["pending_start"] = False
+        st["pending_since"] = None
+        st["operator"] = None
+        st["transaction_id"] = None
+        st["start_time"] = None
+        st["flow"] = 0.0
+        st["vol"] = 0.0
+        st.pop("interrupted_watering", None)
+        st.pop("pending_weather_stop", None)
 
     def handle_weather_alert(self, ws_id: str, city: str, temp: float, cond: str,
                              alert_active: bool, reason: str, source_ip: str = ""):
@@ -461,9 +570,6 @@ class WMCentral:
 
                 st = self.stations.get(clean_id)
                 if st:
-                    if st.get("keys_revoked"):
-                        # Tras re-autenticarse seguirá fuera de servicio mientras dure la alerta
-                        st["oos_before_revocation"] = True
                     if st["status"] == STATUS_WATERING:
                         if not st.get("pending_weather_stop"):
                             # Si se está realizando un riego, el mismo finalizará con normalidad
@@ -489,8 +595,10 @@ class WMCentral:
                     if st:
                         st.pop("pending_weather_stop", None)
                         if st.get("keys_revoked"):
-                            # Claves revocadas: no se restaura hasta la nueva autenticación
-                            st["oos_before_revocation"] = False
+                            pass  # Claves revocadas: no se restaura hasta la nueva autenticación
+                        elif st.get("central_block"):
+                            self.log("Clima favorable, pero la estación sigue FUERA DE SERVICIO por bloqueo "
+                                     "manual de CENTRAL (requiere activación)", ws_id=clean_id)
                         elif st["status"] == STATUS_OUT_OF_SERVICE:
                             self.set_station_status(clean_id, STATUS_AVAILABLE)
                             self.send_ws_command(clean_id, "ACTIVATE")
@@ -745,7 +853,22 @@ class WMCentral:
                         self.log(f"Autenticación DENEGADA para {st_id}: credencial de Registry inválida", ws_id=st_id)
                         return "STATUS#KO#Autenticacion denegada: credencial invalida o no registrada en Registry"
 
+                    cred_fp = key_fingerprint(cred)
                     with self.lock:
+                        st_prev = self.stations.get(st_id)
+                        if (st_prev and st_prev.get("keys_revoked")
+                                and self._revoked_cred_fp.get(st_id) is not None
+                                and hmac.compare_digest(cred_fp, self._revoked_cred_fp[st_id])):
+                            self.audit_event(
+                                st_id, client_ip, "REJECTED_REVOKED",
+                                f"Autenticación DENEGADA para {st_id}: credencial invalidada por la revocación de claves.",
+                                "Se requiere renovar la credencial en WM_Registry (opción 'k' del Monitor)"
+                            )
+                            self.log(f"Autenticación DENEGADA para {st_id}: claves revocadas, se requiere "
+                                     f"credencial renovada", ws_id=st_id)
+                            return ("STATUS#REVOKED#Claves revocadas por Central: renueve la credencial en "
+                                    "WM_Registry y re-autentiquese (opcion k del Monitor)")
+
                         # Generamos clave de cifrado simétrico ÚNICA para esta WS
                         sym_key = generate_symmetric_key()
                         self.station_keys[st_id] = sym_key
@@ -778,10 +901,12 @@ class WMCentral:
                         st["engine_ok"] = False
                         st["engine_reason"] = "Engine no conectado al Monitor"
 
+                        self._last_cred_fp[st_id] = cred_fp
                         if st.pop("keys_revoked", False):
                             # Nueva autenticación tras revocación: nuevas claves y vuelta al servicio,
                             # salvo que ya estuviera fuera de servicio por otro motivo.
-                            keep_oos = st.pop("oos_before_revocation", False)
+                            keep_oos = self._keep_oos_after_reauth(st_id, st.get("central_block", False))
+                            self._revoked_cred_fp.pop(st_id, None)
                             self.audit_event(
                                 st_id, client_ip, "KEY_RENEWED",
                                 f"Estación {st_id} re-autenticada tras revocación: nueva clave simétrica emitida.",
@@ -790,6 +915,9 @@ class WMCentral:
                         else:
                             keep_oos = st["status"] == STATUS_OUT_OF_SERVICE
                         if not keep_oos:
+                            # Vuelve a servicio: sin bloqueo manual vigente (como en la Release 1,
+                            # una WS que se reconecta tras desconectarse no conserva el bloqueo)
+                            st["central_block"] = False
                             self.set_station_status(st_id, STATUS_LEAK)
 
                         self._update_station_db(
@@ -797,6 +925,7 @@ class WMCentral:
                             location=location,
                             status=st["status"]
                         )
+                        self._save_security_state(st_id)
 
                         self.audit_event(
                             st_id, client_ip, "AUTH_SUCCESS",
@@ -1376,9 +1505,10 @@ class WMCentral:
                                          "Estación bloqueada por CENTRAL: Riego detenido")
                 st["pending_start"] = False
                 st["pending_since"] = None
+                # Bloqueo manual: solo lo levanta una activación explícita (no la cancelación del clima)
+                st["central_block"] = True
                 if st.get("keys_revoked"):
-                    # El bloqueo se mantiene después de la nueva autenticación
-                    st["oos_before_revocation"] = True
+                    self._save_security_state(ws_id)  # se conserva tras reiniciar y re-autenticarse
                 self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                 self.send_ws_command(ws_id, "BLOCK")
                 self.log("Puesta en FUERA DE SERVICIO por orden de CENTRAL", ws_id=ws_id)
@@ -1407,6 +1537,7 @@ class WMCentral:
                     continue
 
                 if st["status"] == STATUS_OUT_OF_SERVICE:
+                    st["central_block"] = False
                     self.send_ws_command(ws_id, "ACTIVATE")
                     if engine_ok:
                         self.set_station_status(ws_id, STATUS_AVAILABLE)
@@ -1546,6 +1677,7 @@ class WMCentral:
                         for s in central_self.stations.values():
                             item = dict(s)
                             item["has_key"] = (s["id"] in central_self.station_keys)
+                            item["keys_revoked"] = bool(s.get("keys_revoked"))
                             item["weather_alert"] = central_self.weather_alerts.get(s["id"])
                             item["weather_info"] = central_self.weather_status.get(s["id"])
                             st_list.append(item)

@@ -191,7 +191,21 @@ def run_tests():
     # PRUEBA 6: API_Central y Alerta Meteorológica de WM_W
     # --------------------------------------------------------------------------
     print("\n[TEST 6] Simulando alerta meteorológica de congelación (< 0ºC) desde WM_W vía API_Central...")
-    # Re-autenticación de WS-88 (nuevas claves) y activación para la prueba de alerta climática
+    # Tras la revocación, la credencial anterior ya no autentica (aunque siga vigente en el Registry)
+    s_old = tls_connect()
+    client_handshake(s_old)
+    resp_old = request_socket(s_old, f"AUTH#WS-88#{ws88_cred}#Parque Central")
+    assert resp_old.startswith("STATUS#REVOKED"), f"La credencial anterior debe rechazarse: {resp_old}"
+    s_old.close()
+
+    # Renovación de la credencial en WM_Registry (lo que hace la opción 'k' del Monitor)
+    renew = json.dumps({"id": "WS-88", "location": "Parque Central", "credential": ws88_cred}).encode("utf-8")
+    req_renew = urllib.request.Request("https://127.0.0.1:5520/api/stations", data=renew,
+                                       headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req_renew, context=ctx) as resp_r:
+        ws88_cred = json.loads(resp_r.read().decode("utf-8"))["data"]["credential"]
+
+    # Re-autenticación de WS-88 con la credencial renovada (nuevas claves) y activación para la prueba de clima
     s_ws88 = tls_connect()
     client_handshake(s_ws88)
     resp_reauth = request_socket(s_ws88, f"AUTH#WS-88#{ws88_cred}#Parque Central")

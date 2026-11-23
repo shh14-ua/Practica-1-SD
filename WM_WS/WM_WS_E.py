@@ -180,14 +180,22 @@ class WSEngine:
         return True
 
     def _clear_key(self):
+        """CLEAR_KEY (revocación o baja): la estación deja de estar autorizada. En la misma operación
+        se borra la clave y se cierra cualquier riego en curso (como la Release 1 ante la baja del
+        Monitor), sin depender de que llegue una orden por Kafka que ya no podría descifrarse.
+        El FINISHED se publica en segundo plano para no retener la respuesta al Monitor; sin clave
+        queda pendiente y se reenvía cuando llegue una clave nueva."""
         with self.lock:
             had_key = self.symmetric_key is not None
             self.symmetric_key = None
             self._last_cmd_seq = 0
             self._requeue_unconfirmed_finished_locked()
+            summary, started_ev = self._close_watering_locked("KEYS_CLEARED")
         if had_key:
             self.log("Clave simétrica ELIMINADA por el Monitor (revocación o baja). "
                      "No se aceptan órdenes ni nuevos riegos hasta recibir una clave nueva.")
+        if summary:
+            threading.Thread(target=self._publish_finished, args=(summary, started_ev), daemon=True).start()
 
     def _log_rejected_command(self, reason: str):
         """Informa de órdenes rechazadas como máximo una vez cada 10 s por motivo."""
