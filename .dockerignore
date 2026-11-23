@@ -1,0 +1,38 @@
+# ------------------------------------------------------------------------------
+# Ficheros que NUNCA deben entrar en las imágenes Docker.
+# Los certificados públicos (*_cert.pem) no se excluyen: los clientes los usan
+# como CA de confianza. Docker solo aplica cada patrón desde la raíz del contexto,
+# por eso se usa **/ para cubrir cualquier subcarpeta.
+# ------------------------------------------------------------------------------
+
+# Claves privadas y credenciales
+**/*_key.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.cred
+WM_WS/.credentials
+**/.env
+**/.env.*
+
+# Control de versiones, entornos virtuales y configuración local
+.git
+.venv
+venv
+ENV
+.vscode
+.idea
+.claude
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+**/*:Zone.Identifier
+
+# Datos de ejecución: bases de datos, logs y volúmenes
+data
+**/*.db
+**/*.db-journal
+**/*.log
+
+# Dependencias de Node.js (el Front se monta como volumen, no se copia en la imagen)
+**/node_modules

@@ -22,4 +22,5 @@ VOLUME ["/data"]
 
 EXPOSE 5000 8080
 
-CMD ["python", "WM_Central/WM_Central.py", "5000", "kafka:19092", "--web-port", "8080", "--db", "/data/central.db"]
+# El certificado TLS de Central se guarda en el volumen /data para que no cambie entre reinicios
+CMD ["python", "WM_Central/WM_Central.py", "5000", "kafka:19092", "--web-port", "8080", "--db", "/data/central.db", "--cert", "/data/certs/central_cert.pem", "--key", "/data/certs/central_key.pem"]

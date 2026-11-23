@@ -25,6 +25,12 @@ data/
 
 # Claves privadas
 WM_Registry/certs/*_key.pem
+WM_Central/certs/*_key.pem
+
+# Certificados TLS: cada despliegue genera el suyo al primer arranque (con los SAN de esa
+# máquina) y lo reutiliza; se copian a los clientes, no se versionan.
+WM_Registry/certs/registry_cert.pem
+WM_Central/certs/central_cert.pem
 
 # Credenciales locales de las estaciones (WM_WS_M)
 WM_WS/.credentials/

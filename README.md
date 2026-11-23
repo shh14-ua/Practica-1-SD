@@ -9,7 +9,7 @@ Sistema distribuido de gestión, supervisión y seguridad del riego en parques y
 3. **Nuevo módulo de registro seguro (WM_Registry)** que gestiona altas, bajas y credenciales de acceso para las estaciones de riego a través de un canal seguro HTTPS/SSL.
 4. **Módulo Web Front (Node.js)** que visualiza el cuadro de monitorización interactivo en tiempo real desde cualquier navegador.
 5. **Tres pilares de seguridad:**
-   - **Autenticación segura:** Canal cifrado HTTPS/SSL para la comunicación con `WM_Registry` y verificación obligatoria de credenciales en `WM_Central`.
+   - **Autenticación segura:** Canal cifrado HTTPS/SSL para la comunicación con `WM_Registry` y verificación obligatoria de credenciales en `WM_Central`. La autenticación de las WS en Central y la entrega de la clave simétrica viajan por un canal TLS (certificado propio de Central validado por el Monitor).
    - **Cifrado simétrico de datos:** Clave simétrica única por estación otorgada por Central para evitar ataques Man-In-The-Middle (MITM), con soporte de revocación y restauración de claves ante supuesta vulnerabilidad.
    - **Auditoría estructurada:** Registro detallado de eventos de seguridad (fecha/hora, IP de origen, entidad, acción y descripción).
 
@@ -66,7 +66,7 @@ Sistema distribuido de gestión, supervisión y seguridad del riego en parques y
   - Histórico de transacciones de riego en SQLite.
 
 - **WM_WS_M (Monitor):**
-  Se conecta a `WM_Registry` vía HTTPS para obtener sus credenciales, se autentica en `WM_Central` y recibe su clave simétrica única. Cifra simétricamente todas sus comunicaciones con Central y dispone de menú para re-autenticarse si Central revoca sus claves.
+  Se conecta a `WM_Registry` vía HTTPS para obtener sus credenciales, se autentica en `WM_Central` por un canal TLS (valida el certificado de Central y su nombre de host) y recibe su clave simétrica única. Cifra simétricamente todas sus comunicaciones con Central. Si Central revoca sus claves, la estación queda FUERA DE SERVICIO y el Monitor no vuelve a autenticarse hasta que se usa la opción de menú `k` (o `a`).
 
 - **WM_WS_E (Engine):**
   Simula electroválvula y caudalímetro, recibe la clave simétrica del monitor, ejecuta riegos y publica telemetría. Si recibe orden de parada meteorológica mientras riega, el riego finaliza con normalidad y posteriormente pasa a modo "fuera de servicio".
@@ -81,11 +81,12 @@ Sistema distribuido de gestión, supervisión y seguridad del riego en parques y
 ```text
 Practica-1-SD/
 ├── WM_Central/
-│   ├── WM_Central.py           # Núcleo Central, servidor de sockets y API_Central REST
-│   └── dashboard.html          # Panel web integrado de respaldo
+│   ├── WM_Central.py           # Núcleo Central, servidor de sockets TLS y API_Central REST
+│   ├── dashboard.html          # Panel web integrado de respaldo
+│   └── certs/                  # Certificado TLS de Central (se genera al arrancar; la clave no se versiona)
 ├── WM_Registry/
 │   ├── WM_Registry.py          # API REST HTTPS de registro y credenciales
-│   └── certs/                  # Certificado X.509 y clave privada RSA 2048 para TLS
+│   └── certs/                  # Certificado X.509 y clave RSA-2048 (se generan al arrancar; no se versionan)
 ├── WM_W/
 │   ├── WM_W.py                 # Weather Control Office (OpenWeather + Simulación)
 │   └── ciudades.json           # Ubicaciones de las WS editables en caliente
@@ -130,13 +131,19 @@ docker compose up -d kafka
 
 **Paso 1.2 — WM_Registry (HTTPS REST API en puerto 5500):**
 ```bash
-python WM_Registry/WM_Registry.py 5500
+python WM_Registry/WM_Registry.py 5500 --san <HOST_O_IP_PUBLICA_DEL_REGISTRY>
 ```
+- En el primer arranque genera `WM_Registry/certs/registry_cert.pem` y su clave privada (0600) y en los siguientes los reutiliza. Solo se regeneran si falta alguno, si no forman pareja o si se pide un nombre nuevo con `--san` (o `$WM_REGISTRY_SAN`).
+- El certificado no se versiona: copie `registry_cert.pem` (nunca la clave) a los Monitores y a Central (`--registry-ca` / `$WM_REGISTRY_CA`).
 
-**Paso 1.3 — WM_Central (Sockets en 5000, API REST en 8080):**
+**Paso 1.3 — WM_Central (Sockets TLS en 5000, API REST en 8080):**
 ```bash
-python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080
+python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --san <HOST_O_IP_PUBLICA_DE_CENTRAL>
 ```
+- El canal de sockets con los Monitores es TLS obligatorio: una conexión sin TLS se rechaza y queda en la auditoría como `TLS_FAILED`.
+- Al arrancar se genera (si no existe) un certificado autofirmado RSA-2048 en `WM_Central/certs/central_cert.pem` y su clave privada `central_key.pem` (permisos 0600, excluida de Git). Rutas configurables con `--cert` y `--key`.
+- `--san` (o `$WM_CENTRAL_SAN`) añade, separados por comas, los nombres DNS/IP con los que los Monitores contactan con Central (p. ej. el host público del despliegue cloud). Siempre se incluyen `localhost`, `central` y `127.0.0.1`. Si se añade un nombre nuevo, el certificado se regenera y hay que volver a copiarlo a los Monitores.
+- Copie `central_cert.pem` (nunca la clave) a las máquinas de los Monitores.
 
 **Paso 1.4 — Front (Web Dashboard en Node.js en puerto 3000):**
 ```bash
@@ -166,11 +173,12 @@ python WM_FO/WM_FO.py <IP_KAFKA>:9092 FO-01
 
 **Paso 3.1 — Monitor de la Estación (WM_WS_M):**
 ```bash
-python WM_WS/WM_WS_M.py 6001 <IP_CENTRAL>:5000 WS-01 --loc "River Park" --registry https://<IP_REGISTRY>:5500
+python WM_WS/WM_WS_M.py 6001 <IP_CENTRAL>:5000 WS-01 --loc "River Park" --registry https://<IP_REGISTRY>:5500 --central-ca <ruta>/central_cert.pem
 ```
 - Se registra automáticamente en `WM_Registry` vía HTTPS para recibir su credencial.
+- Se conecta a `WM_Central` por TLS validando su certificado (`--central-ca` o `$WM_CENTRAL_CA`; por defecto `WM_Central/certs/central_cert.pem`). `<IP_CENTRAL>` debe figurar en el SAN del certificado de Central.
 - Se autentica en `WM_Central` y recibe su clave de cifrado simétrico única.
-- Abre socket local en el puerto `6001` para el Engine.
+- Abre el socket del Engine en el puerto `6001` **solo en la interfaz local (127.0.0.1)**: por él viaja la clave simétrica, así que el Engine debe ejecutarse en la misma máquina que su Monitor y conectarse a `localhost:6001` (con Docker, ambos contenedores con `--network=host`, como en `docker_run.sh`).
 
 **Paso 3.2 — Motor de la Estación (WM_WS_E):**
 ```bash
@@ -182,6 +190,12 @@ python WM_WS/WM_WS_E.py <IP_KAFKA>:9092 localhost:6001
 ---
 
 ## Verificación y Pruebas Automatizadas
+
+Las pruebas del canal TLS entre Central y los Monitores están en `test_tls_central.py` (sockets, TLS y Registry HTTPS reales):
+
+```bash
+python test_tls_central.py
+```
 
 El proyecto incluye una suite de pruebas completa en `test_release2.py`:
 

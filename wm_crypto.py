@@ -6,6 +6,7 @@ Proporciona:
   - Generación de claves de cifrado simétrico únicas por estación.
   - Cifrado y descifrado simétrico de mensajes (con soporte para Fernet/AES y fallback puro).
   - Generación automática de certificados SSL autofirmados para el canal seguro HTTPS de WM_Registry.
+  - Generación del certificado TLS (con nombres SAN) del canal seguro WM_Central <-> WM_WS_M.
 """
 
 import base64
@@ -222,3 +223,108 @@ def ensure_ssl_certificates(cert_dir: str) -> Tuple[str, str]:
             pass
 
     return cert_path, key_path
+
+
+# ==============================================================================
+# 4. CERTIFICADO TLS CON NOMBRES SAN (CANAL SEGURO WM_CENTRAL <-> WM_WS_M)
+# ==============================================================================
+
+def _is_ip_address(name: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def _certificate_covers_san(cert_path: str, san_names: list) -> bool:
+    """Comprueba que el certificado incluye en su extensión SAN todos los nombres/IP indicados."""
+    import ipaddress
+    from cryptography import x509
+    try:
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except Exception:
+        return False
+    dns = set(ext.get_values_for_type(x509.DNSName))
+    ips = {str(ip) for ip in ext.get_values_for_type(x509.IPAddress)}
+    return all(
+        (str(ipaddress.ip_address(n)) in ips) if _is_ip_address(n) else (n in dns)
+        for n in san_names
+    )
+
+
+def ensure_tls_certificate(cert_path: str, key_path: str, common_name: str, san_names: list) -> bool:
+    """
+    Garantiza un certificado X.509 autofirmado (RSA-2048, SHA-256) y su clave privada para TLS.
+    Lo (re)genera si falta alguno de los dos ficheros, si no forman pareja o si el certificado
+    no cubre todos los nombres/IP de san_names (necesarios para que el cliente valide el host).
+    La clave privada se guarda con permisos 0600.
+    Devuelve True si se ha generado un par nuevo y False si se reutiliza el existente.
+    Lanza RuntimeError si no se puede generar (p. ej. falta la librería 'cryptography').
+    """
+    san_names = list(dict.fromkeys(n.strip() for n in san_names if n and n.strip()))
+
+    if os.path.isfile(cert_path) and os.path.isfile(key_path):
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_path, key_path)
+            pair_ok = True
+        except (ssl.SSLError, OSError):
+            pair_ok = False
+        if pair_ok and _HAS_CRYPTOGRAPHY and _certificate_covers_san(cert_path, san_names):
+            return False
+
+    if not _HAS_CRYPTOGRAPHY:
+        raise RuntimeError(
+            "Falta la librería 'cryptography' para generar el certificado TLS "
+            "(instálela con: pip install -r requirements.txt)."
+        )
+
+    import datetime
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    entries = [
+        x509.IPAddress(ipaddress.ip_address(n)) if _is_ip_address(n) else x509.DNSName(n)
+        for n in san_names
+    ]
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "ES"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "WaterManagement SD"),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ])
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now_utc - datetime.timedelta(days=1))
+        .not_valid_after(now_utc + datetime.timedelta(days=3650))
+        .add_extension(x509.SubjectAlternativeName(entries), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    for path in (cert_path, key_path):
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    return True

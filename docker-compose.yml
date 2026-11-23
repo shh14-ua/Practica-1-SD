@@ -32,7 +32,7 @@ services:
   central:
     build: .
     container_name: wm_central
-    command: python WM_Central/WM_Central.py 5000 kafka:19092 --web-port 8080 --db /data/central.db
+    command: python WM_Central/WM_Central.py 5000 kafka:19092 --web-port 8080 --db /data/central.db --cert /data/certs/central_cert.pem --key /data/certs/central_key.pem
     depends_on:
       - kafka
       - registry
@@ -45,6 +45,8 @@ services:
       WM_REGISTRY_URL: https://registry:5500
       WM_REGISTRY_DB: /data/registry.db
       WM_REGISTRY_CA: /data/certs/registry_cert.pem
+      # Nombres/IP adicionales del certificado TLS de Central (host/IP con el que conectan los Monitores)
+      WM_CENTRAL_SAN: ${WM_CENTRAL_SAN:-}
     volumes:
       - ./data:/data
     stdin_open: true

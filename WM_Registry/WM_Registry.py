@@ -408,6 +408,15 @@ class WMRegistry:
         except ValueError:
             return False
 
+    def _restrict_key_permissions(self):
+        """Deja la clave privada legible y modificable solo por su propietario (0600)."""
+        try:
+            if os.stat(self.key_file).st_mode & 0o777 != 0o600:
+                os.chmod(self.key_file, 0o600)
+                self.log(f"Permisos de la clave privada corregidos a 0600 ({self.key_file}).")
+        except OSError as exc:
+            self.log(f"Aviso: no se pudieron restringir los permisos de la clave privada ({exc}).")
+
     def _ensure_tls_certificates(self):
         """Garantiza que existan un certificado X.509 y su clave privada RSA correspondiente.
         Si la clave privada no existe (p. ej. ignorada en Git por seguridad) o no coincide con el
@@ -427,6 +436,8 @@ class WMRegistry:
             need_gen = True
 
         if not need_gen:
+            # Se reutiliza el par existente: la clave privada debe quedar igualmente con permisos 0600
+            self._restrict_key_permissions()
             return
 
         self.log("Generando par de claves RSA-2048 y certificado X.509 autofirmado para HTTPS...")

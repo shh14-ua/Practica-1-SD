@@ -23,11 +23,13 @@ case $MODO in
     echo "Iniciando WM_Central en contenedor Docker..."
     docker run --rm $TTY_FLAG --network=host \
       -v "$(pwd)/data:/data" \
-      $IMAGE_NAME python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --db /data/central.db "$@"
+      $IMAGE_NAME python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --db /data/central.db \
+      --cert /data/certs/central_cert.pem --key /data/certs/central_key.pem "$@"
     ;;
   monitor)
     echo "Iniciando WM_WS_M (Monitor) en contenedor Docker..."
-    docker run --rm $TTY_FLAG --network=host $IMAGE_NAME python WM_WS/WM_WS_M.py "$@"
+    # data/certs (solo lectura) contiene el certificado de Central copiado a esta máquina (--central-ca /data/certs/central_cert.pem)
+    docker run --rm $TTY_FLAG --network=host -v "$(pwd)/data/certs:/data/certs:ro" $IMAGE_NAME python WM_WS/WM_WS_M.py "$@"
     ;;
   engine)
     echo "Iniciando WM_WS_E (Engine) en contenedor Docker..."
@@ -42,7 +44,7 @@ case $MODO in
     echo ""
     echo "Ejemplos:"
     echo "  ./docker_run.sh central"
-    echo "  ./docker_run.sh monitor 6001 localhost:5000 WS-01 --loc 'River Park'"
+    echo "  ./docker_run.sh monitor 6001 localhost:5000 WS-01 --loc 'River Park' --central-ca /data/certs/central_cert.pem"
     echo "  ./docker_run.sh engine localhost:9092 localhost:6001"
     echo "  ./docker_run.sh fo localhost:9092 FO-01"
     echo "  ./docker_run.sh fo localhost:9092 FO-01 --file WM_FO/operaciones.txt"

@@ -357,7 +357,6 @@ class FakeRegistry:
             cred = f"CRED-{monitor.ws_id}-TEST{len(self.issued) + 1:04d}"
             self.issued[monitor.ws_id] = cred
         monitor.credential = cred
-        monitor.key_revoked = False
         return True
 
     def verify(self, central, ws_id: str, credential: str) -> bool:
@@ -401,6 +400,12 @@ class WaterManagementFlowTests(unittest.TestCase):
                          lambda mon: self.registry.register(mon)),
             patch.object(WM_Central.WMCentral, "verify_registry_credential",
                          lambda cen, ws_id, cred: self.registry.verify(cen, ws_id, cred)),
+            # Canal TLS Central <-> Monitor: los sockets en memoria del arnés no pueden negociar TLS,
+            # así que solo se sustituye el envoltorio TLS (el protocolo de tramas, la autenticación y
+            # el cifrado simétrico se ejecutan igual). El TLS real se prueba en test_tls_central.py.
+            patch.object(WM_Central.WMCentral, "_init_tls_context", lambda cen: None),
+            patch.object(WM_Central.WMCentral, "_wrap_station_tls", lambda cen, conn, ip: conn),
+            patch.object(WM_WS_M.WSMonitor, "_wrap_central_tls", lambda mon, sock: sock),
         ]
         for p in self.patches:
             p.start()
@@ -1621,6 +1626,82 @@ class WaterManagementFlowTests(unittest.TestCase):
             common.STATUS_AVAILABLE,
             "CENTRAL debe permanecer en DISPONIBLE y nunca pasar a REGANDO por eventos STARTED huérfanos"
         )
+
+        engine.running = False
+        monitor.running = False
+        central.running = False
+
+    def _wait_until(self, cond, timeout=6.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if cond():
+                return True
+            time.sleep(0.05)
+        return cond()
+
+    def test_20_key_revocation_keeps_out_of_service_until_manual_reauthentication(self):
+        """Release 2 (revocación de claves):
+        - Central borra la clave de la WS y la deja FUERA DE SERVICIO sin escribir en el socket desde otro hilo.
+        - El Monitor recibe STATUS#REVOKED como respuesta a su siguiente mensaje y cierra la sesión.
+        - La WS sigue FUERA DE SERVICIO aunque el Monitor se desconecte, y el Monitor NO se re-autentica solo.
+        - Con la opción de re-autenticación recibe una clave nueva y la WS vuelve a DISPONIBLE.
+        - Si ya estaba bloqueada por CENTRAL antes de revocar, sigue FUERA DE SERVICIO tras re-autenticarse."""
+        central, monitor, engine = self._start_cluster("WS-01")
+        old_key = central.station_keys["WS-01"]
+        self.assertEqual(monitor.symmetric_key, old_key)
+
+        sent_from_other_thread = []
+        orig_send_frame = common.send_frame
+        revoking_thread = threading.get_ident()
+
+        def spy_send_frame(sock, msg, *a, **kw):
+            if threading.get_ident() == revoking_thread:
+                sent_from_other_thread.append(msg)
+            return orig_send_frame(sock, msg, *a, **kw)
+
+        with patch.object(common, "send_frame", spy_send_frame):
+            self.assertTrue(central.revoke_station_keys("WS-01"))
+        self.assertEqual(sent_from_other_thread, [], "revoke_station_keys no debe escribir en el socket de la WS")
+        self.assertNotIn("WS-01", central.station_keys)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # El aviso llega en la respuesta al siguiente PING (cada 3 s)
+        self.assertTrue(self._wait_until(lambda: monitor.key_revoked, timeout=6.0),
+                        "El Monitor debe detectar la revocación en la respuesta a su siguiente mensaje")
+        self.assertIsNone(monitor.symmetric_key)
+        self.assertTrue(self._wait_until(lambda: "WS-01" not in central.station_sockets, timeout=3.0))
+
+        # Sin acción manual: no hay re-autenticación automática y la WS sigue FUERA DE SERVICIO
+        time.sleep(3.5)
+        self.assertNotIn("WS-01", central.station_keys, "El Monitor no debe re-autenticarse automáticamente")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", timeout=3.0),
+                        "El Engine debe quedar bloqueado mientras las claves están revocadas")
+
+        # Activar desde Central no es posible sin nueva autenticación
+        central.activate_station("WS-01")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+
+        # Opción 'k' del Monitor: nueva autenticación y nueva clave
+        monitor.reauthenticate()
+        self.assertFalse(monitor.key_revoked)
+        new_key = central.station_keys.get("WS-01")
+        self.assertIsNotNone(new_key)
+        self.assertNotEqual(new_key, old_key, "Tras re-autenticarse debe emitirse una clave simétrica nueva")
+        self.assertEqual(monitor.symmetric_key, new_key)
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE",
+            timeout=8.0), "La WS debe volver a servicio tras la nueva autenticación")
+        self.assertIn("KEY_RENEWED", [a["action"] for a in central.recent_audits])
+
+        # Bloqueo previo de CENTRAL + revocación: tras re-autenticarse sigue FUERA DE SERVICIO
+        central.block_station("WS-01")
+        self.assertTrue(central.revoke_station_keys("WS-01"))
+        self.assertTrue(self._wait_until(lambda: monitor.key_revoked, timeout=6.0))
+        monitor.reauthenticate()
+        self.assertIn("WS-01", central.station_keys)
+        time.sleep(1.5)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
 
         engine.running = False
         monitor.running = False

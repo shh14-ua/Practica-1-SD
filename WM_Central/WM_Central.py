@@ -2,7 +2,7 @@
 """
 WM_Central: Módulo central de control y gobierno de la red de riego WaterManagement.
 Funcionalidades:
-  - Servidor de sockets TCP para autenticación y supervisión de estaciones de riego (WM_WS_M).
+  - Servidor de sockets TCP sobre TLS para autenticación y supervisión de estaciones de riego (WM_WS_M).
   - Integración con Apache Kafka para mensajería con operarios (WM_FO) y motores (WM_WS_E).
   - Base de Datos relacional SQLite para operarios, estaciones e historial de riegos.
   - Cuadro de mandos / panel en tiempo real en consola (códigos de color ANSI requeridos).
@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import sqlite3
+import ssl
 import sys
 import threading
 import time
@@ -40,11 +41,17 @@ from common import (
     parse_addr, parse_host_port_pair, safe_db_path
 )
 from wm_crypto import (
-    generate_symmetric_key, encrypt_message, decrypt_message, is_encrypted
+    generate_symmetric_key, encrypt_message, decrypt_message, is_encrypted,
+    ensure_tls_certificate
 )
 
 class WMCentral:
-    def __init__(self, socket_port: int, kafka_bootstrap: str, web_port: int = 0, db_path: str = "central.db"):
+    # Nombres/IP que cubre siempre el certificado TLS de Central (canal con WM_WS_M)
+    DEFAULT_TLS_SAN = ("localhost", "central", "127.0.0.1")
+
+    def __init__(self, socket_port: int, kafka_bootstrap: str, web_port: int = 0, db_path: str = "central.db",
+                 tls_cert: Optional[str] = None, tls_key: Optional[str] = None,
+                 tls_san: Optional[List[str]] = None):
         self.socket_port = socket_port
         self.kafka_bootstrap = kafka_bootstrap
         self.web_port = web_port
@@ -76,6 +83,15 @@ class WMCentral:
         self.registry_ca = os.getenv(
             "WM_REGISTRY_CA", os.path.join(ROOT_DIR, "WM_Registry", "certs", "registry_cert.pem")
         )
+
+        # Canal TLS con los monitores (Release 2): certificado autofirmado propio de Central.
+        # Los SAN deben incluir el nombre/IP con el que los Monitores contactan con Central.
+        certs_dir = os.path.join(ROOT_DIR, "WM_Central", "certs")
+        self.tls_cert = tls_cert or os.path.join(certs_dir, "central_cert.pem")
+        self.tls_key = tls_key or os.path.join(certs_dir, "central_key.pem")
+        extra_san = [x.strip() for x in (tls_san or []) if x and x.strip()]
+        self.tls_san = list(dict.fromkeys(list(self.DEFAULT_TLS_SAN) + extra_san))
+        self._tls_ctx: Optional[ssl.SSLContext] = None
 
         # Inicialización de la base de datos SQLite
         self._init_db()
@@ -374,6 +390,12 @@ class WMCentral:
                 self.station_keys.pop(clean_id, None)
                 st = self.stations[clean_id]
                 old_status = st["status"]
+                # La WS sigue FUERA DE SERVICIO (aunque su Monitor se desconecte) hasta que se
+                # re-autentique; entonces recupera el servicio salvo que ya estuviera fuera de
+                # servicio antes por otro motivo (bloqueo de CENTRAL o alerta climática).
+                if not st.get("keys_revoked"):
+                    st["oos_before_revocation"] = (old_status == STATUS_OUT_OF_SERVICE)
+                st["keys_revoked"] = True
                 self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
                 self._update_station_db(clean_id, status=STATUS_OUT_OF_SERVICE)
 
@@ -385,14 +407,8 @@ class WMCentral:
                     details="Vulnerabilidad supuesta. Obliga a nueva autenticación."
                 )
                 self.log(f"Claves REVOCADAS para estación {clean_id}. Estado: FUERA DE SERVICIO.", ws_id=clean_id)
-
-                sock = self.station_sockets.get(clean_id)
-                if sock:
-                    try:
-                        from common import send_frame
-                        send_frame(sock, "STATUS#REVOKED#Claves simetricas revocadas por Central. Se requiere re-autenticacion")
-                    except Exception:
-                        pass
+                # No se escribe en el socket desde este hilo (lo atiende el hilo de la conexión):
+                # el Monitor recibe STATUS#REVOKED como respuesta a su siguiente mensaje (PING cada 3 s).
                 return True
         return False
 
@@ -435,6 +451,9 @@ class WMCentral:
 
                 st = self.stations.get(clean_id)
                 if st:
+                    if st.get("keys_revoked"):
+                        # Tras re-autenticarse seguirá fuera de servicio mientras dure la alerta
+                        st["oos_before_revocation"] = True
                     if st["status"] == STATUS_WATERING:
                         if not st.get("pending_weather_stop"):
                             # Si se está realizando un riego, el mismo finalizará con normalidad
@@ -459,7 +478,10 @@ class WMCentral:
                     st = self.stations.get(clean_id)
                     if st:
                         st.pop("pending_weather_stop", None)
-                        if st["status"] == STATUS_OUT_OF_SERVICE:
+                        if st.get("keys_revoked"):
+                            # Claves revocadas: no se restaura hasta la nueva autenticación
+                            st["oos_before_revocation"] = False
+                        elif st["status"] == STATUS_OUT_OF_SERVICE:
                             self.set_station_status(clean_id, STATUS_AVAILABLE)
                             self.send_ws_command(clean_id, "ACTIVATE")
 
@@ -531,13 +553,48 @@ class WMCentral:
     # SERVIDOR DE SOCKETS (COMUNICACIÓN CON WM_WS_M)
     # --------------------------------------------------------------------------
 
+    def _init_tls_context(self) -> ssl.SSLContext:
+        """Prepara el contexto TLS de servidor del canal con los monitores.
+        Genera el certificado autofirmado si no existe o si no cubre los SAN configurados.
+        Si no es posible, lanza una excepción: no existe alternativa sin cifrar."""
+        if ensure_tls_certificate(self.tls_cert, self.tls_key, "WM_Central", self.tls_san):
+            self.log(f"Certificado TLS de Central generado en {self.tls_cert} (válido para: {', '.join(self.tls_san)}). "
+                     f"Copie este certificado a los Monitores (WM_WS_M) para que validen a Central.")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(self.tls_cert, self.tls_key)
+        return ctx
+
+    def _wrap_station_tls(self, conn: socket.socket, client_ip: str):
+        """Negocia TLS con el Monitor recién conectado. Devuelve el socket cifrado o None si el
+        cliente no completa el handshake (conexión en claro, certificado rechazado, timeout...)."""
+        conn.settimeout(10.0)
+        try:
+            return self._tls_ctx.wrap_socket(conn, server_side=True)
+        except (ssl.SSLError, OSError) as exc:
+            reason = getattr(exc, "reason", None) or str(exc) or exc.__class__.__name__
+            self.audit_event(
+                "DESCONOCIDA", client_ip, "TLS_FAILED",
+                f"Conexión rechazada desde {client_ip}: no se completó el handshake TLS con Central.",
+                f"Motivo: {reason}"
+            )
+            self.log(f"Conexión rechazada desde {client_ip}: TLS no negociado ({reason})")
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return None
+
     #escuchar conexiones de monitores
     def run_socket_server(self):
+        # Canal cifrado obligatorio: si el contexto TLS no se puede preparar, no se abre el puerto
+        if self._tls_ctx is None:
+            self._tls_ctx = self._init_tls_context()
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind(("0.0.0.0", self.socket_port))
         server.listen(10)
-        self.log(f"Servidor de Sockets escuchando en puerto {self.socket_port} para monitores (WM_WS_M)")
+        self.log(f"Servidor de Sockets TLS escuchando en puerto {self.socket_port} para monitores (WM_WS_M)")
 
         while self.running:
             try:
@@ -551,6 +608,10 @@ class WMCentral:
     def _handle_station_socket(self, conn: socket.socket, addr):
         station_id = None
         client_ip = addr[0] if addr else "desconocida"
+        # TLS dentro del hilo de la conexión para que un cliente lento no bloquee el accept()
+        conn = self._wrap_station_tls(conn, client_ip)
+        if conn is None:
+            return
         try:
             server_handshake(conn)
             conn.settimeout(15.0)  # Si no hay mensajes o PING en 15s, se considera desconectada
@@ -643,7 +704,18 @@ class WMCentral:
                         st["engine_ok"] = False
                         st["engine_reason"] = "Engine no conectado al Monitor"
 
-                        if st["status"] != STATUS_OUT_OF_SERVICE:
+                        if st.pop("keys_revoked", False):
+                            # Nueva autenticación tras revocación: nuevas claves y vuelta al servicio,
+                            # salvo que ya estuviera fuera de servicio por otro motivo.
+                            keep_oos = st.pop("oos_before_revocation", False)
+                            self.audit_event(
+                                st_id, client_ip, "KEY_RENEWED",
+                                f"Estación {st_id} re-autenticada tras revocación: nueva clave simétrica emitida.",
+                                "Se mantiene FUERA DE SERVICIO (bloqueo previo)" if keep_oos else "Vuelve a servicio"
+                            )
+                        else:
+                            keep_oos = st["status"] == STATUS_OUT_OF_SERVICE
+                        if not keep_oos:
                             self.set_station_status(st_id, STATUS_LEAK)
 
                         self._update_station_db(
@@ -829,8 +901,12 @@ class WMCentral:
                             st["transaction_id"] = None
                             st["flow"] = 0.0
                             st["vol"] = 0.0
-                            self.set_station_status(station_id, STATUS_OFFLINE)
-                            self.log("Conexión de socket cerrada: estación DESCONECTADA", ws_id=station_id)
+                            if st.get("keys_revoked"):
+                                self.log("Conexión de socket cerrada con claves revocadas: estación FUERA DE SERVICIO "
+                                         "hasta nueva autenticación", ws_id=station_id)
+                            else:
+                                self.set_station_status(station_id, STATUS_OFFLINE)
+                                self.log("Conexión de socket cerrada: estación DESCONECTADA", ws_id=station_id)
 
     def _finalize_interrupted_if_unreported(self, ws_id: str, interrupted_ts: float):
         """Si el Engine cayó abruptamente (p. ej. muerte de proceso) y no envió FINISHED tras LEAK,
@@ -1206,6 +1282,9 @@ class WMCentral:
                                          "Estación bloqueada por CENTRAL: Riego detenido")
                 st["pending_start"] = False
                 st["pending_since"] = None
+                if st.get("keys_revoked"):
+                    # El bloqueo se mantiene después de la nueva autenticación
+                    st["oos_before_revocation"] = True
                 self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                 self.send_ws_command(ws_id, "BLOCK")
                 self.log("Puesta en FUERA DE SERVICIO por orden de CENTRAL", ws_id=ws_id)
@@ -1220,6 +1299,9 @@ class WMCentral:
         for ws_id in stations:
             with self.lock:
                 st = self.stations[ws_id]
+                if st.get("keys_revoked"):
+                    self.log(f"No se puede activar {ws_id}: claves revocadas, el Monitor debe re-autenticarse", ws_id=ws_id)
+                    continue
                 monitor_connected = (ws_id in self.station_sockets) and (st["status"] != STATUS_OFFLINE)
                 engine_ok = bool(st.get("engine_ok", False))
                 reason = st.get("engine_reason") or "Engine no conectado al Monitor"
@@ -1637,6 +1719,14 @@ class WMCentral:
                 print(help_text)
 
     def start(self):
+        # 0. Canal TLS con los monitores: sin él no se arranca (no hay alternativa en claro)
+        try:
+            self._tls_ctx = self._init_tls_context()
+        except Exception as exc:
+            print(f"[CENTRAL] ERROR CRÍTICO DE SEGURIDAD: no se pudo preparar TLS para los monitores ({exc}). "
+                  f"Se aborta el inicio para evitar sockets sin cifrar.", file=sys.stderr, flush=True)
+            sys.exit(1)
+
         # 1. Hilo del Servidor de Sockets para monitores
         threading.Thread(target=self.run_socket_server, daemon=True).start()
 
@@ -1677,6 +1767,13 @@ def main():
     parser.add_argument("args", nargs="*", help="[puerto_sockets] [kafka_host:puerto] o [puerto_sockets] [kafka_host] [kafka_puerto]")
     parser.add_argument("--web-port", type=int, default=default_web, help="Puerto para el cuadro de mandos Web (por defecto 8080 o $PORT)")
     parser.add_argument("--db", default=default_db, help="Ruta del fichero SQLite (por defecto central.db o $DB_PATH)")
+    parser.add_argument("--cert", default=None,
+                        help="Certificado TLS PEM del canal con los monitores (por defecto WM_Central/certs/central_cert.pem)")
+    parser.add_argument("--key", default=None,
+                        help="Clave privada TLS PEM (por defecto WM_Central/certs/central_key.pem)")
+    parser.add_argument("--san", default=os.getenv("WM_CENTRAL_SAN", ""),
+                        help="Nombres DNS/IP adicionales del certificado separados por comas, p. ej. el host "
+                             "público del despliegue cloud (también: $WM_CENTRAL_SAN)")
 
     parsed = parser.parse_args()
     raw_args = parsed.args
@@ -1706,7 +1803,10 @@ def main():
         socket_port=socket_port,
         kafka_bootstrap=kafka_bootstrap,
         web_port=parsed.web_port,
-        db_path=parsed.db
+        db_path=parsed.db,
+        tls_cert=parsed.cert,
+        tls_key=parsed.key,
+        tls_san=parsed.san.split(",")
     )
     central.start()
 

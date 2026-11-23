@@ -17,6 +17,7 @@ import os
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -102,8 +103,12 @@ def run_tests():
         except: pass
 
     # Mock bootstrap de Kafka para la prueba
+    # Certificado TLS de Central en un directorio temporal (canal cifrado con los monitores)
+    tls_dir = tempfile.mkdtemp(prefix="wm_r2_tls_")
     central = WMCentral(socket_port=5010, kafka_bootstrap="localhost:9092",
-                        web_port=8090, db_path=central_db)
+                        web_port=8090, db_path=central_db,
+                        tls_cert=os.path.join(tls_dir, "central_cert.pem"),
+                        tls_key=os.path.join(tls_dir, "central_key.pem"))
     central.registry_url = "https://127.0.0.1:5520"
     central.registry_db_path = reg_db
 
@@ -113,8 +118,26 @@ def run_tests():
     t_cent_web.start()
     time.sleep(1.0)
 
+    # Clientes TLS que validan el certificado de Central (cadena y nombre de host)
+    central_ctx = ssl.create_default_context(cafile=central.tls_cert)
+
+    def tls_connect():
+        raw = socket.create_connection(("127.0.0.1", 5010), timeout=3.0)
+        return central_ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+
+    # 3.0 Un cliente sin TLS es rechazado por Central
+    s_plain = socket.create_connection(("127.0.0.1", 5010), timeout=3.0)
+    s_plain.sendall(b"\x05\x02AUTH#WS-88#CRED-X#Zona\x03\x00")
+    try:
+        plain_reply = s_plain.recv(16)
+    except ConnectionResetError:
+        plain_reply = b""
+    assert plain_reply == b"", "Central no debe responder a un cliente sin TLS"
+    s_plain.close()
+    print("  -> Conexión sin TLS rechazada por Central.")
+
     # 3.1 Intento de autenticación sin registro en Registry -> Denegado
-    s_fake = socket.create_connection(("127.0.0.1", 5010), timeout=3.0)
+    s_fake = tls_connect()
     client_handshake(s_fake)
     resp_fake = request_socket(s_fake, "AUTH#WS-99#CRED-FALSA-1234#Zona Desconocida")
     assert "KO" in resp_fake, f"Autenticación con credencial falsa debió ser rechazada: {resp_fake}"
@@ -122,7 +145,7 @@ def run_tests():
     print("  -> Autenticación de estación no registrada rechazada con éxito (KO).")
 
     # 3.2 Autenticación con credencial legítima de Registry
-    s_ws88 = socket.create_connection(("127.0.0.1", 5010), timeout=3.0)
+    s_ws88 = tls_connect()
     client_handshake(s_ws88)
     resp_ok = request_socket(s_ws88, f"AUTH#WS-88#{ws88_cred}#Parque Central")
     assert resp_ok.startswith("STATUS#OK#"), f"Autenticación legítima falló: {resp_ok}"
@@ -154,11 +177,13 @@ def run_tests():
     assert central.stations["WS-88"]["status"] == "FUERA DE SERVICIO", "La estación debe quedar FUERA DE SERVICIO"
     assert "WS-88" not in central.station_keys, "La clave simétrica debe haber sido borrada"
 
-    # Central notifica inmediatamente al socket de la estación que la clave fue revocada
-    from common import recv_msg
-    resp_rev = recv_msg(s_ws88)
+    # Central avisa de la revocación en la respuesta al siguiente mensaje de la estación
+    resp_rev = request_socket(s_ws88, encrypt_message(ws88_sym_key, "PING#WS-88#OK#OK"))
     assert "REVOKED" in resp_rev, f"Se esperaba aviso REVOKED de Central: {resp_rev}"
     s_ws88.close()
+    time.sleep(0.3)
+    assert central.stations["WS-88"]["status"] == "FUERA DE SERVICIO", \
+        "Tras desconectarse con claves revocadas debe seguir FUERA DE SERVICIO"
     print("  -> Central rechazó mensaje con claves revocadas. Estación queda fuera de servicio.")
     print("  -> TEST 5 SUPERADO: Revocación de claves y estado FUERA DE SERVICIO OK.")
 
@@ -166,7 +191,12 @@ def run_tests():
     # PRUEBA 6: API_Central y Alerta Meteorológica de WM_W
     # --------------------------------------------------------------------------
     print("\n[TEST 6] Simulando alerta meteorológica de congelación (< 0ºC) desde WM_W vía API_Central...")
-    # Damos de alta y activamos WS-88 para la prueba de alerta climática
+    # Re-autenticación de WS-88 (nuevas claves) y activación para la prueba de alerta climática
+    s_ws88 = tls_connect()
+    client_handshake(s_ws88)
+    resp_reauth = request_socket(s_ws88, f"AUTH#WS-88#{ws88_cred}#Parque Central")
+    assert resp_reauth.startswith("STATUS#OK#") and resp_reauth.split("#")[2] != ws88_sym_key, \
+        f"La re-autenticación debe entregar una clave nueva: {resp_reauth}"
     central.activate_station("WS-88")
 
     alert_payload = json.dumps({
