@@ -2242,5 +2242,84 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertIn("huella", output, "Las claves se identifican por su huella")
 
 
+    # ------------------------------------------------------------------------------------------
+    # Release 2 - bloque 8: alertas climáticas y riegos
+    # ------------------------------------------------------------------------------------------
+    def _fo_msgs(self, start, ws="WS-01"):
+        return [(m["type"], m.get("msg", ""), m.get("reason")) for m in self._kafka_msgs(common.TOPIC_REPLIES)[start:]
+                if m.get("ws") == ws and m.get("type") in ("AUTH", "DENY", "SUMMARY")]
+
+    def test_34_alert_cancelled_while_watering_finishes(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        n = len(self._kafka_msgs(common.TOPIC_REPLIES))
+        central.request_watering("FO-01", "WS-01", 3)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        self.assertTrue(self._wait_until(lambda: getattr(engine, "pending_weather_block", False), 3))
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        time.sleep(0.5)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_WATERING,
+                         "Sigue REGANDO: no se marca DISPONIBLE antes de terminar")
+        self.assertEqual(engine.state, "WATERING", "La cancelación no interrumpe el riego")
+        self.assertFalse(engine.pending_weather_block, "Se anula el bloqueo climático pendiente")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 6))
+        self.assertTrue(self._wait_until(lambda: any(m[0] == "SUMMARY" for m in self._fo_msgs(n)), 3))
+        self.assertEqual([m[2] for m in self._fo_msgs(n) if m[0] == "SUMMARY"], ["TIME"], "Terminó con normalidad")
+        central.request_watering("FO-01", "WS-01", 1)
+        self.assertTrue(self._wait_until(lambda: engine.state == "WATERING", 4), "La estación sigue operativa")
+        engine.running = monitor.running = central.running = False
+
+    def test_35_alert_with_pending_start_denies_without_contradictions(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        held, holding = [], {"on": True}
+        real_process = central._process_kafka_event
+        central._process_kafka_event = lambda msg: held.append(msg) if holding["on"] else real_process(msg)
+        n = len(self._kafka_msgs(common.TOPIC_REPLIES))
+        central.request_watering("FO-01", "WS-01", 5)
+        self.assertTrue(central.stations["WS-01"]["pending_start"])
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")  # START sin confirmar
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        self.assertFalse(central.stations["WS-01"]["pending_start"])
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 6), "El Engine queda bloqueado")
+        holding["on"] = False
+        for msg in list(held):                         # llega tarde la confirmación del Engine
+            real_process(msg)
+        time.sleep(1.5)
+        msgs = self._fo_msgs(n)
+        self.assertNotIn("AUTH", [m[0] for m in msgs], "Nunca 'AUTORIZADO' para un riego cancelado por la alerta")
+        self.assertEqual(msgs[0][0], "DENY")
+        self.assertIn("alerta climática", msgs[0][1])
+        for _, text, _ in msgs[1:]:
+            self.assertIn("CANCELADO por alerta climática", text)
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 6))
+        engine.running = monitor.running = central.running = False
+
+    def test_36_alert_during_watering_finishes_normally_and_blocks_new_waterings(self):
+        central, monitor, engine = self._start_cluster("WS-01")
+        n = len(self._kafka_msgs(common.TOPIC_REPLIES))
+        central.request_watering("FO-01", "WS-01", 3)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_WATERING, 5))
+        central.handle_weather_alert("WS-01", "Oslo", 5.0, "Rain", True, "Lluvia")
+        time.sleep(0.5)
+        self.assertEqual(engine.state, "WATERING", "El riego en curso no se corta")
+        ok, msg = central.request_watering("FO-02", "WS-01", 5)
+        self.assertFalse(ok, "Sin riegos nuevos durante la alerta")
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 6))
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_OUT_OF_SERVICE, 3))
+        self.assertTrue(self._wait_until(lambda: any(m[0] == "SUMMARY" for m in self._fo_msgs(n)), 3))
+        self.assertEqual([m[2] for m in self._fo_msgs(n) if m[0] == "SUMMARY"], ["TIME"], "Terminó con normalidad")
+        ok, msg = central.request_watering("FO-02", "WS-01", 5)
+        self.assertFalse(ok)
+        self.assertIn("fuera de servicio por alerta climática", msg)
+        engine.start_watering("MANUAL", 0)
+        self.assertEqual(engine.state, "BLOCKED", "Tampoco riego manual en la estación")
+        engine.running = monitor.running = central.running = False
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -55,7 +55,7 @@ Sistema distribuido de gestión, supervisión y seguridad del riego en parques y
   Servidor HTTPS sobre puerto `5500` con certificados SSL. Ofrece endpoints REST (`/api/stations`, `/api/verify`) para que las estaciones se den de alta y obtengan de forma segura su credencial de acceso (`CRED-...`). Sin este paso, Central deniega la autenticación.
 
 - **Weather Control Office (WM_W):**
-  Supervisa cada 4 segundos el clima de las ciudades de las estaciones conectándose a OpenWeather (`https://api.openweathermap.org/`). Si la temperatura baja de 0 ºC o hay lluvia, notifica a Central vía `API_Central` (`POST /api/weather/alert`). Central detiene el riego suavemente y la pasa a "FUERA DE SERVICIO". Cuando el clima vuelve a ser favorable, notifica la cancelación y la estación se restaura automáticamente. Incluye menú interactivo y fichero `ciudades.json` para cambiar ubicaciones en tiempo real sin reiniciar el sistema (conforme a los requisitos de evaluación).
+  Supervisa cada 4 segundos el clima de las ciudades de las estaciones conectándose a OpenWeather (`https://api.openweathermap.org/`). Si la temperatura baja de 0 ºC o hay lluvia, notifica a Central vía `API_Central` (`PUT /api/weather/{ws}`; la cancelación, con `DELETE /api/weather/{ws}/alert`). Central detiene el riego suavemente y la pasa a "FUERA DE SERVICIO". Cuando el clima vuelve a ser favorable, notifica la cancelación y la estación se restaura automáticamente. Incluye menú interactivo y fichero `ciudades.json` para cambiar ubicaciones en tiempo real sin reiniciar el sistema (conforme a los requisitos de evaluación).
 
 - **Front (Node.js Web Dashboard):**
   Servidor Node.js ligero que consume `API_Central` y muestra el cuadro de mandos interactivo:
@@ -189,6 +189,12 @@ WM_WEATHER_TOKEN=<secreto compartido con Central> python WM_W/WM_W.py http://<IP
 ```
 - Realiza consultas cada 4 segundos a OpenWeather y en cada ciclo envía a Central el estado climático actual de cada WS (`PUT /api/weather/{ws}`), aunque no cambie: así Central recupera las alertas si se reinicia. Al volver el clima favorable cancela la alerta (`DELETE /api/weather/{ws}/alert`).
 - Sin `WM_WEATHER_TOKEN` no arranca. Como el secreto viaja en una cabecera, en el despliegue use una URL `https://` de API_Central cuando esté disponible (p. ej. la que proporciona Railway).
+- Clave de OpenWeather: variable `OPENWEATHER_API_KEY`, opción `--key` o comando `k` del menú (no se guarda ni aparece en los logs).
+- Ciudades: comando `c <WS> <ciudad>` del menú o edición del fichero de ciudades (`--cities`, por defecto `WM_W/ciudades.json`); los cambios del fichero se aplican en el siguiente ciclo sin reiniciar (si el fichero no es válido se mantiene la configuración anterior). Simulación: `f <WS> [temp]` (helada), `r <WS>` (lluvia), `ok <WS> [temp]` (clima favorable).
+- En cada ciclo hace una única consulta concurrente por ciudad distinta (las WS de la misma ciudad comparten el resultado), con un límite de espera de 3 s por consulta: una ciudad lenta no retrasa a las demás.
+- Si OpenWeather no da un dato válido (clave no válida, ciudad inexistente, límite superado `429`, sin red o respuesta no válida) **no se inventan datos ni se cancelan alertas**: no se envía nada para esa WS y Central conserva el último estado real. Cada fallo se registra una vez, al producirse, y su recuperación al volver a responder.
+- Límites del plan gratuito de OpenWeather: 60 llamadas por minuto y 1.000.000 al mes. Con una consulta por ciudad distinta cada 4 s se hacen 15 llamadas por minuto por ciudad, así que con más de 4 ciudades distintas a la vez se supera el límite por minuto y OpenWeather responderá `429` en parte de las consultas (se registra y no se inventan resultados).
+- `OPENWEATHER_URL` permite apuntar a un servidor simulado en las pruebas (por defecto, el endpoint oficial `https://api.openweathermap.org/data/2.5/weather`).
 - Dispone de menú para cambiar ciudades en caliente (`c WS-01 Londres`) o simular heladas/lluvia instantáneas (`f WS-01 -4`, `r WS-01`, `ok WS-01`).
 
 **Paso 2.2 — Operarios de Campo (WM_FO):**
@@ -242,6 +248,7 @@ Pruebas de API_Central, WM_W y el Front (HTTP, Registry HTTPS y Node.js reales; 
 python test_api_central.py
 python test_front_proxy.py
 python test_audit.py
+python test_weather.py      # OpenWeather simulado; con OPENWEATHER_API_KEY definida añade una consulta real
 ```
 
 Las pruebas del canal TLS entre Central y los Monitores están en `test_tls_central.py` (sockets, TLS y Registry HTTPS reales):

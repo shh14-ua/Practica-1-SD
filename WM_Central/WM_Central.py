@@ -96,6 +96,8 @@ class WMCentral:
         # Revocación: huella de la última credencial aceptada por WS y de la credencial en uso al revocar
         # (tras una revocación solo se acepta una credencial renovada en WM_Registry)
         self._last_cred_fp: Dict[str, str] = {}
+        # Transacciones cuyo START se canceló por una alerta antes de confirmarse {transaction_id: hora}
+        self._weather_cancelled_tx: Dict[str, float] = {}
         self._revoked_cred_fp: Dict[str, Optional[str]] = {}
 
         # Alertas meteorológicas activas (Release 2 - WM_W) {ws_id: alert_info}
@@ -672,6 +674,22 @@ class WMCentral:
                             self.log(f"Riego en curso en {clean_id} finalizará normalmente antes de pasar a Fuera de Servicio.", ws_id=clean_id)
                             self.send_ws_command(clean_id, "STOP", reason="WEATHER_ALERT")
                     elif st["status"] != STATUS_OUT_OF_SERVICE:
+                        if st.get("pending_start"):
+                            # Orden START aún sin confirmar: el riego no ha comenzado y no se autoriza.
+                            # Si el Engine llegara a abrir la válvula, el BLOCK lo cierra y su FINISHED
+                            # se registra indicando que se canceló por la alerta (sin "AUTORIZADO").
+                            op, tx = st.get("operator"), st.get("transaction_id")
+                            if tx:
+                                now = time.time()
+                                for old in [t for t, ts in self._weather_cancelled_tx.items() if now - ts > 3600]:
+                                    self._weather_cancelled_tx.pop(old, None)
+                                self._weather_cancelled_tx[tx] = now
+                            self.notify_operator(op, "DENY", clean_id,
+                                                 f"DENEGADO: alerta climática en {clean_id} ({reason}) antes de iniciarse el riego")
+                            st["pending_start"] = False
+                            st["pending_since"] = None
+                            st["operator"] = None
+                            st["transaction_id"] = None
                         self.set_station_status(clean_id, STATUS_OUT_OF_SERVICE)
                         self.send_ws_command(clean_id, "BLOCK")
             else:
@@ -687,8 +705,15 @@ class WMCentral:
                     self.log(f"Clima favorable restaurado para {clean_id} ({city}). Alerta cancelada.", ws_id=clean_id)
                     st = self.stations.get(clean_id)
                     if st:
-                        st.pop("pending_weather_stop", None)
-                        if st.get("keys_revoked"):
+                        was_pending_stop = bool(st.pop("pending_weather_stop", None))
+                        if (was_pending_stop and st["status"] == STATUS_WATERING and not st.get("keys_revoked")
+                                and not st.get("central_block")):
+                            # El riego sigue en curso: se anula el bloqueo climático pendiente del Engine
+                            # (ACTIVATE no interrumpe el riego) y la WS seguirá REGANDO hasta que termine.
+                            self.send_ws_command(clean_id, "ACTIVATE")
+                            self.log("Alerta cancelada durante el riego: al terminar, la estación seguirá en servicio",
+                                     ws_id=clean_id)
+                        elif st.get("keys_revoked"):
                             pass  # Claves revocadas: no se restaura hasta la nueva autenticación
                         elif st.get("central_block"):
                             self.log("Clima favorable, pero la estación sigue FUERA DE SERVICIO por bloqueo "
@@ -1340,7 +1365,9 @@ class WMCentral:
                 elif st["status"] == STATUS_LEAK:
                     motivo = "presenta una fuga detectada"
                 elif st["status"] == STATUS_OUT_OF_SERVICE:
-                    motivo = "está fuera de servicio por orden central"
+                    motivo = ("está fuera de servicio por alerta climática" if ws_id in self.weather_alerts
+                              else "está fuera de servicio por claves revocadas" if st.get("keys_revoked")
+                              else "está fuera de servicio por orden central")
                 elif st["status"] == STATUS_OFFLINE:
                     motivo = "está desconectada de la red"
                 self.notify_operator(op, "DENY", ws_id, f"DENEGADO: {motivo}")
@@ -1531,6 +1558,9 @@ class WMCentral:
                 # 3. Notificar al operario únicamente si la transacción no estaba ya registrada
                 if inserted:
                     summary_msg = f"Riego FINALIZADO ({reason}): {total_vol:.2f} L consumidos en {dur} s"
+                    if self._weather_cancelled_tx.pop(tx_id, None):
+                        summary_msg = (f"Riego CANCELADO por alerta climática antes de su confirmación: la válvula "
+                                       f"llegó a abrirse ({total_vol:.2f} L en {dur} s)")
                     self.notify_operator(
                         op_id, "SUMMARY", ws_id, summary_msg,
                         total_vol=total_vol, duration=dur, reason=reason,

@@ -9,22 +9,28 @@ Funcionalidades:
   - API_Central (REST): PUT /api/weather/<WS> con el estado climático actual en cada ciclo (permite a
     Central recuperar las alertas tras reiniciarse) y DELETE /api/weather/<WS>/alert al cancelarse una
     alerta. Cada petición se autentica con el secreto compartido WM_WEATHER_TOKEN (variable de entorno).
-  - Carga y modificación dinámica de ciudades asociadas a las WS (mediante ciudades.json o menú).
+  - Carga y modificación dinámica de ciudades asociadas a las WS (menú o ciudades.json, que se relee
+    automáticamente al modificarse, sin reiniciar).
+  - Una consulta concurrente por ciudad distinta en cada ciclo; si OpenWeather falla no se inventan
+    datos: Central conserva el último estado conocido.
   - Menú interactivo en tiempo real para modificar ciudades o simular climas adversos/favorables.
 """
 
 import argparse
 import json
 import os
+import socket
 import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Dict, Any, Optional
 
-DEFAULT_API_KEY = "demo_key"  # El alumno o profesor puede introducir su clave gratuita de OpenWeather
+# Endpoint 'Current weather data' de OpenWeather (configurable solo para pruebas con un servidor simulado)
+DEFAULT_OPENWEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 
 class WeatherControlOffice:
@@ -35,8 +41,13 @@ class WeatherControlOffice:
         self.weather_token = (weather_token if weather_token is not None
                               else os.getenv("WM_WEATHER_TOKEN", "")).strip()
         self.central_ok: Optional[bool] = None
+        self.central_ok_by_ws: Dict[str, bool] = {}
         self.cities_file = cities_file
         self.api_key = api_key or os.getenv("OPENWEATHER_API_KEY", "")
+        self.openweather_url = os.getenv("OPENWEATHER_URL", DEFAULT_OPENWEATHER_URL).strip() or DEFAULT_OPENWEATHER_URL
+        self.ow_timeout = 3.0              # espera máxima por consulta (dentro del ciclo de 4 s)
+        self.ow_errors: Dict[str, str] = {}  # último fallo de OpenWeather por ciudad
+        self._cities_mtime: Optional[float] = None
         self.interval = interval
         self.running = True
         self.lock = threading.RLock()
@@ -56,23 +67,42 @@ class WeatherControlOffice:
     # --------------------------------------------------------------------------
     # GESTIÓN DEL FICHERO DE CIUDADES
     # --------------------------------------------------------------------------
+    def _cities_path(self) -> str:
+        file_path = self.cities_file
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), self.cities_file)
+        return file_path
+
+    @staticmethod
+    def _valid_cities(data) -> Optional[Dict[str, str]]:
+        """{"WS-01": "Madrid", ...} con identificadores y ciudades no vacíos; None si no es válido."""
+        if not isinstance(data, dict):
+            return None
+        cities = {}
+        for ws_id, city in data.items():
+            if not isinstance(ws_id, str) or not isinstance(city, str) or not ws_id.strip() or not city.strip():
+                return None
+            cities[ws_id.strip().upper()] = city.strip()
+        return cities
+
     def load_cities(self):
         """Carga las ciudades asociadas a cada estación desde el archivo JSON."""
         with self.lock:
-            # Buscar en directorio local o en ruta relativa
-            file_path = self.cities_file
-            if not os.path.isabs(file_path):
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                file_path = os.path.join(base_dir, self.cities_file)
-
+            file_path = self._cities_path()
             if os.path.isfile(file_path):
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:
-                        self.cities = json.load(f)
-                    self.log(f"Ciudades cargadas correctamente desde {file_path}: {self.cities}")
-                    return
+                        cities = self._valid_cities(json.load(f))
+                    self._cities_mtime = os.path.getmtime(file_path)
+                    if cities is not None:
+                        self.cities = cities
+                        self.log(f"Ciudades cargadas correctamente desde {file_path}: {self.cities}")
+                        return
+                    self.log(f"Error: {file_path} no tiene el formato {{\"WS-01\": \"Ciudad\", ...}}.")
                 except Exception as e:
-                    self.log(f"Error al leer {file_path}: {e}")
+                    self.log(f"Error al leer {file_path}: {e.__class__.__name__}")
+                if self.cities:
+                    return  # se mantiene la configuración anterior
 
             # Valores por defecto si el archivo no existe
             self.cities = {
@@ -84,18 +114,44 @@ class WeatherControlOffice:
             }
             self.save_cities()
 
+    def reload_cities_if_changed(self):
+        """Aplica sin reiniciar los cambios hechos a mano en el fichero de ciudades. Si el fichero no
+        es válido se mantiene la configuración actual (avisando una sola vez por modificación)."""
+        file_path = self._cities_path()
+        try:
+            mtime = os.path.getmtime(file_path)
+        except OSError:
+            return
+        with self.lock:
+            if mtime == self._cities_mtime:
+                return
+            self._cities_mtime = mtime
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    cities = self._valid_cities(json.load(f))
+            except Exception:
+                cities = None
+            if cities is None:
+                self.log(f"Aviso: {file_path} modificado pero no es válido; se mantienen las ciudades actuales.")
+                return
+            if cities == self.cities:
+                return
+            for ws_id, city in cities.items():
+                if self.cities.get(ws_id) != city:
+                    self.manual_overrides.pop(ws_id, None)  # nueva ciudad: datos reales
+            self.cities = cities
+            self.log(f"Fichero de ciudades modificado: nueva configuración {self.cities}")
+
     def save_cities(self):
         """Guarda la configuración actual de ciudades en el archivo JSON."""
         with self.lock:
-            file_path = self.cities_file
-            if not os.path.isabs(file_path):
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                file_path = os.path.join(base_dir, self.cities_file)
+            file_path = self._cities_path()
             try:
                 with open(file_path, "w", encoding="utf-8") as f:
                     json.dump(self.cities, f, indent=2, ensure_ascii=False)
+                self._cities_mtime = os.path.getmtime(file_path)
             except Exception as e:
-                self.log(f"Aviso: no se pudo guardar {file_path}: {e}")
+                self.log(f"Aviso: no se pudo guardar {file_path}: {e.__class__.__name__}")
 
     def set_station_city(self, ws_id: str, city: str):
         """Modifica la ciudad de una estación en tiempo real sin reiniciar el sistema."""
@@ -111,112 +167,111 @@ class WeatherControlOffice:
     # --------------------------------------------------------------------------
     # CONSULTA A OPENWEATHER Y ANÁLISIS CLIMÁTICO
     # --------------------------------------------------------------------------
-    def fetch_openweather(self, city: str) -> Optional[Dict[str, Any]]:
-        """Consulta el endpoint Current weather data de OpenWeather para una ciudad."""
-        encoded_city = urllib.parse.quote(city)
-        url = (
-            f"https://api.openweathermap.org/data/2.5/weather"
-            f"?q={encoded_city}&appid={self.api_key}&units=metric"
-        )
+    # Causas de fallo de una consulta (nunca se sustituyen por datos inventados)
+    OW_ERROR_TEXT = {
+        "HTTP 401": "clave de OpenWeather no válida o ausente (OPENWEATHER_API_KEY)",
+        "HTTP 404": "ciudad no encontrada en OpenWeather",
+        "HTTP 429": "límite de peticiones del plan de OpenWeather superado",
+        "SIN_RED": "OpenWeather no accesible (sin red o servicio caído)",
+        "TIMEOUT": "OpenWeather no respondió a tiempo",
+        "RESPUESTA_NO_VALIDA": "respuesta de OpenWeather no válida",
+    }
+
+    def fetch_openweather(self, city: str) -> tuple:
+        """Consulta 'Current weather data' de OpenWeather para una ciudad.
+        Devuelve (datos, None) o (None, causa del fallo). Nunca registra la URL (contiene la clave)."""
+        url = (f"{self.openweather_url}?q={urllib.parse.quote(city)}"
+               f"&appid={urllib.parse.quote(self.api_key)}&units=metric")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "WaterManagement-WM_W/2.0"})
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
-                if resp.status == 200:
-                    raw = resp.read().decode("utf-8")
-                    return json.loads(raw)
+            with urllib.request.urlopen(req, timeout=self.ow_timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return (data, None) if isinstance(data, dict) else (None, "RESPUESTA_NO_VALIDA")
         except urllib.error.HTTPError as he:
-            # 401 si la API key no está activa o 404 si la ciudad no existe
-            return {"error": f"HTTP {he.code}", "detail": str(he)}
-        except Exception as e:
-            return {"error": "NetworkError", "detail": str(e)}
-        return None
+            return None, f"HTTP {he.code}"
+        except (socket.timeout, TimeoutError):
+            return None, "TIMEOUT"
+        except urllib.error.URLError as ue:
+            return None, "TIMEOUT" if isinstance(ue.reason, (socket.timeout, TimeoutError)) else "SIN_RED"
+        except ValueError:
+            return None, "RESPUESTA_NO_VALIDA"
+        except Exception:
+            return None, "SIN_RED"
 
-    def analyze_weather(self, ws_id: str, city: str) -> Dict[str, Any]:
-        """
-        Determina temperatura y si hay condiciones adversas (temp < 0 ºC o lluvia).
-        Soporta simulación manual y consulta a OpenWeather.
-        """
+    @staticmethod
+    def interpret_openweather(ws_id: str, city: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Clima a partir de la respuesta de OpenWeather (main.temp y weather[0].main / campo 'rain').
+        Criterio del enunciado: alerta si la temperatura baja de 0 ºC o llueve. None si faltan datos."""
+        try:
+            temp = data["main"]["temp"]
+            if isinstance(temp, bool) or not isinstance(temp, (int, float)):
+                return None
+            temp = float(temp)
+            weather_list = data.get("weather") or [{}]
+            cond = str(weather_list[0].get("main", "Clear"))
+            desc = str(weather_list[0].get("description", ""))
+        except (KeyError, TypeError, AttributeError, IndexError):
+            return None
+        has_rain = cond in ("Rain", "Drizzle", "Thunderstorm", "Squall") or "rain" in data
+        is_freezing = temp < 0.0
+        reasons = []
+        if is_freezing:
+            reasons.append(f"Temperatura bajo cero ({temp:.1f}ºC)")
+        if has_rain:
+            reasons.append(f"Precipitaciones ({desc or cond})")
+        return {
+            "ws_id": ws_id, "city": city, "temp": temp, "condition": cond,
+            "alert": is_freezing or has_rain,
+            "reason": " y ".join(reasons) if reasons else "Clima favorable",
+            "source": "OPENWEATHER API",
+        }
+
+    def simulated_weather(self, ws_id: str, city: str) -> Optional[Dict[str, Any]]:
+        """Clima simulado desde el menú (f / r / ok) para esa WS, si lo hay."""
         with self.lock:
             override = self.manual_overrides.get(ws_id)
-            if override is not None:
-                temp = float(override.get("temp", 20.0))
-                is_raining = bool(override.get("rain", False))
-                cond = "Rain" if is_raining else ("Clear" if temp >= 0 else "Snow")
-                is_adverse = (temp < 0.0) or is_raining
-                reason = []
-                if temp < 0.0:
-                    reason.append(f"Temperatura de congelación ({temp:.1f}ºC)")
-                if is_raining:
-                    reason.append("Lluvia detectada (precipitación activa)")
-                reason_str = " y ".join(reason) if reason else "Clima favorable"
-                return {
-                    "ws_id": ws_id,
-                    "city": city,
-                    "temp": temp,
-                    "condition": cond,
-                    "alert": is_adverse,
-                    "reason": reason_str,
-                    "source": "SIMULACIÓN MANUAL"
-                }
+        if override is None:
+            return None
+        temp = float(override.get("temp", 20.0))
+        is_raining = bool(override.get("rain", False))
+        cond = "Rain" if is_raining else ("Clear" if temp >= 0 else "Snow")
+        reason = []
+        if temp < 0.0:
+            reason.append(f"Temperatura de congelación ({temp:.1f}ºC)")
+        if is_raining:
+            reason.append("Lluvia detectada (precipitación activa)")
+        return {
+            "ws_id": ws_id, "city": city, "temp": temp, "condition": cond,
+            "alert": (temp < 0.0) or is_raining,
+            "reason": " y ".join(reason) if reason else "Clima favorable",
+            "source": "SIMULACIÓN MANUAL",
+        }
 
-        # Consulta real a OpenWeather
-        res = self.fetch_openweather(city)
-        if not res or "error" in res:
-            # Si la API falla por límite o clave de prueba, aplicamos estimación según ciudad
-            # para no interrumpir la ejecución del alumno
-            default_temps = {"madrid": 15.0, "seville": 22.0, "valencia": 18.0, "london": 10.0, "helsinki": -2.0}
-            est_temp = default_temps.get(city.lower(), 12.0)
-            is_adverse = (est_temp < 0.0)
-            cond = "Snow" if est_temp < 0 else "Clear"
-            reason = f"Temperatura de congelación ({est_temp:.1f}ºC)" if is_adverse else "Clima favorable"
-            return {
-                "ws_id": ws_id,
-                "city": city,
-                "temp": est_temp,
-                "condition": cond,
-                "alert": is_adverse,
-                "reason": reason,
-                "source": f"FALLBACK ({res.get('error', 'Sin conexión') if res else 'Timeout'})"
-            }
+    def analyze_weather(self, ws_id: str, city: str) -> Optional[Dict[str, Any]]:
+        """Clima actual de una WS (simulado o de OpenWeather). None si no hay dato válido."""
+        simulated = self.simulated_weather(ws_id, city)
+        if simulated is not None:
+            return simulated
+        data, error = self.fetch_openweather(city)
+        weather = self.interpret_openweather(ws_id, city, data) if data is not None else None
+        self._report_openweather(city, error or (None if weather else "RESPUESTA_NO_VALIDA"))
+        return weather
 
-        try:
-            main_data = res.get("main", {})
-            temp = float(main_data.get("temp", 20.0))
-            weather_list = res.get("weather", [{}])
-            cond = weather_list[0].get("main", "Clear")
-            desc = weather_list[0].get("description", "")
-
-            # Criterio del enunciado: temperatura bajo cero (temp < 0ºC) o lluvia
-            rain_conditions = ("Rain", "Drizzle", "Thunderstorm", "Squall")
-            has_rain = (cond in rain_conditions) or ("rain" in res)
-            is_freezing = (temp < 0.0)
-            is_adverse = is_freezing or has_rain
-
-            reasons = []
-            if is_freezing:
-                reasons.append(f"Temperatura bajo cero ({temp:.1f}ºC)")
-            if has_rain:
-                reasons.append(f"Precipitaciones ({desc or cond})")
-
-            return {
-                "ws_id": ws_id,
-                "city": city,
-                "temp": temp,
-                "condition": cond,
-                "alert": is_adverse,
-                "reason": " y ".join(reasons) if reasons else "Clima favorable",
-                "source": "OPENWEATHER API"
-            }
-        except Exception as e:
-            return {
-                "ws_id": ws_id,
-                "city": city,
-                "temp": 15.0,
-                "condition": "Clear",
-                "alert": False,
-                "reason": f"Error parseando datos: {e}",
-                "source": "ERROR"
-            }
+    def _report_openweather(self, city: str, error: Optional[str]):
+        """Avisa de los fallos de OpenWeather por ciudad solo cuando cambian (sin saturar el log)."""
+        key = city.strip().lower()
+        with self.lock:
+            previous = self.ow_errors.get(key)
+            if error:
+                self.ow_errors[key] = error
+            else:
+                self.ow_errors.pop(key, None)
+        if error and error != previous:
+            text = self.OW_ERROR_TEXT.get(error, f"error de OpenWeather ({error})")
+            self.log(f"Aviso: sin dato válido de OpenWeather para '{city}': {text}. "
+                     f"Central conserva el último estado conocido.")
+        elif not error and previous:
+            self.log(f"OpenWeather vuelve a responder para '{city}'.")
 
     # --------------------------------------------------------------------------
     # NOTIFICACIÓN A CENTRAL VÍA API_CENTRAL
@@ -236,19 +291,25 @@ class WeatherControlOffice:
         except Exception:
             return 0
 
-    def _report_delivery(self, code: int):
-        """Informa del estado de entrega solo cuando cambia (sin repetir el aviso cada 4 s)."""
+    def _report_delivery(self, ws_id: str, code: int):
+        """Informa del estado de entrega de cada WS solo cuando cambia (sin repetir el aviso cada 4 s)."""
         ok = code in (200, 201, 204)
-        if ok != self.central_ok:
-            if ok:
-                self.log(f"Comunicación con API_Central correcta ({self.central_api_url}).")
-            elif code in (401, 503):
-                self.log("API_Central RECHAZA las notificaciones: revise WM_WEATHER_TOKEN en WM_W y en Central.")
-            elif code == 0:
-                self.log(f"Aviso: API_Central no accesible ({self.central_api_url}). Se reintenta en cada ciclo.")
-            else:
-                self.log(f"Aviso: API_Central respondió HTTP {code} a la notificación climática.")
-        self.central_ok = ok
+        with self.lock:
+            previous = self.central_ok_by_ws.get(ws_id)
+            self.central_ok_by_ws[ws_id] = ok
+            self.central_ok = ok
+        if ok == previous:
+            return
+        if ok:
+            self.log(f"Comunicación con API_Central correcta para {ws_id} ({self.central_api_url}).")
+        elif code in (401, 503):
+            self.log(f"API_Central RECHAZA las notificaciones de {ws_id}: revise WM_WEATHER_TOKEN en WM_W y en Central.")
+        elif code == 404:
+            self.log(f"Aviso: {ws_id} no existe en WM_Central (HTTP 404). Revise el fichero de ciudades.")
+        elif code == 0:
+            self.log(f"Aviso: API_Central no accesible ({self.central_api_url}) para {ws_id}. Se reintenta en cada ciclo.")
+        else:
+            self.log(f"Aviso: API_Central respondió HTTP {code} a la notificación climática de {ws_id}.")
 
     def notify_central(self, weather_data: Dict[str, Any]) -> bool:
         """Comunica a WM_Central el estado climático actual de una WS (PUT /api/weather/<WS>)."""
@@ -262,7 +323,7 @@ class WeatherControlOffice:
             "reason": str(weather_data.get("reason", ""))[:200],
         }
         code = self._central_request("PUT", f"/api/weather/{urllib.parse.quote(ws_id)}", payload)
-        self._report_delivery(code)
+        self._report_delivery(ws_id, code)
         return code in (200, 201, 204)
 
     def cancel_alert(self, ws_id: str) -> bool:
@@ -271,51 +332,78 @@ class WeatherControlOffice:
         code = self._central_request("DELETE", f"/api/weather/{urllib.parse.quote(ws_id)}/alert")
         if code == 404:
             return True
-        self._report_delivery(code)
+        self._report_delivery(ws_id, code)
         return code in (200, 204)
 
     # --------------------------------------------------------------------------
     # BUCLE PRINCIPAL DE MONITORIZACIÓN METEOROLÓGICA (CADA 4 SEGUNDOS)
     # --------------------------------------------------------------------------
+    def _process_station(self, ws_id: str, city: str, weather: Optional[Dict[str, Any]]):
+        """Aplica el clima de una WS: sin dato válido no se envía nada (Central conserva el último
+        estado real); con dato, cancelación explícita si procede y estado actual a Central."""
+        if weather is None:
+            return
+        with self.lock:
+            prev_state = self.weather_state.get(ws_id)
+            self.weather_state[ws_id] = dict(weather, observed_at=time.strftime("%H:%M:%S"))
+        prev_alert = prev_state.get("alert") if prev_state else None
+        current_alert = weather["alert"]
+        if current_alert and prev_alert is not True:
+            self.log(f"¡ALERTA CLIMÁTICA DETECTADA! [{ws_id} - {city}]: {weather['reason']}. Notificando a Central...")
+        elif prev_alert is True and not current_alert:
+            self.log(f"Clima normalizado [{ws_id} - {city}]: {weather['temp']}ºC, {weather['condition']}. Notificando cancelación a Central...")
+        if prev_alert is True and not current_alert:
+            self.cancel_alert(ws_id)
+        # Estado climático actual en cada ciclo (aunque no cambie): Central recupera las alertas
+        # tras reiniciarse; las notificaciones repetidas no generan eventos duplicados
+        self.notify_central(weather)
+
+    def run_cycle(self):
+        """Un ciclo: una consulta concurrente por ciudad distinta (con límite de espera, una ciudad
+        lenta no retiene a las demás); su resultado se comparte entre las WS de esa ciudad."""
+        self.reload_cities_if_changed()
+        with self.lock:
+            stations = dict(self.cities)
+            simulated = {ws for ws in stations if ws in self.manual_overrides}
+        real_cities = {}
+        for ws_id, city in stations.items():
+            if ws_id not in simulated:
+                real_cities.setdefault(city.strip().lower(), city)
+        if not stations:
+            return
+        pool = ThreadPoolExecutor(max_workers=max(1, len(real_cities), len(stations)))
+        try:
+            futures = {key: pool.submit(self.fetch_openweather, city) for key, city in real_cities.items()}
+            wait(list(futures.values()), timeout=self.ow_timeout + 0.5)
+            results = {}
+            for key, fut in futures.items():
+                data, error = fut.result() if fut.done() else (None, "TIMEOUT")
+                weather_any = self.interpret_openweather("", real_cities[key], data) if data is not None else None
+                self._report_openweather(real_cities[key], error or (None if weather_any else "RESPUESTA_NO_VALIDA"))
+                results[key] = weather_any
+            jobs = []
+            for ws_id, city in stations.items():
+                if ws_id in simulated:
+                    weather = self.simulated_weather(ws_id, city)
+                else:
+                    shared = results.get(city.strip().lower())
+                    weather = dict(shared, ws_id=ws_id, city=city) if shared else None
+                jobs.append(pool.submit(self._process_station, ws_id, city, weather))
+            wait(jobs, timeout=max(1.0, self.interval))
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def run_monitoring_loop(self):
         self.log(f"Iniciando ciclo meteorológico. Sondeo a OpenWeather cada {self.interval}s.")
         self.log(f"API Central configurada en: {self.central_api_url}")
-
         while self.running:
             start_time = time.time()
-            with self.lock:
-                current_cities = dict(self.cities)
-
-            for ws_id, city in current_cities.items():
-                if not self.running:
-                    break
-                w_info = self.analyze_weather(ws_id, city)
-                prev_state = self.weather_state.get(ws_id)
-                self.weather_state[ws_id] = w_info
-
-                # Cambios del estado de alerta (para el log y la cancelación explícita)
-                prev_alert = prev_state.get("alert") if prev_state else None
-                current_alert = w_info["alert"]
-                alert_changed = (prev_alert != current_alert)
-
-                if alert_changed:
-                    if current_alert:
-                        self.log(f"¡ALERTA CLIMÁTICA DETECTADA! [{ws_id} - {city}]: {w_info['reason']}. Notificando a Central...")
-                    else:
-                        self.log(f"Clima normalizado [{ws_id} - {city}]: {w_info['temp']}ºC, {w_info['condition']}. Notificando cancelación a Central...")
-
-                # Cancelación explícita de la alerta al volver el clima favorable
-                if prev_alert is True and not current_alert:
-                    self.cancel_alert(ws_id)
-
-                # Estado climático actual en cada ciclo (aunque no cambie): Central recupera las alertas
-                # tras reiniciarse; las notificaciones repetidas no generan eventos duplicados
-                self.notify_central(w_info)
-
+            try:
+                self.run_cycle()
+            except Exception as exc:
+                self.log(f"Aviso: error en el ciclo meteorológico ({exc.__class__.__name__}).")
             # Dormir hasta completar el intervalo de 4 segundos
-            elapsed = time.time() - start_time
-            sleep_time = max(0.2, self.interval - elapsed)
-            time.sleep(sleep_time)
+            time.sleep(max(0.2, self.interval - (time.time() - start_time)))
 
     # --------------------------------------------------------------------------
     # MENÚ INTERACTIVO EN TIEMPO REAL (SEGÚN NOTA DE CORRECCIÓN DEL ENUNCIADO)
@@ -355,7 +443,9 @@ class WeatherControlOffice:
                             reason = st.get("reason", "Sin datos")
                             src = st.get("source", "")
                             status_badge = "[ALERTA ADVERSA]" if alert else "[CLIMA OK]"
-                            print(f"  • {ws_id:<7} | Ciudad: {city:<12} | Temp: {temp}ºC | Clima: {cond:<10} | {status_badge} ({reason}) [{src}]")
+                            error = self.ow_errors.get(city.strip().lower())
+                            extra = f" | SIN DATO ACTUAL: {self.OW_ERROR_TEXT.get(error, error)}" if error and ws_id not in self.manual_overrides else ""
+                            print(f"  • {ws_id:<7} | Ciudad: {city:<12} | Temp: {temp}ºC | Clima: {cond:<10} | {status_badge} ({reason}) [{src} {st.get('observed_at', '')}]{extra}")
                     print()
 
                 elif cmd == "c" and len(parts) >= 3:
