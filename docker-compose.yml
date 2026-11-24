@@ -47,6 +47,10 @@ services:
       WM_REGISTRY_CA: /data/certs/registry_cert.pem
       # Nombres/IP adicionales del certificado TLS de Central (host/IP con el que conectan los Monitores)
       WM_CENTRAL_SAN: ${WM_CENTRAL_SAN:-}
+      # Secretos de API_Central (definirlos en el entorno de despliegue; nunca en el repositorio):
+      # token de administración para las acciones de control y secreto compartido con WM_W
+      WM_ADMIN_TOKEN: ${WM_ADMIN_TOKEN:-}
+      WM_WEATHER_TOKEN: ${WM_WEATHER_TOKEN:-}
     volumes:
       - ./data:/data
     stdin_open: true

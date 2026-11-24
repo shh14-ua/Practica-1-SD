@@ -144,12 +144,33 @@ python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --san <HOST_
 - Al arrancar se genera (si no existe) un certificado autofirmado RSA-2048 en `WM_Central/certs/central_cert.pem` y su clave privada `central_key.pem` (permisos 0600, excluida de Git). Rutas configurables con `--cert` y `--key`.
 - `--san` (o `$WM_CENTRAL_SAN`) añade, separados por comas, los nombres DNS/IP con los que los Monitores contactan con Central (p. ej. el host público del despliegue cloud). Siempre se incluyen `localhost`, `central` y `127.0.0.1`. Si se añade un nombre nuevo, el certificado se regenera y hay que volver a copiarlo a los Monitores.
 - Copie `central_cert.pem` (nunca la clave) a las máquinas de los Monitores.
+- Secretos de API_Central (variables de entorno del despliegue, p. ej. en Railway o en `docker compose`; nunca en el repositorio):
+  - `WM_ADMIN_TOKEN`: token de administración para las acciones de control por la API (regar, bloquear, activar, revocar claves, alta de WS). Solo las peticiones directas desde la propia máquina de Central están exentas; las que llegan a través del Front siempre lo requieren.
+  - `WM_WEATHER_TOKEN`: secreto compartido con WM_W. Sin él configurado, Central rechaza todas las notificaciones climáticas.
+- Central consulta cada 10 s a WM_Registry (`GET /api/stations` por HTTPS, validando su certificado con `$WM_REGISTRY_CA`) qué WS están dadas de alta, para mostrar su estado de registro.
+
+**API_Central (REST):**
+
+| Método y ruta | Acceso | Descripción |
+|---|---|---|
+| `GET /api/stations`, `GET /api/stations/{ws}` | Público | Estado de las WS: estado, activación, clave/token, revocación, registro en WM_Registry, clima |
+| `GET /api/operators`, `GET /api/operators/{id}` | Público | Operarios FO con su estado (`REGANDO` / `EN_ESPERA`) y sus riegos en curso |
+| `GET /api/waterings` | Público | Riegos en curso (regando o pendientes de confirmación del Engine) |
+| `GET /api/status`, `/api/history`, `/api/audit`, `/api/weather` | Público | Panel completo (Front), histórico, auditoría y clima |
+| `PUT /api/weather/{ws}` | WM_W (`X-Weather-Token`) | Estado climático actual de una WS (activa o cancela la alerta) |
+| `DELETE /api/weather/{ws}/alert` | WM_W (`X-Weather-Token`) | Cancelación de la alerta climática |
+| `POST /api/weather/alert` | WM_W (`X-Weather-Token`) | Compatibilidad: igual que el PUT, con `ws_id` en el cuerpo |
+| `POST /api/action` | Administración (`X-Admin-Token`) | `start`, `block`, `activate`, `revoke_keys`, `register` |
+
+Las respuestas son JSON con códigos coherentes: 400 (datos no válidos), 401/403 (sin autorización), 404 (recurso inexistente), 409 (acción no realizable en el estado actual) y 503 (notificaciones climáticas sin `WM_WEATHER_TOKEN` configurado).
 
 **Paso 1.4 — Front (Web Dashboard en Node.js en puerto 3000):**
 ```bash
 node front/server.js 3000 http://localhost:8080
 ```
 El panel de control queda disponible en el navegador en `http://localhost:3000/`.
+- El Front solo reenvía a API_Central las consultas y las acciones de control; nunca las notificaciones climáticas. Al ejecutar una acción pide el token de administración, que solo se guarda en la sesión del navegador.
+- Si API_Central usa HTTPS con un certificado propio, indique su CA con `CENTRAL_API_CA=<ruta>`; el certificado siempre se verifica.
 
 ---
 
@@ -157,9 +178,10 @@ El panel de control queda disponible en el navegador en `http://localhost:3000/`
 
 **Paso 2.1 — Oficina Meteorológica (WM_W):**
 ```bash
-python WM_W/WM_W.py http://<IP_CENTRAL>:8080
+WM_WEATHER_TOKEN=<secreto compartido con Central> python WM_W/WM_W.py http://<IP_CENTRAL>:8080
 ```
-- Realiza consultas cada 4 segundos a OpenWeather.
+- Realiza consultas cada 4 segundos a OpenWeather y en cada ciclo envía a Central el estado climático actual de cada WS (`PUT /api/weather/{ws}`), aunque no cambie: así Central recupera las alertas si se reinicia. Al volver el clima favorable cancela la alerta (`DELETE /api/weather/{ws}/alert`).
+- Sin `WM_WEATHER_TOKEN` no arranca. Como el secreto viaja en una cabecera, en el despliegue use una URL `https://` de API_Central cuando esté disponible (p. ej. la que proporciona Railway).
 - Dispone de menú para cambiar ciudades en caliente (`c WS-01 Londres`) o simular heladas/lluvia instantáneas (`f WS-01 -4`, `r WS-01`, `ok WS-01`).
 
 **Paso 2.2 — Operarios de Campo (WM_FO):**
@@ -206,6 +228,13 @@ python WM_WS/WM_WS_E.py <IP_KAFKA>:9092 localhost:6001
 ---
 
 ## Verificación y Pruebas Automatizadas
+
+Pruebas de API_Central, WM_W y el Front (HTTP, Registry HTTPS y Node.js reales; Kafka simulado):
+
+```bash
+python test_api_central.py
+python test_front_proxy.py
+```
 
 Las pruebas del canal TLS entre Central y los Monitores están en `test_tls_central.py` (sockets, TLS y Registry HTTPS reales):
 

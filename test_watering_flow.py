@@ -2162,5 +2162,30 @@ class WaterManagementFlowTests(unittest.TestCase):
         engine.running = monitor.running = central.running = False
 
 
+    def test_32_weather_cancellation_respects_monitor_connection(self):
+        """Con Monitor y Engine conectados, la cancelación devuelve la WS a DISPONIBLE (Engine AVAILABLE).
+        Con el Monitor desconectado queda DESCONECTADA; al reconectarse vuelve a servicio como en la
+        Release 1. En ningún caso se inicia un riego."""
+        central, monitor, engine = self._start_cluster("WS-01")
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        self.assertTrue(self._wait_until(lambda: engine.state == "BLOCKED", 4))
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertTrue(self._wait_until(
+            lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE and engine.state == "AVAILABLE", 4))
+
+        restore = self._disconnect_monitor_from_central(central, monitor)
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_OFFLINE, 3))
+        central.handle_weather_alert("WS-01", "Oslo", -4.0, "Snow", True, "Helada")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OUT_OF_SERVICE)
+        central.handle_weather_alert("WS-01", "Oslo", 12.0, "Clear", False, "Normal")
+        self.assertEqual(central.stations["WS-01"]["status"], common.STATUS_OFFLINE,
+                         "Sin Monitor conectado no vuelve a DISPONIBLE")
+        restore()
+        self.assertTrue(self._wait_until(lambda: central.stations["WS-01"]["status"] == common.STATUS_AVAILABLE, 8))
+        self.assertNotEqual(engine.state, "WATERING")
+        self.assertEqual(central.stations["WS-01"]["operator"], None, "No se ha iniciado ningún riego")
+        engine.running = monitor.running = central.running = False
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

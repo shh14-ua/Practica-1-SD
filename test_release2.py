@@ -211,6 +211,10 @@ def run_tests():
     resp_reauth = request_socket(s_ws88, f"AUTH#WS-88#{ws88_cred}#Parque Central")
     assert resp_reauth.startswith("STATUS#OK#") and resp_reauth.split("#")[2] != ws88_sym_key, \
         f"La re-autenticación debe entregar una clave nueva: {resp_reauth}"
+    # Como un Monitor real, informa con un PING cifrado de que su Engine está operativo
+    new_key = resp_reauth.split("#")[2]
+    resp_ping2 = decrypt_message(new_key, request_socket(s_ws88, encrypt_message(new_key, "PING#WS-88#OK#OK")))
+    assert "OK" in resp_ping2, f"PING tras la re-autenticación: {resp_ping2}"
     central.activate_station("WS-88")
 
     alert_payload = json.dumps({
@@ -222,33 +226,43 @@ def run_tests():
         "reason": "Temperatura de congelación (-3.5ºC)"
     }).encode("utf-8")
 
-    req_alert = urllib.request.Request("http://127.0.0.1:8090/api/weather/alert", data=alert_payload,
-                                       headers={"Content-Type": "application/json"}, method="POST")
+    # Notificaciones de WM_W autenticadas con el secreto compartido WM_WEATHER_TOKEN
+    # (valor aleatorio generado para la prueba; nunca se guarda en el repositorio)
+    import secrets as _secrets
+    import urllib.error as _uerr
+    weather_token = _secrets.token_urlsafe(24)
+    os.environ["WM_WEATHER_TOKEN"] = weather_token
+
+    req_anon = urllib.request.Request("http://127.0.0.1:8090/api/weather/alert", data=alert_payload,
+                                      headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req_anon)
+        raise AssertionError("Una alerta sin token de WM_W debe rechazarse")
+    except _uerr.HTTPError as he:
+        assert he.code == 401, f"Se esperaba 401 sin token: {he.code}"
+    assert central.stations["WS-88"]["status"] != "FUERA DE SERVICIO", "La alerta anónima no debe tener efecto"
+    print("  -> Alerta sin token de WM_W rechazada (401).")
+
+    auth = {"Content-Type": "application/json", "X-Weather-Token": weather_token}
+    req_alert = urllib.request.Request("http://127.0.0.1:8090/api/weather/WS-88", data=alert_payload,
+                                       headers=auth, method="PUT")
     with urllib.request.urlopen(req_alert) as resp_al:
         assert resp_al.status == 200, "API_Central rechazó alerta"
 
     # Comprobamos que WS-88 pasó a FUERA DE SERVICIO por el clima adverso
     assert central.stations["WS-88"]["status"] == "FUERA DE SERVICIO", "WS-88 debió pasar a FUERA DE SERVICIO por helada"
     assert "WS-88" in central.weather_alerts, "Alerta meteorológica no registrada en Central"
-    print("  -> Alerta climática procesada: WS-88 detenida y en FUERA DE SERVICIO.")
+    print("  -> Alerta climática procesada (PUT /api/weather/WS-88): WS-88 detenida y en FUERA DE SERVICIO.")
 
     # Cancelación de la alerta climática (vuelve a ser favorable)
-    cancel_payload = json.dumps({
-        "ws_id": "WS-88",
-        "city": "Helsinki",
-        "temp": 14.0,
-        "condition": "Clear",
-        "alert": False,
-        "reason": "Clima normalizado"
-    }).encode("utf-8")
-    req_cancel = urllib.request.Request("http://127.0.0.1:8090/api/weather/alert", data=cancel_payload,
-                                        headers={"Content-Type": "application/json"}, method="POST")
+    req_cancel = urllib.request.Request("http://127.0.0.1:8090/api/weather/WS-88/alert",
+                                        headers=auth, method="DELETE")
     with urllib.request.urlopen(req_cancel) as resp_canc:
         assert resp_canc.status == 200
 
     assert central.stations["WS-88"]["status"] == "DISPONIBLE", "WS-88 debió restaurarse a DISPONIBLE"
     assert "WS-88" not in central.weather_alerts, "Alerta debió ser eliminada"
-    print("  -> Cancelación climática procesada: WS-88 restaurada a DISPONIBLE.")
+    print("  -> Cancelación climática procesada (DELETE /api/weather/WS-88/alert): WS-88 restaurada a DISPONIBLE.")
     print("  -> TEST 6 SUPERADO: Consumo de API_Central por WM_W y gestión de alertas OK.")
 
     # --------------------------------------------------------------------------

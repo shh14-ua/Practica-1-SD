@@ -542,6 +542,35 @@
       return "st-desconectada";
     }
 
+    // Acciones de control protegidas por Central (WM_ADMIN_TOKEN): el token lo introduce el usuario
+    // y solo se guarda en sessionStorage de esta pestaña (nunca en el código, URLs ni repositorio).
+    function adminToken() {
+      try { return sessionStorage.getItem("wmAdminToken") || ""; } catch (e) { return ""; }
+    }
+    async function postAdminAction(url, payload) {
+      const send = (token) => fetch(url, {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, token ? { "X-Admin-Token": token } : {}),
+        body: JSON.stringify(payload)
+      });
+      let resp = await send(adminToken());
+      if (resp.status === 403) {
+        const token = prompt("Acción protegida: introduzca el token de administración de Central");
+        if (!token) return resp;
+        try { sessionStorage.setItem("wmAdminToken", token); } catch (e) {}
+        resp = await send(token);
+        if (resp.status === 403) {
+          try { sessionStorage.removeItem("wmAdminToken"); } catch (e) {}
+        }
+      }
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { msg = (await resp.clone().json()).msg || msg; } catch (e) {}
+        alert("Acción no realizada: " + msg);
+      }
+      return resp;
+    }
+
     async function sendAction(action, wsId) {
       if (action === "revoke_keys") {
         if (!confirm(`¿Revocar las claves simétricas de seguridad de la estación ${wsId}? La estación quedará FUERA DE SERVICIO y obligada a re-autenticarse.`)) {
@@ -557,11 +586,7 @@
         payload.op = "CENTRAL";
       }
       try {
-        const resp = await fetch(`${API_BASE}/api/action`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
+        const resp = await postAdminAction(`${API_BASE}/api/action`, payload);
         if (resp.ok) {
           fetchStatus();
           fetchHistory();
@@ -708,13 +733,15 @@
         } else {
           tbody.innerHTML = stations.map(s => {
             const hasKey = Boolean(s.has_key);
-            const isConnected = s.status !== "DESCONECTADA";
             const isRevoked = Boolean(s.keys_revoked);  // estado real de revocación (API_Central)
 
-            // 1. Estado de Registro
-            const regBadge = (hasKey || isConnected)
-              ? `<span class="key-badge reg-ok">✓ Registrada y Autenticada</span>`
-              : `<span class="key-badge reg-pending">Registrada en BD (Sin Auth activa)</span>`;
+            // 1. Estado de Registro en WM_Registry (consultado por Central) y autenticación en Central
+            const authText = hasKey ? " · Autenticada en Central" : "";
+            const regBadge = s.registry_registered === true
+              ? `<span class="key-badge reg-ok">✓ Registrada en WM_Registry${authText}</span>`
+              : (s.registry_registered === false
+                  ? `<span class="key-badge reg-pending">✗ No registrada en WM_Registry</span>`
+                  : `<span class="key-badge reg-pending">? WM_Registry no disponible${authText}</span>`);
 
             // 2. Estado de Activación y salud del Engine
             const engineDetail = (s.status === "FUGA" && s.engine_reason)

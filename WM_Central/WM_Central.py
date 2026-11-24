@@ -80,6 +80,13 @@ class WMCentral:
         # Limitación de la auditoría de mensajes rechazados {(entidad, motivo): [último_registro, omitidos]}
         self._kafka_reject_audit: Dict[tuple, list] = {}
 
+        # Estado de alta de cada WS en WM_Registry (consultado periódicamente por HTTPS)
+        # registry_available: None = aún sin consultar, False = Registry no accesible
+        self.registry_registered: Dict[str, bool] = {}
+        self.registry_available: Optional[bool] = None
+        self.registry_checked_at: Optional[str] = None
+        self._throttled_logs: Dict[str, float] = {}
+
         # Revocación: huella de la última credencial aceptada por WS y de la credencial en uso al revocar
         # (tras una revocación solo se acepta una credencial renovada en WM_Registry)
         self._last_cred_fp: Dict[str, str] = {}
@@ -409,6 +416,51 @@ class WMCentral:
         except Exception:
             pass
 
+    def refresh_registry_status(self) -> bool:
+        """Consulta a WM_Registry (API HTTPS, certificado validado) qué WS están dadas de alta.
+        Una sola petición para todas las estaciones; solo se guarda si cada WS está registrada."""
+        try:
+            import urllib.request
+            if not os.path.isfile(self.registry_ca):
+                raise FileNotFoundError(f"certificado del Registry no encontrado en {self.registry_ca}")
+            ctx = ssl.create_default_context(cafile=self.registry_ca)
+            with urllib.request.urlopen(f"{self.registry_url}/api/stations", context=ctx, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            registered = {
+                str(item.get("id", "")).strip().upper(): str(item.get("status", "ACTIVE")).upper() == "ACTIVE"
+                for item in data.get("stations", []) if isinstance(item, dict)
+            }
+            ok = True
+        except Exception as exc:
+            registered, ok = None, False
+            reason = exc.__class__.__name__
+        with self.lock:
+            was_available = self.registry_available
+            self.registry_available = ok
+            self.registry_checked_at = datetime.now().strftime("%H:%M:%S")
+            if ok:
+                self.registry_registered = registered
+        if ok and was_available is not True:
+            self.log("Estado de registro de las WS obtenido de WM_Registry.")
+        elif not ok and was_available is not False:
+            self.log(f"WM_Registry no accesible para consultar el estado de registro de las WS ({reason}).")
+        return ok
+
+    def run_registry_status_poller(self, interval: float = 10.0):
+        """Mantiene actualizado el estado de registro (cada 'interval' segundos)."""
+        while self.running:
+            self.refresh_registry_status()
+            time.sleep(interval)
+
+    def _registry_fields(self, ws_id: str) -> Dict[str, Any]:
+        """Estado de registro de una WS para la API: True/False, o None si el Registry no está accesible."""
+        known = self.registry_available is True
+        return {
+            "registry_registered": self.registry_registered.get(ws_id, False) if known else None,
+            "registry_available": bool(known),
+            "registry_checked_at": self.registry_checked_at,
+        }
+
     def verify_registry_credential(self, ws_id: str, credential: str) -> bool:
         """Verifica si la credencial de una estación es válida consultando WM_Registry."""
         clean_id = ws_id.strip().upper()
@@ -588,9 +640,9 @@ class WMCentral:
                         source_ip=source_ip or "WM_W",
                         action="WEATHER_NORMAL",
                         description=f"Cancelación de alerta en {city} ({temp:.1f}ºC, {cond}). Clima favorable restaurado.",
-                        details="Estación restaurada a DISPONIBLE."
+                        details="Alerta cancelada: vuelve a servicio si su Monitor está conectado y no hay otro bloqueo."
                     )
-                    self.log(f"Clima favorable restaurado para {clean_id} ({city}). Estación restaurada.", ws_id=clean_id)
+                    self.log(f"Clima favorable restaurado para {clean_id} ({city}). Alerta cancelada.", ws_id=clean_id)
                     st = self.stations.get(clean_id)
                     if st:
                         st.pop("pending_weather_stop", None)
@@ -600,8 +652,18 @@ class WMCentral:
                             self.log("Clima favorable, pero la estación sigue FUERA DE SERVICIO por bloqueo "
                                      "manual de CENTRAL (requiere activación)", ws_id=clean_id)
                         elif st["status"] == STATUS_OUT_OF_SERVICE:
-                            self.set_station_status(clean_id, STATUS_AVAILABLE)
-                            self.send_ws_command(clean_id, "ACTIVATE")
+                            # Solo vuelve a servicio con Monitor conectado y clave vigente (misma regla que
+                            # una activación): sin Monitor queda DESCONECTADA; sin Engine operativo, en FUGA.
+                            # Nunca se inicia un riego: solo se desbloquea el Engine (ACTIVATE).
+                            if clean_id not in self.station_sockets:
+                                self.set_station_status(clean_id, STATUS_OFFLINE)
+                            elif clean_id not in self.station_keys:
+                                self.log("Clima favorable, pero la estación no tiene clave vigente: sigue FUERA DE "
+                                         "SERVICIO", ws_id=clean_id)
+                            else:
+                                self.send_ws_command(clean_id, "ACTIVATE")
+                                self.set_station_status(clean_id, STATUS_AVAILABLE if st.get("engine_ok")
+                                                        else STATUS_LEAK)
 
     # --------------------------------------------------------------------------
     # LOGGING Y NOTIFICACIONES
@@ -1163,15 +1225,15 @@ class WMCentral:
     # GESTIÓN DE RIEGO (KAFKA: SOLICITUDES Y TELEMETRÍA)
     # --------------------------------------------------------------------------
     def request_watering(self, op: str, ws_id: str, duration: int):
-        """Procesa una solicitud de riego (desde FO o desde CENTRAL). Soporta una WS o 'ALL'."""
+        """Procesa una solicitud de riego (desde FO o desde CENTRAL). Soporta una WS o 'ALL'.
+        Devuelve (True, mensaje) si se envió la orden de apertura o (False, motivo) si se denegó."""
         op = op.strip().upper()
         ws_id = ws_id.strip().upper()
         if ws_id == "ALL":
             with self.lock:
                 targets = list(self.stations.keys())
-            for target in targets:
-                self.request_watering(op, target, duration)
-            return
+            sent = [t for t in targets if self.request_watering(op, t, duration)[0]]
+            return bool(sent), f"Orden de riego enviada a {len(sent)} de {len(targets)} estaciones"
 
         with self.lock:
             self.notify_operator(op, "STEP", ws_id, f"Petición de riego recibida para {ws_id}")
@@ -1181,22 +1243,22 @@ class WMCentral:
                 with self._get_db() as db:
                     registered = db.execute("SELECT 1 FROM operators WHERE id = ?", (op,)).fetchone()
                     if not registered:
-                        self.notify_operator(op, "DENY", ws_id, f"DENEGADO: El operario '{op}' no está registrado en CENTRAL")
-                        return
+                        msg = f"DENEGADO: El operario '{op}' no está registrado en CENTRAL"
+                        self.notify_operator(op, "DENY", ws_id, msg)
+                        return False, msg
 
             # 2. Validar estación
             st = self.stations.get(ws_id)
             if not st:
-                self.notify_operator(op, "DENY", ws_id, f"DENEGADO: La estación '{ws_id}' no existe en el sistema")
-                return
+                msg = f"DENEGADO: La estación '{ws_id}' no existe en el sistema"
+                self.notify_operator(op, "DENY", ws_id, msg)
+                return False, msg
 
             # 3. Comprobar disponibilidad
             if st["pending_start"]:
-                self.notify_operator(
-                    op, "DENY", ws_id,
-                    "DENEGADO: La estación tiene una solicitud de riego pendiente de confirmación"
-                )
-                return
+                msg = "DENEGADO: La estación tiene una solicitud de riego pendiente de confirmación"
+                self.notify_operator(op, "DENY", ws_id, msg)
+                return False, msg
 
             if st["status"] != STATUS_AVAILABLE:
                 motivo = f"estación no disponible ({st['status']})"
@@ -1209,7 +1271,7 @@ class WMCentral:
                 elif st["status"] == STATUS_OFFLINE:
                     motivo = "está desconectada de la red"
                 self.notify_operator(op, "DENY", ws_id, f"DENEGADO: {motivo}")
-                return
+                return False, f"DENEGADO: {motivo}"
 
             # 4. Autorizar e iniciar
 
@@ -1230,6 +1292,7 @@ class WMCentral:
                 args=(ws_id, st["pending_since"]),
                 daemon=True
             ).start()
+            return True, f"Orden de riego enviada a {ws_id} (transaction_id={tx_id})"
 
     def check_watering_timeout(self, ws_id: str, request_time: float):
         """Cancela una solicitud si el Engine no confirma en 10 segundos."""
@@ -1558,10 +1621,13 @@ class WMCentral:
 
     @staticmethod
     def _is_authorized_admin_request(client_ip: str, headers=None) -> bool:
-        """Verifica que la petición administrativa provenga exclusivamente de loopback (127.0.0.1 / ::1)
-        o presente un token administrativo válido (WM_ADMIN_TOKEN)."""
+        """Verifica que la petición administrativa provenga directamente de loopback (127.0.0.1 / ::1)
+        o presente un token administrativo válido (WM_ADMIN_TOKEN). Una petición reenviada por un
+        proxy (p. ej. el Front, que añade X-Forwarded-For) no se considera local aunque llegue de
+        127.0.0.1: así un usuario anónimo del Front nunca hereda la exención local."""
         ip = (client_ip or "").strip()
-        if ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+        proxied = headers is not None and bool(headers.get("X-Forwarded-For"))
+        if ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1") and not proxied:
             return True
         expected_token = (os.getenv("WM_ADMIN_TOKEN") or "").strip()
         if expected_token and headers is not None:
@@ -1653,190 +1719,369 @@ class WMCentral:
     # --------------------------------------------------------------------------
     # INTERFAZ WEB EMBEBIDA EN TIEMPO REAL (HTML / SSE / REST)
     # --------------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # API_CENTRAL (REST): vistas, autenticación y validación
+    # --------------------------------------------------------------------------
+    OPERATOR_ID_RE = re.compile(r"^[A-Z0-9_-]{1,32}$")
+
+    def _log_throttled(self, key: str, message: str, interval: float = 30.0):
+        """Escribe un aviso como máximo una vez cada 'interval' segundos por clave."""
+        now = time.time()
+        with self.lock:
+            if now - self._throttled_logs.get(key, 0.0) < interval:
+                return
+            self._throttled_logs[key] = now
+        self.log(message)
+
+    def _station_view(self, s: Dict[str, Any]) -> Dict[str, Any]:
+        """Representación pública de una WS (sin claves ni huellas de credenciales)."""
+        return {
+            "id": s["id"],
+            "location": s["location"],
+            "status": s["status"],
+            "flow": s.get("flow", 0.0),
+            "vol": s.get("vol", 0.0),
+            "operator": s.get("operator"),
+            "transaction_id": s.get("transaction_id"),
+            "pending_start": bool(s.get("pending_start")),
+            "start_time": s.get("start_time"),
+            "engine_ok": bool(s.get("engine_ok")),
+            "engine_reason": s.get("engine_reason"),
+            "monitor_connected": s["id"] in self.station_sockets,
+            "has_key": s["id"] in self.station_keys,
+            "keys_revoked": bool(s.get("keys_revoked")),
+            "central_block": bool(s.get("central_block")),
+            "weather_alert": self.weather_alerts.get(s["id"]),
+            "weather_info": self.weather_status.get(s["id"]),
+            **self._registry_fields(s["id"]),
+        }
+
+    def _waterings_view(self) -> List[Dict[str, Any]]:
+        """Riegos en curso: estaciones regando o con la orden de inicio pendiente de confirmar."""
+        return [
+            {
+                "ws_id": s["id"],
+                "operator": s.get("operator"),
+                "transaction_id": s.get("transaction_id"),
+                "state": "REGANDO" if s["status"] == STATUS_WATERING else "PENDIENTE_CONFIRMACION",
+                "start_time": s.get("start_time"),
+                "flow": s.get("flow", 0.0),
+                "vol": s.get("vol", 0.0),
+            }
+            for s in self.stations.values()
+            if s["status"] == STATUS_WATERING or s.get("pending_start")
+        ]
+
+    def _operators_view(self) -> List[Dict[str, Any]]:
+        """Operarios registrados con su estado actual (regando o en espera) y sus riegos en curso."""
+        with self._get_db() as db:
+            ops = [dict(r) for r in db.execute("SELECT id, name FROM operators ORDER BY id").fetchall()]
+        waterings = self._waterings_view()
+        known = {o["id"] for o in ops}
+        for w in waterings:  # p. ej. riegos ordenados desde la consola de CENTRAL
+            if w["operator"] and w["operator"] not in known:
+                ops.append({"id": w["operator"], "name": w["operator"]})
+                known.add(w["operator"])
+        for o in ops:
+            o["waterings"] = [w for w in waterings if w["operator"] == o["id"]]
+            o["status"] = "REGANDO" if o["waterings"] else "EN_ESPERA"
+        return ops
+
+    @staticmethod
+    def _check_weather_token(headers) -> tuple:
+        """Las notificaciones de WM_W exigen el secreto compartido WM_WEATHER_TOKEN.
+        Sin configurar en Central, se rechazan siempre (nunca acceso anónimo).
+        Devuelve (0, "") si es válido o (código HTTP, mensaje)."""
+        expected = (os.getenv("WM_WEATHER_TOKEN") or "").strip()
+        if not expected:
+            return 503, "Notificaciones climáticas deshabilitadas: WM_WEATHER_TOKEN no configurado en Central"
+        provided = (headers.get("X-Weather-Token") or "").strip() if headers is not None else ""
+        if not provided or not hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8")):
+            return 401, "Token de WM_W ausente o no válido"
+        return 0, ""
+
+    @staticmethod
+    def _parse_weather_body(data: Dict[str, Any]) -> tuple:
+        """Valida los datos climáticos de WM_W. Devuelve (valores, "") o (None, error)."""
+        try:
+            temp = data.get("temp", 0.0)
+            if isinstance(temp, bool) or not isinstance(temp, (int, float)) or temp != temp or abs(temp) > 100:
+                return None, "'temp' debe ser un número entre -100 y 100"
+            alert = data.get("alert", False)
+            if not isinstance(alert, bool):
+                return None, "'alert' debe ser true o false"
+            values = {"temp": float(temp), "alert_active": alert}
+            for field, key, default, maxlen in (("city", "city", "", 80), ("condition", "cond", "Clear", 40),
+                                                ("reason", "reason", "Condición meteorológica adversa", 200)):
+                val = data.get(field, default)
+                if not isinstance(val, str) or len(val) > maxlen:
+                    return None, f"'{field}' debe ser un texto de como máximo {maxlen} caracteres"
+                values[key] = val.strip() or default
+            return values, ""
+        except Exception:
+            return None, "Datos climáticos no válidos"
+
     def run_web_server(self):
         central_self = self
 
         class DashboardHandler(http.server.BaseHTTPRequestHandler):
+            MAX_BODY = 64 * 1024
+
             def log_message(self, format, *args):
                 return  # Silenciar logs HTTP en consola
 
+            # ---------------- utilidades ----------------
+            def _send_json(self, code: int, obj):
+                body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _path(self) -> List[str]:
+                path = self.path.split("?", 1)[0].rstrip("/") or "/"
+                return [p for p in path.split("/") if p]
+
+            def _client_ip(self) -> str:
+                return self.client_address[0] if self.client_address else "desconocida"
+
+            def _read_json(self):
+                """Cuerpo JSON (objeto). Devuelve (datos, None) o (None, error)."""
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    return None, "Content-Length no válido"
+                if length < 0 or length > self.MAX_BODY:
+                    return None, "Cuerpo de la petición demasiado grande"
+                raw = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+                if not raw.strip():
+                    return {}, None
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    return None, "El cuerpo no es JSON válido"
+                if not isinstance(data, dict):
+                    return None, "El cuerpo debe ser un objeto JSON"
+                return data, None
+
+            # ---------------- GET (consultas públicas) ----------------
             def do_GET(self):
-                if self.path == "/" or self.path.startswith("/index"):
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(central_self._get_dashboard_html().encode("utf-8"))
-
-                elif self.path == "/api/status":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
+                try:
+                    parts = self._path()
+                    if parts == [] or (parts and parts[0].startswith("index")):
+                        body = central_self._get_dashboard_html().encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    if len(parts) < 2 or parts[0] != "api":
+                        return self._send_json(404, {"status": "not_found", "msg": "Recurso no encontrado"})
+                    res = parts[1]
                     with central_self.lock:
-                        st_list = []
-                        for s in central_self.stations.values():
-                            item = dict(s)
-                            item["has_key"] = (s["id"] in central_self.station_keys)
-                            item["keys_revoked"] = bool(s.get("keys_revoked"))
-                            item["weather_alert"] = central_self.weather_alerts.get(s["id"])
-                            item["weather_info"] = central_self.weather_status.get(s["id"])
-                            st_list.append(item)
-                        payload = {
-                            "stations": st_list,
-                            "weather_alerts": central_self.weather_alerts,
-                            "weather_status": central_self.weather_status,
-                            "logs": central_self.recent_logs[-25:],
-                            "audits": central_self.recent_audits[-25:],
-                            "timestamp": datetime.now().strftime("%H:%M:%S")
-                        }
-                    self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+                        if res == "status" and len(parts) == 2:
+                            st_list = []
+                            for s in central_self.stations.values():
+                                item = dict(s)
+                                item["has_key"] = (s["id"] in central_self.station_keys)
+                                item["keys_revoked"] = bool(s.get("keys_revoked"))
+                                item["weather_alert"] = central_self.weather_alerts.get(s["id"])
+                                item["weather_info"] = central_self.weather_status.get(s["id"])
+                                item.update(central_self._registry_fields(s["id"]))
+                                st_list.append(item)
+                            return self._send_json(200, {
+                                "stations": st_list,
+                                "weather_alerts": central_self.weather_alerts,
+                                "weather_status": central_self.weather_status,
+                                "logs": central_self.recent_logs[-25:],
+                                "audits": central_self.recent_audits[-25:],
+                                "timestamp": datetime.now().strftime("%H:%M:%S")
+                            })
+                        if res == "stations" and len(parts) == 2:
+                            return self._send_json(200, [central_self._station_view(s)
+                                                         for s in central_self.stations.values()])
+                        if res == "stations" and len(parts) == 3:
+                            st = central_self.stations.get(parts[2].upper())
+                            if not st:
+                                return self._send_json(404, {"status": "not_found",
+                                                             "msg": f"La estación '{parts[2]}' no existe"})
+                            return self._send_json(200, central_self._station_view(st))
+                        if res == "waterings" and len(parts) == 2:
+                            return self._send_json(200, central_self._waterings_view())
+                        if res == "operators" and len(parts) in (2, 3):
+                            ops = central_self._operators_view()
+                            if len(parts) == 2:
+                                return self._send_json(200, ops)
+                            op = next((o for o in ops if o["id"] == parts[2].upper()), None)
+                            if not op:
+                                return self._send_json(404, {"status": "not_found",
+                                                             "msg": f"El operario '{parts[2]}' no existe"})
+                            return self._send_json(200, op)
+                        if res == "audit" and len(parts) == 2:
+                            return self._send_json(200, list(central_self.recent_audits))
+                        if res == "weather" and len(parts) == 2:
+                            return self._send_json(200, {
+                                "weather_status": dict(central_self.weather_status),
+                                "weather_alerts": dict(central_self.weather_alerts),
+                                **central_self.weather_status
+                            })
+                        if res == "history" and len(parts) == 2:
+                            with central_self._get_db() as db:
+                                rows = db.execute("""
+                                    SELECT id, ws_id, operator_id, start_time, end_time, total_vol, duration_sec, reason
+                                    FROM watering_history ORDER BY id DESC LIMIT 20
+                                """).fetchall()
+                            return self._send_json(200, [dict(r) for r in rows])
+                    return self._send_json(404, {"status": "not_found", "msg": "Recurso no encontrado"})
+                except Exception as exc:
+                    central_self.log(f"Error interno en API_Central (GET {self.path.split('?')[0]}): "
+                                     f"{exc.__class__.__name__}")
+                    return self._send_json(500, {"status": "error", "msg": "Error interno"})
 
-                elif self.path == "/api/audit":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    with central_self.lock:
-                        audits = list(central_self.recent_audits)
-                    self.wfile.write(json.dumps(audits, ensure_ascii=False).encode("utf-8"))
+            # ---------------- notificaciones de WM_W (protegidas) ----------------
+            def _weather_request(self, method: str, parts: List[str]):
+                code, msg = central_self._check_weather_token(self.headers)
+                if code:
+                    central_self._log_throttled(
+                        f"weather-auth-{code}",
+                        f"Notificación climática RECHAZADA desde {self._client_ip()} ({msg})")
+                    return self._send_json(code, {"status": "unauthorized" if code == 401 else "disabled",
+                                                  "msg": msg})
+                data, err = self._read_json()
+                if err:
+                    return self._send_json(400, {"status": "invalid", "msg": err})
 
-                elif self.path == "/api/weather":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    with central_self.lock:
-                        w_data = {
-                            "weather_status": dict(central_self.weather_status),
-                            "weather_alerts": dict(central_self.weather_alerts),
-                            **central_self.weather_status
-                        }
-                    self.wfile.write(json.dumps(w_data, ensure_ascii=False).encode("utf-8"))
-
-                elif self.path == "/api/operators":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    with central_self._get_db() as db:
-                        rows = db.execute("SELECT id, name FROM operators").fetchall()
-                        ops = [dict(r) for r in rows]
-                    self.wfile.write(json.dumps(ops, ensure_ascii=False).encode("utf-8"))
-
-                elif self.path == "/api/history":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.end_headers()
-                    with central_self._get_db() as db:
-                        rows = db.execute("""
-                            SELECT id, ws_id, operator_id, start_time, end_time, total_vol, duration_sec, reason
-                            FROM watering_history ORDER BY id DESC LIMIT 20
-                        """).fetchall()
-                        data = [dict(r) for r in rows]
-                    self.wfile.write(json.dumps(data).encode("utf-8"))
+                if method == "POST":            # Compatibilidad: POST /api/weather/alert con ws_id en el cuerpo
+                    ws_id = str(data.get("ws_id") or "").strip().upper()
                 else:
-                    self.send_response(404)
-                    self.end_headers()
+                    ws_id = parts[2].upper()
+                    body_ws = str(data.get("ws_id") or ws_id).strip().upper()
+                    if body_ws != ws_id:
+                        return self._send_json(400, {"status": "invalid",
+                                                     "msg": "'ws_id' del cuerpo no coincide con la ruta"})
+                if not STATION_ID_RE.fullmatch(ws_id):
+                    return self._send_json(400, {"status": "invalid", "msg": "Identificador de estación no válido"})
+                if ws_id not in central_self.stations:
+                    return self._send_json(404, {"status": "not_found", "msg": f"La estación '{ws_id}' no existe"})
+
+                if method == "DELETE":          # Cancelación de la alerta climática
+                    with central_self.lock:
+                        current = dict(central_self.weather_alerts.get(ws_id) or {})
+                    if not current:
+                        return self._send_json(404, {"status": "not_found",
+                                                     "msg": f"No hay alerta climática activa para {ws_id}"})
+                    central_self.handle_weather_alert(
+                        ws_id=ws_id, city=current.get("city", ""), temp=float(current.get("temp", 0.0)),
+                        cond=current.get("condition", "Clear"), alert_active=False,
+                        reason="Cancelación de la alerta notificada por WM_W", source_ip=self._client_ip())
+                    return self._send_json(200, {"status": "ok", "ws_id": ws_id, "alert": False})
+
+                values, err = central_self._parse_weather_body(data)
+                if err:
+                    return self._send_json(400, {"status": "invalid", "msg": err})
+                central_self.handle_weather_alert(ws_id=ws_id, source_ip=self._client_ip(), **values)
+                return self._send_json(200, {"status": "ok", "ws_id": ws_id, "alert": values["alert_active"]})
+
+            # ---------------- acciones de control (protegidas) ----------------
+            def _action_request(self):
+                if not central_self._is_authorized_admin_request(self._client_ip(), self.headers):
+                    central_self._log_throttled(
+                        "admin-auth", f"Acción de control DENEGADA desde {self._client_ip()}: token de "
+                                      f"administración ausente o no válido")
+                    return self._send_json(403, {"status": "forbidden", "created": False,
+                                                 "msg": "Acceso denegado: se requiere el token de administración "
+                                                        "(o ejecutar la acción desde la máquina de Central)"})
+                data, err = self._read_json()
+                if err:
+                    return self._send_json(400, {"status": "invalid", "msg": err})
+                action = str(data.get("action") or "").strip().lower()
+                ws_id = str(data.get("ws") or "").strip().upper()
+                if action not in ("start", "block", "activate", "revoke_keys", "restore_keys", "register"):
+                    return self._send_json(400, {"status": "invalid", "msg": f"Acción no válida: '{action}'"})
+                if not ws_id:
+                    return self._send_json(400, {"status": "invalid", "msg": "Falta la estación ('ws')"})
+
+                if action == "register":
+                    loc = str(data.get("location") or "Parque Municipal")
+                    if not STATION_ID_RE.fullmatch(ws_id):
+                        central_self.register_station(ws_id, loc)
+                        return self._send_json(400, {"status": "invalid", "created": False,
+                                                     "msg": "Formato de ID no válido: use WS- seguido de al menos dos dígitos"})
+                    created = central_self.register_station(ws_id, loc)
+                    return self._send_json(200, {"status": "ok", "created": True} if created else
+                                           {"status": "exists", "created": False,
+                                            "msg": f"La estación {ws_id} ya existe"})
+
+                all_allowed = action in ("start", "block", "activate")
+                if ws_id == "ALL" and not all_allowed:
+                    return self._send_json(400, {"status": "invalid", "msg": "Esta acción requiere una estación concreta"})
+                if ws_id != "ALL" and ws_id not in central_self.stations:
+                    return self._send_json(404, {"status": "not_found", "msg": f"La estación '{ws_id}' no existe"})
+
+                if action == "start":
+                    duration = data.get("duration", 10)
+                    op = str(data.get("op") or "CENTRAL").strip().upper()
+                    if isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 86400:
+                        return self._send_json(400, {"status": "invalid",
+                                                     "msg": "'duration' debe ser un entero entre 1 y 86400 segundos"})
+                    if not central_self.OPERATOR_ID_RE.fullmatch(op):
+                        return self._send_json(400, {"status": "invalid", "msg": "Identificador de operario no válido"})
+                    ok, msg = central_self.request_watering(op, ws_id, duration)
+                    return self._send_json(200 if ok else 409, {"status": "ok" if ok else "denied", "msg": msg})
+
+                if action in ("revoke_keys", "restore_keys"):
+                    central_self.revoke_station_keys(ws_id)
+                    return self._send_json(200, {"status": "ok", "ws": ws_id,
+                                                 "msg": "Claves revocadas: la estación queda FUERA DE SERVICIO"})
+
+                if action == "block":
+                    central_self.block_station(ws_id)
+                else:
+                    central_self.activate_station(ws_id)
+                if ws_id == "ALL":
+                    return self._send_json(200, {"status": "ok", "ws": "ALL"})
+                with central_self.lock:
+                    st = central_self.stations[ws_id]
+                    new_status = st["status"]
+                    done = (new_status == STATUS_OUT_OF_SERVICE) if action == "block" else \
+                        (new_status not in (STATUS_OUT_OF_SERVICE, STATUS_OFFLINE) and not st.get("keys_revoked"))
+                return self._send_json(200 if done else 409, {
+                    "status": "ok" if done else "denied", "ws": ws_id, "station_status": new_status,
+                    "msg": "" if done else ("No se pudo bloquear la estación" if action == "block" else
+                                            "No se pudo activar la estación (desconectada, revocada o no operativa)")})
+
+            def _dispatch(self, method: str):
+                try:
+                    parts = self._path()
+                    if parts == ["api", "action"] and method == "POST":
+                        return self._action_request()
+                    if parts[:2] == ["api", "weather"]:
+                        if parts == ["api", "weather", "alert"] and method == "POST":
+                            return self._weather_request("POST", parts)
+                        if len(parts) == 3 and method == "PUT":
+                            return self._weather_request("PUT", parts)
+                        if len(parts) == 4 and parts[3] == "alert" and method == "DELETE":
+                            return self._weather_request("DELETE", parts)
+                    known = parts in (["api", "action"], ["api", "weather", "alert"]) or parts[:2] == ["api", "weather"]
+                    return self._send_json(405 if known else 404, {
+                        "status": "method_not_allowed" if known else "not_found",
+                        "msg": "Método no permitido para este recurso" if known else "Recurso no encontrado"})
+                except Exception as exc:
+                    central_self.log(f"Error interno en API_Central ({method} {self.path.split('?')[0]}): "
+                                     f"{exc.__class__.__name__}")
+                    return self._send_json(500, {"status": "error", "msg": "Error interno"})
 
             def do_POST(self):
-                content_len = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(content_len).decode("utf-8")
-                try:
-                    data = json.loads(body)
-                except Exception:
-                    data = {}
+                self._dispatch("POST")
 
-                client_ip = self.client_address[0] if self.client_address else "desconocida"
+            def do_PUT(self):
+                self._dispatch("PUT")
 
-                # Consumo de API_Rest de WM_W (Release 2)
-                if self.path == "/api/weather/alert":
-                    ws_id = str(data.get("ws_id") or "").strip().upper()
-                    city = str(data.get("city") or "").strip()
-                    temp = float(data.get("temp", 0.0))
-                    cond = str(data.get("condition") or "Clear")
-                    alert_active = bool(data.get("alert", False))
-                    reason = str(data.get("reason") or "Condición meteorológica adversa")
-
-                    if ws_id:
-                        central_self.handle_weather_alert(
-                            ws_id=ws_id, city=city, temp=temp, cond=cond,
-                            alert_active=alert_active, reason=reason, source_ip=client_ip
-                        )
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "ok"}')
-                    return
-
-                if self.path == "/api/action":
-                    action = data.get("action")
-                    ws_id = data.get("ws")
-                    dur = int(data.get("duration", 10))
-                    op = data.get("op", "CENTRAL")
-
-                    if action == "start" and ws_id:
-                        central_self.request_watering(op, ws_id, dur)
-                    elif action == "block" and ws_id:
-                        central_self.block_station(ws_id)
-                    elif action == "activate" and ws_id:
-                        central_self.activate_station(ws_id)
-                    elif action in ("revoke_keys", "restore_keys") and ws_id:
-                        central_self.revoke_station_keys(ws_id)
-                    elif action == "register" and ws_id:
-                        client_ip = self.client_address[0] if self.client_address else ""
-                        if not central_self._is_authorized_admin_request(client_ip, self.headers):
-                            central_self.log(
-                                f"Acceso DENEGADO a alta HTTP desde origen no autorizado ({client_ip})",
-                                ws_id=str(ws_id).strip().upper()
-                            )
-                            self.send_response(403)
-                            self.send_header("Content-Type", "application/json")
-                            self.end_headers()
-                            self.wfile.write(
-                                json.dumps({
-                                    "status": "forbidden",
-                                    "created": False,
-                                    "msg": "Acceso denegado: alta permitida únicamente desde la máquina de Central"
-                                }).encode("utf-8")
-                            )
-                            return
-
-                        loc = str(data.get("location") or "Parque Municipal")
-                        clean_ws = str(ws_id).strip().upper()
-                        if not STATION_ID_RE.fullmatch(clean_ws):
-                            central_self.register_station(clean_ws, loc)
-                            self.send_response(400)
-                            self.send_header("Content-Type", "application/json")
-                            self.end_headers()
-                            self.wfile.write(
-                                json.dumps({
-                                    "status": "invalid",
-                                    "created": False,
-                                    "msg": "Formato de ID no válido: use WS- seguido de al menos dos dígitos"
-                                }).encode("utf-8")
-                            )
-                            return
-
-                        created = central_self.register_station(clean_ws, loc)
-                        resp = (
-                            {"status": "ok", "created": True}
-                            if created
-                            else {"status": "exists", "created": False, "msg": f"La estación {clean_ws} ya existe"}
-                        )
-                        self.send_response(200)
-                        self.send_header("Content-Type", "application/json")
-                        self.end_headers()
-                        self.wfile.write(json.dumps(resp).encode("utf-8"))
-                        return
-
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(b'{"status": "ok"}')
-                else:
-                    self.send_response(404)
-                    self.end_headers()
+            def do_DELETE(self):
+                self._dispatch("DELETE")
 
         server = http.server.ThreadingHTTPServer(("0.0.0.0", self.web_port), DashboardHandler)
         self._web_server = server
@@ -1958,6 +2203,7 @@ class WMCentral:
 
         # 2. Hilos de Consumidores y Publicadores Kafka
         threading.Thread(target=self.run_kafka_requests_consumer, daemon=True).start()
+        threading.Thread(target=self.run_registry_status_poller, daemon=True).start()
         threading.Thread(target=self.run_kafka_events_consumer, daemon=True).start()
         threading.Thread(target=self.run_kafka_status_publisher, daemon=True).start()
 

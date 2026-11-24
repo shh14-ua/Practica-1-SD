@@ -6,6 +6,9 @@ Funcionalidades:
   - Análisis de condiciones meteorológicas adversas: temperatura < 0 ºC o lluvia/precipitaciones.
   - Notificación de situaciones de alerta climática a WM_Central a través de API_Central.
   - Notificación de cancelación de alertas cuando el clima vuelve a ser favorable.
+  - API_Central (REST): PUT /api/weather/<WS> con el estado climático actual en cada ciclo (permite a
+    Central recuperar las alertas tras reiniciarse) y DELETE /api/weather/<WS>/alert al cancelarse una
+    alerta. Cada petición se autentica con el secreto compartido WM_WEATHER_TOKEN (variable de entorno).
   - Carga y modificación dinámica de ciudades asociadas a las WS (mediante ciudades.json o menú).
   - Menú interactivo en tiempo real para modificar ciudades o simular climas adversos/favorables.
 """
@@ -16,6 +19,7 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, Any, Optional
@@ -25,8 +29,12 @@ DEFAULT_API_KEY = "demo_key"  # El alumno o profesor puede introducir su clave g
 
 class WeatherControlOffice:
     def __init__(self, central_api_url: str, cities_file: str = "ciudades.json",
-                 api_key: Optional[str] = None, interval: float = 4.0):
+                 api_key: Optional[str] = None, interval: float = 4.0, weather_token: Optional[str] = None):
         self.central_api_url = central_api_url.rstrip("/")
+        # Secreto compartido con Central para autenticar las notificaciones (nunca en el repositorio)
+        self.weather_token = (weather_token if weather_token is not None
+                              else os.getenv("WM_WEATHER_TOKEN", "")).strip()
+        self.central_ok: Optional[bool] = None
         self.cities_file = cities_file
         self.api_key = api_key or os.getenv("OPENWEATHER_API_KEY", "")
         self.interval = interval
@@ -213,21 +221,58 @@ class WeatherControlOffice:
     # --------------------------------------------------------------------------
     # NOTIFICACIÓN A CENTRAL VÍA API_CENTRAL
     # --------------------------------------------------------------------------
-    def notify_central(self, weather_data: Dict[str, Any]) -> bool:
-        """Notifica el estado meteorológico o alerta a WM_Central vía API_Central."""
-        url = f"{self.central_api_url}/api/weather/alert"
-        payload = json.dumps(weather_data).encode("utf-8")
+    def _central_request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> int:
+        """Petición autenticada a API_Central. Devuelve el código HTTP (0 si no hay conexión)."""
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            f"{self.central_api_url}{path}", data=data, method=method,
+            headers={"Content-Type": "application/json", "X-Weather-Token": self.weather_token}
+        )
         try:
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
-                return resp.status in (200, 201)
-        except Exception as e:
-            # Central puede estar desconectada momentáneamente
-            return False
+                return resp.status
+        except urllib.error.HTTPError as he:
+            return he.code
+        except Exception:
+            return 0
+
+    def _report_delivery(self, code: int):
+        """Informa del estado de entrega solo cuando cambia (sin repetir el aviso cada 4 s)."""
+        ok = code in (200, 201, 204)
+        if ok != self.central_ok:
+            if ok:
+                self.log(f"Comunicación con API_Central correcta ({self.central_api_url}).")
+            elif code in (401, 503):
+                self.log("API_Central RECHAZA las notificaciones: revise WM_WEATHER_TOKEN en WM_W y en Central.")
+            elif code == 0:
+                self.log(f"Aviso: API_Central no accesible ({self.central_api_url}). Se reintenta en cada ciclo.")
+            else:
+                self.log(f"Aviso: API_Central respondió HTTP {code} a la notificación climática.")
+        self.central_ok = ok
+
+    def notify_central(self, weather_data: Dict[str, Any]) -> bool:
+        """Comunica a WM_Central el estado climático actual de una WS (PUT /api/weather/<WS>)."""
+        ws_id = str(weather_data.get("ws_id", "")).strip().upper()
+        payload = {
+            "ws_id": ws_id,
+            "city": str(weather_data.get("city", ""))[:80],
+            "temp": float(weather_data.get("temp", 0.0)),
+            "condition": str(weather_data.get("condition", "Clear"))[:40],
+            "alert": bool(weather_data.get("alert", False)),
+            "reason": str(weather_data.get("reason", ""))[:200],
+        }
+        code = self._central_request("PUT", f"/api/weather/{urllib.parse.quote(ws_id)}", payload)
+        self._report_delivery(code)
+        return code in (200, 201, 204)
+
+    def cancel_alert(self, ws_id: str) -> bool:
+        """Cancela la alerta climática de una WS (DELETE /api/weather/<WS>/alert).
+        404 significa que Central ya no tenía la alerta activa: se considera cancelada."""
+        code = self._central_request("DELETE", f"/api/weather/{urllib.parse.quote(ws_id)}/alert")
+        if code == 404:
+            return True
+        self._report_delivery(code)
+        return code in (200, 204)
 
     # --------------------------------------------------------------------------
     # BUCLE PRINCIPAL DE MONITORIZACIÓN METEOROLÓGICA (CADA 4 SEGUNDOS)
@@ -248,16 +293,10 @@ class WeatherControlOffice:
                 prev_state = self.weather_state.get(ws_id)
                 self.weather_state[ws_id] = w_info
 
-                # Detectamos cambios de estado de alerta o de datos meteorológicos (ciudad, temp, condición)
+                # Cambios del estado de alerta (para el log y la cancelación explícita)
                 prev_alert = prev_state.get("alert") if prev_state else None
                 current_alert = w_info["alert"]
                 alert_changed = (prev_alert != current_alert)
-                data_changed = (
-                    prev_state is None
-                    or prev_state.get("city") != w_info.get("city")
-                    or prev_state.get("condition") != w_info.get("condition")
-                    or abs(float(prev_state.get("temp", 0.0)) - float(w_info.get("temp", 0.0))) >= 0.1
-                )
 
                 if alert_changed:
                     if current_alert:
@@ -265,13 +304,13 @@ class WeatherControlOffice:
                     else:
                         self.log(f"Clima normalizado [{ws_id} - {city}]: {w_info['temp']}ºC, {w_info['condition']}. Notificando cancelación a Central...")
 
-                if alert_changed or data_changed:
-                    success = self.notify_central(w_info)
-                    if not success:
-                        # Si falló la entrega, invalidar prev_state para reintentar en el siguiente ciclo
-                        self.weather_state.pop(ws_id, None)
-                        if alert_changed:
-                            self.log(f"Aviso: no se pudo entregar alerta meteorológica a Central ({self.central_api_url})")
+                # Cancelación explícita de la alerta al volver el clima favorable
+                if prev_alert is True and not current_alert:
+                    self.cancel_alert(ws_id)
+
+                # Estado climático actual en cada ciclo (aunque no cambie): Central recupera las alertas
+                # tras reiniciarse; las notificaciones repetidas no generan eventos duplicados
+                self.notify_central(w_info)
 
             # Dormir hasta completar el intervalo de 4 segundos
             elapsed = time.time() - start_time
@@ -367,6 +406,11 @@ def main():
     parser.add_argument("--key", default=None, help="API Key de OpenWeather")
     parser.add_argument("--interval", type=float, default=4.0, help="Intervalo de consulta en segundos (por defecto 4.0)")
     args = parser.parse_args()
+
+    if not os.getenv("WM_WEATHER_TOKEN", "").strip():
+        print("[WM_W] ERROR: falta la variable de entorno WM_WEATHER_TOKEN (secreto compartido con WM_Central). "
+              "Sin ella Central rechaza todas las notificaciones climáticas.", file=sys.stderr)
+        sys.exit(1)
 
     wco = WeatherControlOffice(
         central_api_url=args.central_api,
