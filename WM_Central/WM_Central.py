@@ -12,6 +12,7 @@ Funcionalidades:
 
 import argparse
 import hmac
+import ipaddress
 import http.server
 import json
 import os
@@ -57,6 +58,12 @@ class WMCentral:
         self.kafka_bootstrap = kafka_bootstrap
         self.web_port = web_port
         self.db_path = safe_db_path(db_path)
+        # Auditoría en fichero junto a la base de datos persistente (o en $WM_AUDIT_LOG)
+        self.audit_log_path = os.getenv("WM_AUDIT_LOG") or os.path.join(
+            os.path.dirname(os.path.abspath(self.db_path)), "audit.log")
+        self._audit_failures: Dict[str, float] = {}
+        # Última IP conocida del Monitor de cada WS (origen de sus eventos, también los de Kafka)
+        self._station_ip: Dict[str, str] = {}
         self.lock = threading.RLock()
         self.running = True
 
@@ -85,7 +92,6 @@ class WMCentral:
         self.registry_registered: Dict[str, bool] = {}
         self.registry_available: Optional[bool] = None
         self.registry_checked_at: Optional[str] = None
-        self._throttled_logs: Dict[str, float] = {}
 
         # Revocación: huella de la última credencial aceptada por WS y de la credencial en uso al revocar
         # (tras una revocación solo se acepta una credencial renovada en WM_Registry)
@@ -116,6 +122,7 @@ class WMCentral:
 
         # Inicialización de la base de datos SQLite
         self._init_db()
+        self._load_recent_audits()
 
         # Carga en memoria del estado de las estaciones desde la base de datos
         # IMPORTANTE (según punto 1 del enunciado): Ante reinicio, todas las estaciones conocidas
@@ -385,15 +392,18 @@ class WMCentral:
     # AUDITORÍA ESTRUCTURADA Y SEGURIDAD (RELEASE 2)
     # --------------------------------------------------------------------------
     def audit_event(self, entity: str, source_ip: str, action: str, description: str, details: str = ""):
-        """Registra un evento estructurado de auditoría en memoria, base de datos y fichero."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        """Registra un evento estructurado de auditoría en memoria, base de datos y fichero.
+        Fecha y hora ISO 8601 con zona horaria. Cada campo se guarda en una sola línea para que
+        ningún texto recibido pueda simular entradas adicionales en el fichero."""
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        one_line = lambda v: " ".join(str(v if v is not None else "").split())
         entry = {
             "timestamp": timestamp,
-            "entity": entity,
-            "source_ip": source_ip or "LOCAL",
-            "action": action,
-            "description": description,
-            "details": details
+            "entity": one_line(entity) or "DESCONOCIDA",
+            "source_ip": one_line(source_ip) or "LOCAL",
+            "action": one_line(action),
+            "description": one_line(description),
+            "details": one_line(details),
         }
         with self.lock:
             self.recent_audits.append(entry)
@@ -405,16 +415,47 @@ class WMCentral:
                 db.execute("""
                     INSERT INTO audit_log (timestamp, entity, source_ip, action, description, details)
                     VALUES (?, ?, ?, ?, ?, ?)
-                """, (timestamp, entity, source_ip or "LOCAL", action, description, details))
+                """, (entry["timestamp"], entry["entity"], entry["source_ip"], entry["action"],
+                      entry["description"], entry["details"]))
                 db.commit()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_audit_failure("SQLite", exc)
 
         try:
-            with open("audit.log", "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] [{entity}@{source_ip or 'LOCAL'}] [{action}] {description} | {details}\n")
-        except Exception:
-            pass
+            with open(self.audit_log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{entry['timestamp']}] [{entry['entity']}@{entry['source_ip']}] "
+                        f"[{entry['action']}] {entry['description']} | {entry['details']}\n")
+        except Exception as exc:
+            self._report_audit_failure("fichero", exc)
+
+    def _report_audit_failure(self, sink: str, exc: Exception):
+        """Un fallo al guardar la auditoría nunca se oculta: se avisa por consola y en el log de
+        Central (visible en API_Central y el Front), como máximo una vez cada 30 s por destino.
+        Solo se indica el tipo de error, sin contenido del evento."""
+        now = time.time()
+        with self.lock:
+            if now - self._audit_failures.get(sink, 0.0) < 30.0:
+                return
+            self._audit_failures[sink] = now
+        msg = f"ERROR: no se pudo guardar un evento de auditoría en {sink} ({exc.__class__.__name__})"
+        print(f"[CENTRAL] {msg}", file=sys.stderr, flush=True)
+        self.log(msg)
+
+    def _load_recent_audits(self):
+        """Recupera de SQLite los últimos 100 eventos para API_Central y el Front tras reiniciar."""
+        try:
+            with self.lock, self._get_db() as db:
+                rows = db.execute("""
+                    SELECT timestamp, entity, source_ip, action, description, details
+                    FROM audit_log ORDER BY id DESC LIMIT 100
+                """).fetchall()
+            self.recent_audits = [dict(r) for r in reversed(rows)]
+        except Exception as exc:
+            self._report_audit_failure("SQLite (lectura)", exc)
+
+    def _ws_origin(self, ws_id: str) -> str:
+        """IP conocida del Monitor de una WS; 'DESCONOCIDO' si no se conoce (nunca se inventa)."""
+        return self._station_ip.get(ws_id) or "DESCONOCIDO"
 
     def refresh_registry_status(self) -> bool:
         """Consulta a WM_Registry (API HTTPS, certificado validado) qué WS están dadas de alta.
@@ -501,7 +542,7 @@ class WMCentral:
 
         return False
 
-    def revoke_station_keys(self, ws_id: str) -> bool:
+    def revoke_station_keys(self, ws_id: str, source_ip: str = "CENTRAL", origin_note: str = "") -> bool:
         """Revoca las claves simétricas de una estación ante supuesta vulnerabilidad.
         La estación queda FUERA DE SERVICIO y obligada a re-autenticarse."""
         clean_id = ws_id.strip().upper()
@@ -530,10 +571,11 @@ class WMCentral:
 
                 self.audit_event(
                     entity=clean_id,
-                    source_ip="CENTRAL",
+                    source_ip=source_ip,
                     action="KEY_REVOCATION",
                     description=f"Claves simétricas revocadas para {clean_id}. Estación pasa de {old_status} a FUERA DE SERVICIO.",
                     details="Vulnerabilidad supuesta. Obliga a nueva autenticación."
+                            + (f" | {origin_note}" if origin_note else "")
                 )
                 self.log(f"Claves REVOCADAS para estación {clean_id}. Estado: FUERA DE SERVICIO.", ws_id=clean_id)
                 # No se escribe en el socket desde este hilo (lo atiende el hilo de la conexión):
@@ -726,7 +768,12 @@ class WMCentral:
                 seq = next_kafka_seq(self._cmd_seq.get(ws_id, 0))
                 self._cmd_seq[ws_id] = seq
                 message = seal_kafka_message(key, KAFKA_KIND_COMMAND, ws_id, payload, seq)
-                return send_kafka(self.producer, TOPIC_COMMANDS, message)
+                sent = send_kafka(self.producer, TOPIC_COMMANDS, message)
+        if key:
+            if not sent:
+                self._audit_throttled(ws_id, "CENTRAL", "KAFKA_SEND_ERROR", cmd,
+                                      f"Error al publicar la orden {cmd} para {ws_id} en Kafka (ws_commands)")
+            return sent
         self.log(f"Orden {cmd} NO enviada al Engine: la estación no tiene clave simétrica vigente", ws_id=ws_id)
         self._audit_kafka_reject(ws_id, "SIN_CLAVE", f"Orden {cmd} no enviada a {ws_id}: sin clave simétrica vigente.",
                                  action="KAFKA_CMD_NOT_SENT")
@@ -739,25 +786,36 @@ class WMCentral:
         if self.station_keys.get(ws_id):
             self.send_ws_command(ws_id, "ACK_FINISHED", transaction_id=tx_id)
 
-    def _audit_kafka_reject(self, ws_id: str, reason: str, description: str,
-                            action: str = "KAFKA_REJECTED", interval: float = 30.0):
-        """Audita un mensaje Kafka rechazado (o no enviado) limitando la frecuencia: como máximo un
-        registro por estación y motivo cada 'interval' segundos, indicando cuántos se omitieron."""
-        entity = ws_id if ws_id in self.stations else "DESCONOCIDA"
+    def _audit_throttled(self, entity: str, source_ip: str, action: str, reason: str, description: str,
+                         interval: float = 30.0) -> bool:
+        """Audita un evento repetitivo (rechazos, errores) como máximo una vez cada 'interval' s por
+        entidad, acción y motivo, indicando cuántos se omitieron. Devuelve True si se registró."""
         now = time.time()
+        key = (entity, action, reason)
         with self.lock:
-            entry = self._kafka_reject_audit.setdefault((entity, action, reason), [0.0, 0])
+            if key not in self._kafka_reject_audit and len(self._kafka_reject_audit) >= 500:
+                self._kafka_reject_audit.pop(next(iter(self._kafka_reject_audit)))
+            entry = self._kafka_reject_audit.setdefault(key, [0.0, 0])
             if now - entry[0] < interval:
                 entry[1] += 1
-                return
+                return False
             omitted = entry[1]
             entry[0], entry[1] = now, 0
         details = f"Motivo: {reason}"
         if omitted:
             details += f" | {omitted} mensajes similares omitidos en los últimos {int(interval)} s"
-        self.audit_event(entity, "KAFKA", action, description, details)
-        if action == "KAFKA_REJECTED":
-            self.log(f"{description} ({details})", ws_id=entity if entity != "DESCONOCIDA" else None)
+        self.audit_event(entity, source_ip, action, description, details)
+        return True
+
+    def _audit_kafka_reject(self, ws_id: str, reason: str, description: str,
+                            action: str = "KAFKA_REJECTED", interval: float = 30.0):
+        """Audita un mensaje Kafka rechazado (origen: el Monitor de la WS) o una orden no enviada
+        (origen: CENTRAL), limitando la frecuencia."""
+        entity = ws_id if ws_id in self.stations else "DESCONOCIDA"
+        source = "CENTRAL" if action != "KAFKA_REJECTED" else (
+            self._ws_origin(entity) if entity != "DESCONOCIDA" else "DESCONOCIDO")
+        if self._audit_throttled(entity, source, action, reason, description, interval) and action == "KAFKA_REJECTED":
+            self.log(f"{description} (Motivo: {reason})", ws_id=entity if entity != "DESCONOCIDA" else None)
 
     def _process_kafka_event(self, message) -> None:
         """Descifra y valida un mensaje de ws_events antes de procesarlo. Rechaza los mensajes en
@@ -791,6 +849,8 @@ class WMCentral:
                 self._update_station_db(ws_id, status=new_status)
                 if old_status != new_status:
                     self.log(f"Estado cambiado: {old_status} -> {new_status}", ws_id=ws_id)
+                    self.audit_event(ws_id, self._ws_origin(ws_id), "STATUS_CHANGE",
+                                     f"Cambio de situación de {ws_id}: {old_status} -> {new_status}")
 
     # --------------------------------------------------------------------------
     # SERVIDOR DE SOCKETS (COMUNICACIÓN CON WM_WS_M)
@@ -964,6 +1024,7 @@ class WMCentral:
                         st["engine_reason"] = "Engine no conectado al Monitor"
 
                         self._last_cred_fp[st_id] = cred_fp
+                        self._station_ip[st_id] = client_ip
                         if st.pop("keys_revoked", False):
                             # Nueva autenticación tras revocación: nuevas claves y vuelta al servicio,
                             # salvo que ya estuviera fuera de servicio por otro motivo.
@@ -1224,15 +1285,27 @@ class WMCentral:
     # --------------------------------------------------------------------------
     # GESTIÓN DE RIEGO (KAFKA: SOLICITUDES Y TELEMETRÍA)
     # --------------------------------------------------------------------------
-    def request_watering(self, op: str, ws_id: str, duration: int):
+    def request_watering(self, op: str, ws_id: str, duration: int, source_ip: str = "CENTRAL",
+                         origin_note: str = ""):
         """Procesa una solicitud de riego (desde FO o desde CENTRAL). Soporta una WS o 'ALL'.
-        Devuelve (True, mensaje) si se envió la orden de apertura o (False, motivo) si se denegó."""
+        Devuelve (True, mensaje) si se envió la orden de apertura o (False, motivo) si se denegó.
+        Cada solicitud queda en la auditoría (WATERING_REQUEST) con su origen y resultado."""
+        ok, msg = self._request_watering(op, ws_id, duration, source_ip, origin_note)
+        if ws_id.strip().upper() != "ALL":   # con ALL ya se audita cada estación por separado
+            self.audit_event(
+                op.strip().upper() or "DESCONOCIDO", source_ip, "WATERING_REQUEST",
+                f"Solicitud de riego de {op.strip().upper()} para {ws_id.strip().upper()} ({duration} s): "
+                f"{'AUTORIZADA' if ok else 'DENEGADA'}",
+                msg + (f" | {origin_note}" if origin_note else ""))
+        return ok, msg
+
+    def _request_watering(self, op: str, ws_id: str, duration: int, source_ip: str, origin_note: str):
         op = op.strip().upper()
         ws_id = ws_id.strip().upper()
         if ws_id == "ALL":
             with self.lock:
                 targets = list(self.stations.keys())
-            sent = [t for t in targets if self.request_watering(op, t, duration)[0]]
+            sent = [t for t in targets if self.request_watering(op, t, duration, source_ip, origin_note)[0]]
             return bool(sent), f"Orden de riego enviada a {len(sent)} de {len(targets)} estaciones"
 
         with self.lock:
@@ -1317,6 +1390,8 @@ class WMCentral:
                 op, "DENY", ws_id,
                 "DENEGADO: El Engine no confirmó el inicio del riego en 10 segundos"
             )
+            self.audit_event(ws_id, "CENTRAL", "WATERING_TIMEOUT",
+                             f"Riego de {op} en {ws_id} cancelado: el Engine no confirmó el inicio en 10 s")
 
     def handle_ws_event(self, ev: dict):
         """Procesa eventos y telemetría emitidos por el motor de la estación (WM_WS_E)."""
@@ -1493,8 +1568,14 @@ class WMCentral:
                         duration = int(data.get("duration", 10))
                     except (ValueError, TypeError):
                         duration = 10
+                    # Kafka no informa de la IP del productor: se registra la que declara el FO
+                    try:
+                        fo_ip = str(ipaddress.ip_address(str(data.get("source_ip", "")).strip()))
+                        note = "IP declarada por el FO (no verificada por Kafka)"
+                    except ValueError:
+                        fo_ip, note = "DESCONOCIDO", "El FO no declaró una IP válida"
                     if op and ws_id:
-                        self.request_watering(op, ws_id, duration)
+                        self.request_watering(op, ws_id, duration, source_ip=fo_ip, origin_note=note)
             except Exception as exc:
                 if self.running:
                     self.log(f"Aviso en consumidor Kafka fo_requests ({exc}). Reintentando...")
@@ -1550,7 +1631,7 @@ class WMCentral:
             return list(self.stations.keys())
         return [target] if target in self.stations else []
 
-    def block_station(self, target: str):
+    def block_station(self, target: str, source_ip: str = "CENTRAL", origin_note: str = ""):
         """Pone una o todas las WS fuera de servicio (estado NARANJA)."""
         stations = self._target_stations(target)
         if not stations:
@@ -1575,8 +1656,10 @@ class WMCentral:
                 self.set_station_status(ws_id, STATUS_OUT_OF_SERVICE)
                 self.send_ws_command(ws_id, "BLOCK")
                 self.log("Puesta en FUERA DE SERVICIO por orden de CENTRAL", ws_id=ws_id)
+                self.audit_event(ws_id, source_ip, "STATION_BLOCKED",
+                                 f"Estación {ws_id} bloqueada (FUERA DE SERVICIO) por orden de CENTRAL", origin_note)
 
-    def activate_station(self, target: str):
+    def activate_station(self, target: str, source_ip: str = "CENTRAL", origin_note: str = ""):
         """Reactiva una o todas las WS desde Fuera de Servicio comprobando que Monitor y Engine estén operativos."""
         stations = self._target_stations(target)
         if not stations:
@@ -1608,11 +1691,15 @@ class WMCentral:
                     else:
                         self.set_station_status(ws_id, STATUS_LEAK)
                         self.log(f"No puede pasar a DISPONIBLE: pasa a FUGA ({reason})", ws_id=ws_id)
+                    self.audit_event(ws_id, source_ip, "STATION_ACTIVATED",
+                                     f"Estación {ws_id} activada por orden de CENTRAL (queda {st['status']})", origin_note)
                 elif st["status"] == STATUS_LEAK:
                     if engine_ok:
                         self.send_ws_command(ws_id, "ACTIVATE")
                         self.set_station_status(ws_id, STATUS_AVAILABLE)
                         self.log("Activada y en servicio (DISPONIBLE): Monitor y Engine operativos", ws_id=ws_id)
+                        self.audit_event(ws_id, source_ip, "STATION_ACTIVATED",
+                                         f"Estación {ws_id} activada por orden de CENTRAL (queda DISPONIBLE)", origin_note)
                     else:
                         self.log(f"No se puede activar {ws_id} a DISPONIBLE: se mantiene en FUGA ({reason})", ws_id=ws_id)
                 elif st["status"] == STATUS_AVAILABLE and not engine_ok:
@@ -1636,7 +1723,8 @@ class WMCentral:
                 return True
         return False
 
-    def register_station(self, ws_id: str, location: str = "Parque Municipal") -> bool:
+    def register_station(self, ws_id: str, location: str = "Parque Municipal", source_ip: str = "CENTRAL",
+                         origin_note: str = "") -> bool:
         """Da de alta dinámicamente una nueva estación autorizada en memoria y en SQLite.
         Valida el formato WS- seguido de al menos dos dígitos (ej. WS-07, WS-100).
         Si la estación ya existe, registra un aviso y devuelve False sin modificar su ubicación, estado ni conexiones."""
@@ -1674,6 +1762,9 @@ class WMCentral:
             }
             self._update_station_db(clean_id, location=clean_loc, status=STATUS_OFFLINE)
             self.log(f"Nueva estación dada de alta en CENTRAL: {clean_id} ({clean_loc})", ws_id=clean_id)
+            self.audit_event(clean_id, source_ip, "STATION_REGISTERED",
+                             f"Nueva estación {clean_id} dada de alta en CENTRAL", f"Ubicación: {clean_loc}"
+                             + (f" | {origin_note}" if origin_note else ""))
             return True
 
     # --------------------------------------------------------------------------
@@ -1723,15 +1814,6 @@ class WMCentral:
     # API_CENTRAL (REST): vistas, autenticación y validación
     # --------------------------------------------------------------------------
     OPERATOR_ID_RE = re.compile(r"^[A-Z0-9_-]{1,32}$")
-
-    def _log_throttled(self, key: str, message: str, interval: float = 30.0):
-        """Escribe un aviso como máximo una vez cada 'interval' segundos por clave."""
-        now = time.time()
-        with self.lock:
-            if now - self._throttled_logs.get(key, 0.0) < interval:
-                return
-            self._throttled_logs[key] = now
-        self.log(message)
 
     def _station_view(self, s: Dict[str, Any]) -> Dict[str, Any]:
         """Representación pública de una WS (sin claves ni huellas de credenciales)."""
@@ -1847,6 +1929,24 @@ class WMCentral:
             def _client_ip(self) -> str:
                 return self.client_address[0] if self.client_address else "desconocida"
 
+            def _origin(self) -> tuple:
+                """(IP de origen, nota) para la auditoría. La IP es la del socket, que no se puede
+                falsificar. X-Forwarded-For solo se acepta como IP del cliente si la petición llega de
+                un proxy de confianza ($WM_TRUSTED_PROXIES, p. ej. la IP del Front); si no, el valor
+                declarado se anota como no confiable."""
+                peer = self._client_ip()
+                xff = (self.headers.get("X-Forwarded-For") or "").strip()
+                if not xff:
+                    return peer, ""
+                try:
+                    declared = str(ipaddress.ip_address(xff.split(",")[-1].strip()))
+                except ValueError:
+                    declared = None
+                trusted = {p.strip() for p in os.getenv("WM_TRUSTED_PROXIES", "").split(",") if p.strip()}
+                if declared and peer in trusted:
+                    return declared, f"Cliente web vía proxy de confianza {peer}"
+                return peer, f"X-Forwarded-For no confiable: {declared or 'valor no válido'}"
+
             def _read_json(self):
                 """Cuerpo JSON (objeto). Devuelve (datos, None) o (None, error)."""
                 try:
@@ -1865,6 +1965,15 @@ class WMCentral:
                 if not isinstance(data, dict):
                     return None, "El cuerpo debe ser un objeto JSON"
                 return data, None
+
+            def _audit_api_error(self, method: str, exc: Exception):
+                path = self.path.split("?")[0]
+                central_self.log(f"Error interno en API_Central ({method} {path}): {exc.__class__.__name__}")
+                ip, note = self._origin()
+                central_self._audit_throttled(
+                    "API_CENTRAL", ip, "API_ERROR", f"{method} {path} {exc.__class__.__name__}",
+                    f"Error interno de API_Central en {method} {path} ({exc.__class__.__name__})"
+                    + (f" | {note}" if note else ""))
 
             # ---------------- GET (consultas públicas) ----------------
             def do_GET(self):
@@ -1937,17 +2046,19 @@ class WMCentral:
                             return self._send_json(200, [dict(r) for r in rows])
                     return self._send_json(404, {"status": "not_found", "msg": "Recurso no encontrado"})
                 except Exception as exc:
-                    central_self.log(f"Error interno en API_Central (GET {self.path.split('?')[0]}): "
-                                     f"{exc.__class__.__name__}")
+                    self._audit_api_error("GET", exc)
                     return self._send_json(500, {"status": "error", "msg": "Error interno"})
 
             # ---------------- notificaciones de WM_W (protegidas) ----------------
             def _weather_request(self, method: str, parts: List[str]):
                 code, msg = central_self._check_weather_token(self.headers)
                 if code:
-                    central_self._log_throttled(
-                        f"weather-auth-{code}",
-                        f"Notificación climática RECHAZADA desde {self._client_ip()} ({msg})")
+                    ip, note = self._origin()
+                    if central_self._audit_throttled(
+                            "WM_W", ip, "WEATHER_AUTH_DENIED", f"HTTP {code}",
+                            f"Notificación climática RECHAZADA ({method} {self.path.split('?')[0]}): {msg}"
+                            + (f" | {note}" if note else "")):
+                        central_self.log(f"Notificación climática RECHAZADA desde {ip} ({msg})")
                     return self._send_json(code, {"status": "unauthorized" if code == 401 else "disabled",
                                                   "msg": msg})
                 data, err = self._read_json()
@@ -1987,10 +2098,14 @@ class WMCentral:
 
             # ---------------- acciones de control (protegidas) ----------------
             def _action_request(self):
+                origin_ip, origin_note = self._origin()
                 if not central_self._is_authorized_admin_request(self._client_ip(), self.headers):
-                    central_self._log_throttled(
-                        "admin-auth", f"Acción de control DENEGADA desde {self._client_ip()}: token de "
-                                      f"administración ausente o no válido")
+                    if central_self._audit_throttled(
+                            "API_CENTRAL", origin_ip, "API_AUTH_DENIED", "token",
+                            "Acción de control DENEGADA: token de administración ausente o no válido"
+                            + (f" | {origin_note}" if origin_note else "")):
+                        central_self.log(f"Acción de control DENEGADA desde {origin_ip}: token de "
+                                         f"administración ausente o no válido")
                     return self._send_json(403, {"status": "forbidden", "created": False,
                                                  "msg": "Acceso denegado: se requiere el token de administración "
                                                         "(o ejecutar la acción desde la máquina de Central)"})
@@ -2007,10 +2122,10 @@ class WMCentral:
                 if action == "register":
                     loc = str(data.get("location") or "Parque Municipal")
                     if not STATION_ID_RE.fullmatch(ws_id):
-                        central_self.register_station(ws_id, loc)
+                        central_self.register_station(ws_id, loc, origin_ip, origin_note)
                         return self._send_json(400, {"status": "invalid", "created": False,
                                                      "msg": "Formato de ID no válido: use WS- seguido de al menos dos dígitos"})
-                    created = central_self.register_station(ws_id, loc)
+                    created = central_self.register_station(ws_id, loc, origin_ip, origin_note)
                     return self._send_json(200, {"status": "ok", "created": True} if created else
                                            {"status": "exists", "created": False,
                                             "msg": f"La estación {ws_id} ya existe"})
@@ -2029,18 +2144,20 @@ class WMCentral:
                                                      "msg": "'duration' debe ser un entero entre 1 y 86400 segundos"})
                     if not central_self.OPERATOR_ID_RE.fullmatch(op):
                         return self._send_json(400, {"status": "invalid", "msg": "Identificador de operario no válido"})
-                    ok, msg = central_self.request_watering(op, ws_id, duration)
+                    ok, msg = central_self.request_watering(op, ws_id, duration, origin_ip,
+                                                            origin_note or "Solicitud por API_Central")
                     return self._send_json(200 if ok else 409, {"status": "ok" if ok else "denied", "msg": msg})
 
                 if action in ("revoke_keys", "restore_keys"):
-                    central_self.revoke_station_keys(ws_id)
+                    central_self.revoke_station_keys(ws_id, origin_ip, origin_note or "Solicitud por API_Central")
                     return self._send_json(200, {"status": "ok", "ws": ws_id,
                                                  "msg": "Claves revocadas: la estación queda FUERA DE SERVICIO"})
 
+                note = origin_note or "Solicitud por API_Central"
                 if action == "block":
-                    central_self.block_station(ws_id)
+                    central_self.block_station(ws_id, origin_ip, note)
                 else:
-                    central_self.activate_station(ws_id)
+                    central_self.activate_station(ws_id, origin_ip, note)
                 if ws_id == "ALL":
                     return self._send_json(200, {"status": "ok", "ws": "ALL"})
                 with central_self.lock:
@@ -2070,8 +2187,7 @@ class WMCentral:
                         "status": "method_not_allowed" if known else "not_found",
                         "msg": "Método no permitido para este recurso" if known else "Recurso no encontrado"})
                 except Exception as exc:
-                    central_self.log(f"Error interno en API_Central ({method} {self.path.split('?')[0]}): "
-                                     f"{exc.__class__.__name__}")
+                    self._audit_api_error(method, exc)
                     return self._send_json(500, {"status": "error", "msg": "Error interno"})
 
             def do_POST(self):

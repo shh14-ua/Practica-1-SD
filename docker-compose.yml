@@ -51,6 +51,8 @@ services:
       # token de administración para las acciones de control y secreto compartido con WM_W
       WM_ADMIN_TOKEN: ${WM_ADMIN_TOKEN:-}
       WM_WEATHER_TOKEN: ${WM_WEATHER_TOKEN:-}
+      # IP del proxy de confianza (el Front) cuyo X-Forwarded-For se acepta como IP del cliente en la auditoría
+      WM_TRUSTED_PROXIES: ${WM_TRUSTED_PROXIES:-}
     volumes:
       - ./data:/data
     stdin_open: true

@@ -174,7 +174,7 @@ class WSEngine:
                 self._last_cmd_seq = self._load_last_cmd_seq(key)
                 self._requeue_unconfirmed_finished_locked()
             has_pending = bool(self.pending_finished_events)
-        self.log(f"Clave simétrica recibida del Monitor ({key[:10]}...). Canal Kafka cifrado activado.")
+        self.log(f"Clave simétrica recibida del Monitor (huella {key_fingerprint(key)[:8]}). Canal Kafka cifrado activado.")
         if has_pending:
             self.trigger_flush_pending()  # reenvía con la clave nueva los FINISHED no confirmados
         return True

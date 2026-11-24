@@ -164,6 +164,13 @@ python WM_Central/WM_Central.py 5000 localhost:9092 --web-port 8080 --san <HOST_
 
 Las respuestas son JSON con códigos coherentes: 400 (datos no válidos), 401/403 (sin autorización), 404 (recurso inexistente), 409 (acción no realizable en el estado actual) y 503 (notificaciones climáticas sin `WM_WEATHER_TOKEN` configurado).
 
+**Auditoría (WM_Central):**
+- Cada evento se guarda en SQLite (tabla `audit_log`, en la misma base de datos persistente de Central) y en el fichero `audit.log` situado junto a esa base de datos (configurable con `WM_AUDIT_LOG`). Al arrancar, Central recupera los últimos 100 eventos para API_Central y el Front. Si falla la escritura en SQLite o en el fichero, se avisa por consola y en el log de Central (sin el contenido del evento).
+- Campos: fecha y hora ISO 8601 con zona horaria, entidad (WS, operario, WM_W o API), origen (IP), acción, descripción y detalles. Cada evento ocupa una sola línea.
+- Eventos: autenticaciones (`AUTH_SUCCESS`, `AUTH_FAILED`, `TLS_FAILED`), claves (`KEY_REVOCATION`, `KEY_RENEWED`, `REJECTED_REVOKED`, `INTEGRITY_FAIL`), incidencias (`LEAK_ALERT`, `LEAK_INCIDENCE`, `FIXED_INCIDENCE`, `RESTORED`), cambio de situación de la WS (`STATUS_CHANGE`), bloqueos (`STATION_BLOCKED`, `STATION_ACTIVATED`), altas (`STATION_REGISTERED`), riegos (`WATERING_REQUEST`, `WATERING_TIMEOUT`), clima (`WEATHER_ALERT`, `WEATHER_NORMAL`) y errores (`API_AUTH_DENIED`, `WEATHER_AUTH_DENIED`, `API_ERROR`, `KAFKA_SEND_ERROR`, `KAFKA_REJECTED`, `KAFKA_CMD_NOT_SENT`). Los rechazos y errores repetitivos se registran como máximo una vez cada 30 s, indicando cuántos se omitieron.
+- Origen: IP del Monitor de la WS (también para sus eventos por Kafka; `DESCONOCIDO` si no se conoce), IP declarada por el FO en sus peticiones (Kafka no permite verificarla), `CENTRAL` para la consola y, en API_Central, la IP del socket. `X-Forwarded-For` solo se acepta como IP del cliente si la petición llega de un proxy de confianza indicado en `WM_TRUSTED_PROXIES` (p. ej. la IP del Front); si no, se anota como no confiable.
+- No se registran claves, credenciales ni tokens. Los Monitores y Engines identifican las claves y credenciales en sus logs solo por una huella SHA-256 corta.
+
 **Paso 1.4 — Front (Web Dashboard en Node.js en puerto 3000):**
 ```bash
 node front/server.js 3000 http://localhost:8080
@@ -234,6 +241,7 @@ Pruebas de API_Central, WM_W y el Front (HTTP, Registry HTTPS y Node.js reales; 
 ```bash
 python test_api_central.py
 python test_front_proxy.py
+python test_audit.py
 ```
 
 Las pruebas del canal TLS entre Central y los Monitores están en `test_tls_central.py` (sockets, TLS y Registry HTTPS reales):

@@ -34,7 +34,8 @@ from common import (
     parse_addr, COLOR_BOLD, COLOR_RESET
 )
 from wm_crypto import (
-    encrypt_message, decrypt_message, is_encrypted, is_valid_symmetric_key, require_cryptography
+    encrypt_message, decrypt_message, is_encrypted, is_valid_symmetric_key, require_cryptography,
+    key_fingerprint
 )
 
 DEFAULT_REGISTRY_CA = os.getenv(
@@ -50,10 +51,10 @@ DEFAULT_CRED_DIR = os.getenv("WM_WS_CRED_DIR", os.path.join(ROOT_DIR, "WM_WS", "
 
 
 def mask_secret(value: Optional[str]) -> str:
-    """Muestra solo el inicio de un secreto para logs y consola."""
+    """Identifica un secreto en logs y consola sin revelar ningún fragmento: huella SHA-256 corta."""
     if not value:
         return "—"
-    return value[:12] + "…" if len(value) > 12 else "…"
+    return f"huella {key_fingerprint(value)[:8]}"
 
 
 class WSMonitor:
@@ -291,7 +292,7 @@ class WSMonitor:
                 self.symmetric_key = parts[2].strip()
                 self.key_revoked = False
                 self.log(f"Autenticado en Central (canal TLS) con éxito. Clave simétrica única recibida "
-                         f"({self.symmetric_key[:10]}...)")
+                         f"({mask_secret(self.symmetric_key)})")
                 self.central_sock = sock
                 self.central_blocked = "#BLOCKED" in resp
                 # Tras autenticarse se envía al Engine el estado explícito que indica Central (BLOCKED o
@@ -528,7 +529,7 @@ class WSMonitor:
                     print(f"  • Credencial:     {mask_secret(self.credential) if self.credential else 'No registrada aún'}")
                     print(f"  • CA del Registry:{self.registry_ca}")
                     print(f"  • CA de Central:  {self.central_ca}")
-                    print(f"  • Clave simétrica:{self.symmetric_key[:12] + '...' if self.symmetric_key else 'Sin clave / Revocada'}")
+                    print(f"  • Clave simétrica:{mask_secret(self.symmetric_key) if self.symmetric_key else 'Sin clave / Revocada'}")
                     print(f"  • Clave revocada: {'SÍ (Fuera de Servicio)' if self.key_revoked else 'NO'}")
                     print(f"  • Central Socket: {'Conectado' if self.central_sock else 'Desconectado'}")
                     print(f"  • Engine Socket:  {'Conectado' if self.engine_sock else 'Desconectado'}\n")

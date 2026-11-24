@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -402,6 +403,7 @@ class WaterManagementFlowTests(unittest.TestCase):
             # Simulación de WM_Registry (ver FakeRegistry) y credenciales locales en directorio temporal
             patch.object(WM_WS_M, "DEFAULT_CRED_DIR", self.cred_dir),
             patch.object(WM_WS_E, "DEFAULT_STATE_DIR", os.path.join(self.cred_dir, "engine_state")),
+            patch.dict(os.environ, {"WM_AUDIT_LOG": os.path.join(self.cred_dir, "audit.log")}),
             patch.object(WM_WS_M.WSMonitor, "register_in_registry",
                          lambda mon: self.registry.register(mon)),
             patch.object(WM_Central.WMCentral, "verify_registry_credential",
@@ -2185,6 +2187,59 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertNotEqual(engine.state, "WATERING")
         self.assertEqual(central.stations["WS-01"]["operator"], None, "No se ha iniciado ningún riego")
         engine.running = monitor.running = central.running = False
+
+
+    def test_33_audit_trail_of_full_flow_with_origins_and_no_secrets(self):
+        """Recorrido completo (FO -> Central -> Engine, revocación y re-autenticación): la auditoría
+        registra los eventos obligatorios con su origen y ni la auditoría ni los logs de Monitor y
+        Engine contienen claves, credenciales ni fragmentos de ellas."""
+        import json as _json
+        import sqlite3 as _sqlite3
+        logs = io.StringIO()
+        with redirect_stdout(logs):
+            central, monitor, engine = self._start_cluster("WS-01")
+            keys = [central.station_keys["WS-01"]]
+            credentials = [monitor.credential]
+            fo = WM_FO.FieldOperator("localhost:9092", "FO-01")
+            fo.source_ip = "198.51.100.77"          # IP declarada por el equipo del FO
+            threading.Thread(target=fo.listen_kafka, daemon=True).start()
+            time.sleep(0.1)
+            fo.request_service("WS-01", 1)
+            self.assertTrue(fo.service_done_event.wait(timeout=6.0))
+            central.revoke_station_keys("WS-01")
+            self.assertTrue(self._wait_until(lambda: monitor.key_revoked, 6))
+            monitor.reauthenticate()
+            keys.append(central.station_keys["WS-01"])
+            credentials.append(monitor.credential)
+            time.sleep(1.0)
+            engine.running = monitor.running = central.running = fo.running = False
+
+        audits = list(central.recent_audits)
+        actions = [a["action"] for a in audits]
+        for required in ("AUTH_SUCCESS", "STATUS_CHANGE", "WATERING_REQUEST", "KEY_REVOCATION",
+                         "REJECTED_REVOKED", "KEY_RENEWED"):
+            self.assertIn(required, actions, required)
+        req = next(a for a in audits if a["action"] == "WATERING_REQUEST")
+        self.assertEqual((req["entity"], req["source_ip"]), ("FO-01", "198.51.100.77"))
+        self.assertIn("AUTORIZADA", req["description"])
+        changes = [a["description"].split(": ", 1)[1] for a in audits
+                   if a["action"] == "STATUS_CHANGE" and a["entity"] == "WS-01"]
+        for transition in ("DISPONIBLE -> REGANDO", "REGANDO -> DISPONIBLE", "-> FUERA DE SERVICIO"):
+            self.assertTrue(any(transition in c for c in changes), transition)
+        ws_events = [a for a in audits if a["entity"] == "WS-01" and a["action"] in ("AUTH_SUCCESS", "STATUS_CHANGE")]
+        self.assertTrue(all(a["source_ip"] == "127.0.0.1" for a in ws_events), "IP del Monitor de la WS")
+        self.assertTrue(all(datetime.fromisoformat(a["timestamp"]).tzinfo for a in audits))
+
+        with _sqlite3.connect(self.temp_db.name) as db:
+            stored = _json.dumps(db.execute("SELECT * FROM audit_log").fetchall())
+        with open(central.audit_log_path, encoding="utf-8") as f:
+            stored += f.read()
+        output = logs.getvalue()
+        for secret in keys + credentials:
+            for fragment in (secret, secret[:10], secret[:8]):
+                self.assertNotIn(fragment, stored, "Secreto en la auditoría")
+                self.assertNotIn(fragment, output, "Secreto o fragmento en los logs de Monitor/Engine/Central")
+        self.assertIn("huella", output, "Las claves se identifican por su huella")
 
 
 if __name__ == "__main__":

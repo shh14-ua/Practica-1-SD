@@ -15,6 +15,7 @@ Funcionalidades:
 
 import argparse
 import os
+import socket
 import sys
 import threading
 import time
@@ -26,11 +27,21 @@ if ROOT_DIR not in sys.path:
 
 from common import (
     TOPIC_REQUESTS, TOPIC_REPLIES, TOPIC_STATUS,
-    make_producer, send_kafka, make_consumer,
+    make_producer, send_kafka, make_consumer, parse_addr,
     COLOR_BOLD, COLOR_RESET, format_status
 )
 
 class FieldOperator:
+    def _local_ip(self) -> str:
+        """IP de la interfaz con la que este equipo llega al broker Kafka (sin enviar tráfico)."""
+        try:
+            host, port = parse_addr(self.kafka_bootstrap.split(",")[0], 9092)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((host, port))
+                return s.getsockname()[0]
+        except Exception:
+            return ""
+
     def __init__(self, kafka_bootstrap: str, op_id: str):
         self.kafka_bootstrap = kafka_bootstrap
         self.op_id = op_id.strip().upper()
@@ -44,6 +55,9 @@ class FieldOperator:
         self.seen_summary_tx_ids = set()
 
         self.producer = make_producer(self.kafka_bootstrap)
+        # IP de este equipo, declarada en cada petición para la auditoría de Central
+        # (Kafka no informa de la IP del productor)
+        self.source_ip = self._local_ip()
         # Usamos un group_id determinista por operario para que, si el FO se cierra en mitad
         # de un riego y se vuelve a abrir, recupere automáticamente el resultado de su servicio.
         self.consumer = make_consumer(
@@ -150,7 +164,8 @@ class FieldOperator:
             "op": self.op_id,
             "ws": clean_ws,
             "duration": duration,
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "source_ip": self.source_ip
         }
         ok = send_kafka(self.producer, TOPIC_REQUESTS, payload)
         if not ok:
