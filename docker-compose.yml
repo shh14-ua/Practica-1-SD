@@ -49,8 +49,8 @@ services:
       WM_CENTRAL_SAN: ${WM_CENTRAL_SAN:-}
       # Secretos de API_Central (definirlos en el entorno de despliegue; nunca en el repositorio):
       # token de administración para las acciones de control y secreto compartido con WM_W
-      WM_ADMIN_TOKEN: ${WM_ADMIN_TOKEN:-}
-      WM_WEATHER_TOKEN: ${WM_WEATHER_TOKEN:-}
+      WM_ADMIN_TOKEN: ${WM_ADMIN_TOKEN:-admin-2627}
+      WM_WEATHER_TOKEN: ${WM_WEATHER_TOKEN:-weather-2627}
       # IP del proxy de confianza (el Front) cuyo X-Forwarded-For se acepta como IP del cliente en la auditoría
       WM_TRUSTED_PROXIES: ${WM_TRUSTED_PROXIES:-}
     volumes:

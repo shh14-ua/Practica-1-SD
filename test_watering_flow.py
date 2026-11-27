@@ -1378,9 +1378,9 @@ class WaterManagementFlowTests(unittest.TestCase):
         self.assertEqual(resp, "OK")
         self.assertLess(elapsed, 0.5, "handle_monitor_request no debe bloquearse al tramitar BLOCKED")
 
-        # 3. Esperar finalización del riego
+        # 3. Esperar finalización del riego y publicación asíncrona del evento FINISHED
         deadline = time.time() + 2.0
-        while time.time() < deadline and engine.state != "BLOCKED":
+        while time.time() < deadline and (engine.state != "BLOCKED" or len(finished_events) < 1):
             time.sleep(0.05)
 
         self.assertEqual(engine.state, "BLOCKED", "El estado final debe ser BLOCKED")
